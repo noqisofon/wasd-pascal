@@ -1,0 +1,11 @@
+[package]
+name = "wasd-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Recursive-descent parser for WASD Pascal. Single grammar for all dialects; dialect checks happen in wasd-sema."
+
+[dependencies]
+wasd-ast.workspace = true
+wasd-lexer.workspace = true

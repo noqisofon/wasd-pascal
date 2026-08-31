@@ -1,0 +1,10 @@
+[package]
+name = "wasd-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tokenizer for WASD Pascal."
+
+[dependencies]
+wasd-ast.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "wasd-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AST, source spans, dialect, and diagnostic types for WASD Pascal. Depends on nothing else in the workspace."
+
+[dependencies]
