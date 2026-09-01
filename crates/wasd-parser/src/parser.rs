@@ -10,10 +10,18 @@
 //!   手続き呼び出し
 //! - 式: リテラル、識別子、二項演算、単項演算、括弧、関数呼び出し
 //!
-//! `FOR`/`REPEAT`/`CASE`文、配列・レコード型、`UNIT`等のUCSD拡張構文は
-//! まだパースしない。レキサはこれらをトークンとして認識できるが、
-//! このパーサーはまだ対応する文法規則を持たないというだけの状態であり、
-//! 遭遇した場合は構文エラーの`Diagnostic`を発する。
+//! `FOR`/`REPEAT`/`CASE`文に加え、UCSD拡張の`UNIT`/`INTERFACE`/
+//! `IMPLEMENTATION`/`USES`、`CASE`文の`OTHERWISE`句、16進数リテラル
+//! `$FF`、コンパイラディレクティブ、`STRING[n]`型もパースする。
+//! 配列・レコード・ポインタ・集合型はまだパースしない（遭遇した場合は
+//! 構文エラーの`Diagnostic`を発する）。
+//!
+//! # エントリポイント: `PROGRAM`か`UNIT`か
+//!
+//! [`Parser::parse_compilation_unit`]が先頭トークンを見て`PROGRAM`/`UNIT`の
+//! どちらをパースするかを決める。[`Parser::parse_program`]/
+//! [`Parser::parse_unit`]は個別に直接呼び出すこともできる（既存のテストや
+//! 呼び出し元が`PROGRAM`前提で書かれている場合に備えて残す）。
 //!
 //! # エラー耐性（パニックモード回復）
 //!
@@ -26,8 +34,10 @@
 //! 想定した設計。
 
 use wasd_ast::{
-    BinOp, Block, CaseBranch, ConstDecl, Diagnostic, Expr, ForDirection, FuncDecl, Identifier,
-    Literal, ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
+    BinOp, Block, CaseBranch, CompilationUnit, ConstDecl, Diagnostic, Expr, ForDirection,
+    FuncDecl, FuncSignature, Identifier, ImplementationSection, InterfaceSection, Literal,
+    ParamDecl, ProcDecl, ProcSignature, Program, Severity, Span, Statement, TypeExpr, Unit, UnOp,
+    VarDecl,
 };
 use wasd_lexer::{Token, TokenKind};
 
@@ -51,6 +61,19 @@ impl Parser {
         }
     }
 
+    /// ソース1本分のコンパイル単位（`PROGRAM`または`UNIT`）をパースする。
+    /// 先頭トークンが`UNIT`であれば[`Self::parse_unit`]、それ以外は
+    /// [`Self::parse_program`]に委譲する。
+    pub fn parse_compilation_unit(&mut self) -> (Option<CompilationUnit>, Vec<Diagnostic>) {
+        if matches!(self.peek(), TokenKind::Unit) {
+            let (unit, diags) = self.parse_unit();
+            (unit.map(CompilationUnit::Unit), diags)
+        } else {
+            let (program, diags) = self.parse_program();
+            (program.map(CompilationUnit::Program), diags)
+        }
+    }
+
     /// プログラム全体をパースする。エラーがあってもパニックせず、可能な限り
     /// 復帰してパースを継続し、`Diagnostic`を蓄積する。
     ///
@@ -69,6 +92,7 @@ impl Parser {
         let name = self.parse_identifier("program name");
         self.expect(&TokenKind::Semicolon, "';'");
 
+        let mut uses = Vec::new();
         let mut const_decls = Vec::new();
         let mut var_decls = Vec::new();
         let mut proc_decls = Vec::new();
@@ -76,11 +100,16 @@ impl Parser {
 
         loop {
             match self.peek() {
+                // UCSD拡張: `USES id, id, ...;`。標準的な置き場所は`PROGRAM`
+                // ヘッダの直後だが、`CONST`/`VAR`同様、パーサーはどの順序でも
+                // 受理する（dialectチェックは`wasd-sema`が行うため、パーサー
+                // レベルでは位置に関する制約も設けない）。
+                TokenKind::Uses => uses.extend(self.parse_uses_clause()),
                 TokenKind::Const => const_decls.extend(self.parse_const_section()),
                 TokenKind::Var => var_decls.extend(self.parse_var_section()),
                 TokenKind::Procedure => proc_decls.push(self.parse_proc_decl()),
                 TokenKind::Function => func_decls.push(self.parse_func_decl()),
-                TokenKind::Type | TokenKind::Label | TokenKind::Unit | TokenKind::Uses => {
+                TokenKind::Type | TokenKind::Label | TokenKind::Unit => {
                     let kind = self.peek().clone();
                     let span = self.peek_span();
                     self.error(
@@ -103,6 +132,7 @@ impl Parser {
         let end = self.previous_span().end.max(start.end);
         let program = Program {
             name,
+            uses,
             const_decls,
             var_decls,
             proc_decls,
@@ -112,6 +142,146 @@ impl Parser {
         };
 
         (Some(program), std::mem::take(&mut self.diagnostics))
+    }
+
+    // ------------------------------------------------------------------
+    // UCSD拡張: UNIT / INTERFACE / IMPLEMENTATION / USES
+    // ------------------------------------------------------------------
+
+    /// `UNIT name; INTERFACE ... IMPLEMENTATION ... END.`
+    ///
+    /// UNCONFIRMED: `IMPLEMENTATION`部の末尾（`END.`の直前）に初期化用の
+    /// 文の並びが書けるかどうかは一次資料で未確認のため、今回は実装しない
+    /// （`wasd_ast::Unit`のドキュメント参照）。
+    fn parse_unit(&mut self) -> (Option<Unit>, Vec<Diagnostic>) {
+        if self.is_eof() {
+            let span = self.peek_span();
+            self.error(span, "expected 'UNIT', found end of input");
+            return (None, std::mem::take(&mut self.diagnostics));
+        }
+
+        let start = self.peek_span();
+        self.expect(&TokenKind::Unit, "'UNIT'");
+        let name = self.parse_identifier("unit name");
+        self.expect(&TokenKind::Semicolon, "';'");
+
+        let interface = self.parse_interface_section();
+        let implementation = self.parse_implementation_section();
+
+        let end_span = self.expect_and_span(&TokenKind::End, "'END'");
+        self.expect(&TokenKind::Dot, "'.'");
+
+        let end = end_span.end.max(start.end);
+        let unit = Unit {
+            name,
+            interface,
+            implementation,
+            span: Span::new(start.start, end),
+        };
+
+        (Some(unit), std::mem::take(&mut self.diagnostics))
+    }
+
+    /// `INTERFACE [USES ...;] [CONST ...] [VAR ...] {PROCEDURE/FUNCTION シグネチャ}`
+    fn parse_interface_section(&mut self) -> InterfaceSection {
+        let start = self.peek_span();
+        self.expect(&TokenKind::Interface, "'INTERFACE'");
+
+        let mut uses = Vec::new();
+        let mut const_decls = Vec::new();
+        let mut var_decls = Vec::new();
+        let mut proc_signatures = Vec::new();
+        let mut func_signatures = Vec::new();
+
+        loop {
+            match self.peek() {
+                TokenKind::Uses => uses.extend(self.parse_uses_clause()),
+                TokenKind::Const => const_decls.extend(self.parse_const_section()),
+                TokenKind::Var => var_decls.extend(self.parse_var_section()),
+                TokenKind::Procedure => proc_signatures.push(self.parse_proc_signature()),
+                TokenKind::Function => func_signatures.push(self.parse_func_signature()),
+                _ => break,
+            }
+        }
+
+        let end = self.previous_span().end.max(start.end);
+        InterfaceSection {
+            uses,
+            const_decls,
+            var_decls,
+            proc_signatures,
+            func_signatures,
+            span: Span::new(start.start, end),
+        }
+    }
+
+    /// `IMPLEMENTATION {PROCEDURE/FUNCTION 完全な宣言}`
+    fn parse_implementation_section(&mut self) -> ImplementationSection {
+        let start = self.peek_span();
+        self.expect(&TokenKind::Implementation, "'IMPLEMENTATION'");
+
+        let mut proc_decls = Vec::new();
+        let mut func_decls = Vec::new();
+        loop {
+            match self.peek() {
+                TokenKind::Procedure => proc_decls.push(self.parse_proc_decl()),
+                TokenKind::Function => func_decls.push(self.parse_func_decl()),
+                _ => break,
+            }
+        }
+
+        let end = self.previous_span().end.max(start.end);
+        ImplementationSection {
+            proc_decls,
+            func_decls,
+            span: Span::new(start.start, end),
+        }
+    }
+
+    /// `USES id, id, ...;`。呼び出し元は`self.peek()`が`TokenKind::Uses`で
+    /// あることを確認済みの前提。
+    fn parse_uses_clause(&mut self) -> Vec<Identifier> {
+        self.advance(); // USES
+        let mut names = vec![self.parse_identifier("unit name")];
+        while self.check(&TokenKind::Comma) {
+            self.advance();
+            names.push(self.parse_identifier("unit name"));
+        }
+        self.expect(&TokenKind::Semicolon, "';'");
+        names
+    }
+
+    /// `INTERFACE`部の`PROCEDURE name(params);`（本体なし）。
+    fn parse_proc_signature(&mut self) -> ProcSignature {
+        let start = self.peek_span();
+        self.advance(); // PROCEDURE
+        let name = self.parse_identifier("procedure name");
+        let params = self.parse_param_list();
+        self.expect(&TokenKind::Semicolon, "';'");
+        let end = self.previous_span().end;
+        ProcSignature {
+            name,
+            params,
+            span: Span::new(start.start, end),
+        }
+    }
+
+    /// `INTERFACE`部の`FUNCTION name(params): returnType;`（本体なし）。
+    fn parse_func_signature(&mut self) -> FuncSignature {
+        let start = self.peek_span();
+        self.advance(); // FUNCTION
+        let name = self.parse_identifier("function name");
+        let params = self.parse_param_list();
+        self.expect(&TokenKind::Colon, "':'");
+        let return_type = self.parse_type();
+        self.expect(&TokenKind::Semicolon, "';'");
+        let end = self.previous_span().end;
+        FuncSignature {
+            name,
+            params,
+            return_type,
+            span: Span::new(start.start, end),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -151,6 +321,25 @@ impl Parser {
 
         match self.peek().clone() {
             TokenKind::IntegerLiteral(v) => {
+                self.advance();
+                let v = if negate { -v } else { v };
+                Literal::Int(v, Span::new(start.start, self.previous_span().end))
+            }
+            // UCSD拡張: 16進数リテラル `$FF`。
+            //
+            // # 既知のスコープ制限: `CONST`宣言・`CASE`ラベルではdialectチェックを
+            //   行わない
+            //
+            // `wasd_ast::Literal`（`CONST`宣言の右辺・`CASE`ラベルで使う）は
+            // `Expr`と異なり16進数由来かどうかを区別するバリアントを持たない
+            // （式中の`Expr::HexIntLiteral`とは非対称）。式中の`$FF`
+            // （`x := $FF`のような代入・比較の右辺）についてはdialectチェックを
+            // 実装するが、`CONST`宣言や`CASE`ラベルの中の`$FF`については
+            // 値だけを普通の`Literal::Int`としてデコードし、dialectチェックは
+            // 行わない。これは今回のスコープを絞るための意図的な制限であり、
+            // 将来`Literal`にも同様の区別を持たせる形で解消できる
+            // （TODO: `Literal::HexInt`のようなバリアントを追加する）。
+            TokenKind::HexIntegerLiteral(v) => {
                 self.advance();
                 let v = if negate { -v } else { v };
                 Literal::Int(v, Span::new(start.start, self.previous_span().end))
@@ -224,11 +413,12 @@ impl Parser {
                     "real" => TypeExpr::Real(span),
                     "boolean" => TypeExpr::Boolean(span),
                     "char" => TypeExpr::Char(span),
+                    "string" => self.parse_string_n_type(span),
                     _ => {
                         self.error(
                             span,
                             format!(
-                                "unknown type '{name}' (only INTEGER/REAL/BOOLEAN/CHAR are supported by this parser)"
+                                "unknown type '{name}' (only INTEGER/REAL/BOOLEAN/CHAR/STRING[n] are supported by this parser)"
                             ),
                         );
                         TypeExpr::Integer(span)
@@ -239,7 +429,7 @@ impl Parser {
                 self.error(
                     span,
                     format!(
-                        "expected a type name (INTEGER/REAL/BOOLEAN/CHAR), found {}",
+                        "expected a type name (INTEGER/REAL/BOOLEAN/CHAR/STRING[n]), found {}",
                         describe(&other)
                     ),
                 );
@@ -249,6 +439,45 @@ impl Parser {
                 TypeExpr::Integer(span)
             }
         }
+    }
+
+    /// UCSD拡張: `STRING[n]`型。呼び出し元は`STRING`識別子を消費済みで、
+    /// `type_start`はその`STRING`識別子自体のspan（`[n]`を含まない）。
+    ///
+    /// UNCONFIRMED: 角括弧`[n]`を省略した`STRING`単体の宣言が許されるか、
+    /// 許される場合の既定最大長は何かは一次資料で未確認
+    /// （このセッションでは一次資料へのネットワークアクセスがブロックされて
+    /// いた）。ここでは慣用的によく引用される既定値`80`を仮に採用し、
+    /// パーサーレベルでは拒否しない（`wasd_ast::Dialect`の設計方針どおり、
+    /// UCSD拡張構文は常に受理する）。
+    fn parse_string_n_type(&mut self, type_start: Span) -> TypeExpr {
+        if !self.check(&TokenKind::LBracket) {
+            return TypeExpr::StringN(80, type_start);
+        }
+        self.advance(); // '['
+
+        let len = match self.peek().clone() {
+            TokenKind::IntegerLiteral(v) if v > 0 => {
+                self.advance();
+                v as usize
+            }
+            other => {
+                self.error(
+                    self.peek_span(),
+                    format!(
+                        "expected a positive integer length for STRING[n], found {}",
+                        describe(&other)
+                    ),
+                );
+                if !matches!(other, TokenKind::RBracket | TokenKind::Semicolon | TokenKind::Eof) {
+                    self.advance();
+                }
+                80
+            }
+        };
+
+        let close = self.expect_and_span(&TokenKind::RBracket, "']'");
+        TypeExpr::StringN(len, Span::new(type_start.start, close.end.max(type_start.end)))
     }
 
     /// `PROCEDURE name(params); [VAR ...] BEGIN ... END;`
@@ -439,6 +668,14 @@ impl Parser {
             TokenKind::Case => self.parse_case_statement(),
             TokenKind::Identifier(_) => self.parse_assignment_or_call(),
 
+            // UCSD拡張: コンパイラディレクティブ `(*$I foo.pas*)`。
+            // `wasd_ast::Statement::CompilerDirective`のドキュメント参照。
+            TokenKind::CompilerDirective { name, args } => {
+                let span = self.peek_span();
+                self.advance();
+                Some(Statement::CompilerDirective { name, args, span })
+            }
+
             // 空文（empty statement）。ISO 7185の文法は`statement`の一種として
             // 「何もない」ことを許容する（`;;`の連続や`THEN`直後の`ELSE`など）。
             // ここでは呼び出し元がこれらのトークンを消費しない前提で、
@@ -578,9 +815,13 @@ impl Parser {
         })
     }
 
-    /// `CASE selector OF label1, label2: stmt1; label3: stmt2 END`
+    /// `CASE selector OF label1, label2: stmt1; label3: stmt2; [OTHERWISE stmtN] END`
     ///
-    /// UCSD拡張の`OTHERWISE`句は今回のスコープに含めない。
+    /// UCSD拡張の`OTHERWISE`句（どのラベルにも一致しない場合のデフォルト
+    /// 分岐）もパースする。文法上、`OTHERWISE`は最後の分岐として現れる想定
+    /// （その後にさらに`label: stmt`形式の分岐は続かない）ため、`OTHERWISE`
+    /// を読んだ時点でループを抜ける。dialectチェック（`Iso7185`では使用不可）
+    /// は`wasd-sema`が行う。
     fn parse_case_statement(&mut self) -> Option<Statement> {
         let start = self.peek_span();
         self.advance(); // CASE
@@ -588,11 +829,22 @@ impl Parser {
         self.expect(&TokenKind::Of, "'OF'");
 
         let mut branches = Vec::new();
+        let mut otherwise = None;
         loop {
             while self.check(&TokenKind::Semicolon) {
                 self.advance();
             }
             if self.check(&TokenKind::End) || self.is_eof() {
+                break;
+            }
+
+            if self.check(&TokenKind::Otherwise) {
+                self.advance();
+                let stmt = self.parse_statement_or_recover();
+                otherwise = Some(Box::new(stmt));
+                if self.check(&TokenKind::Semicolon) {
+                    self.advance();
+                }
                 break;
             }
 
@@ -615,6 +867,11 @@ impl Parser {
                 continue;
             } else if self.check(&TokenKind::End) || self.is_eof() {
                 break;
+            } else if self.check(&TokenKind::Otherwise) {
+                // `OTHERWISE`の前のセミコロンは省略できる
+                // （`1: stmt OTHERWISE stmt2`）。ループの先頭に戻れば
+                // `OTHERWISE`ハンドリングに入る。
+                continue;
             } else {
                 let span = self.peek_span();
                 let found = describe(self.peek());
@@ -631,6 +888,7 @@ impl Parser {
         Some(Statement::Case {
             selector,
             branches,
+            otherwise,
             span: Span::new(start.start, end_span.end),
         })
     }
@@ -895,6 +1153,14 @@ impl Parser {
                 self.advance();
                 Expr::IntLiteral(v, span)
             }
+            // UCSD拡張: 16進数リテラル `$FF`。`Expr::IntLiteral`とは別の
+            // `Expr::HexIntLiteral`として組み立てる（dialectチェックを
+            // `wasd-sema`で行うため。`wasd_ast::Expr::HexIntLiteral`の
+            // ドキュメント参照）。パーサー自身はdialectに関わらず常に受理する。
+            TokenKind::HexIntegerLiteral(v) => {
+                self.advance();
+                Expr::HexIntLiteral(v, span)
+            }
             TokenKind::RealLiteral(v) => {
                 self.advance();
                 Expr::RealLiteral(v, span)
@@ -1121,6 +1387,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Otherwise => "'OTHERWISE'".to_string(),
         TokenKind::Identifier(name) => format!("identifier '{name}'"),
         TokenKind::IntegerLiteral(v) => format!("integer literal '{v}'"),
+        TokenKind::HexIntegerLiteral(v) => format!("hexadecimal literal '${v:X}'"),
         TokenKind::RealLiteral(v) => format!("real literal '{v}'"),
         TokenKind::StringLiteral(s) => format!("string literal '{s}'"),
         TokenKind::Assign => "':='".to_string(),
@@ -1762,5 +2029,187 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
         assert_eq!(program.func_decls.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7: UCSD拡張構文（パーサーはdialectに関わらず常に受理する）
+    // ------------------------------------------------------------------
+
+    fn parse_unit_source(source: &str) -> (Option<wasd_ast::CompilationUnit>, Vec<Diagnostic>) {
+        let (tokens, lex_diags) = wasd_lexer::Lexer::new(source).tokenize();
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics for {source:?}: {lex_diags:?}"
+        );
+        Parser::new(tokens).parse_compilation_unit()
+    }
+
+    /// `PROGRAM`ソースは`parse_compilation_unit`経由でも
+    /// `CompilationUnit::Program`としてパースされること。
+    #[test]
+    fn parse_compilation_unit_dispatches_to_program() {
+        let (unit, diags) = parse_unit_source("PROGRAM Foo; BEGIN END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        match unit {
+            Some(wasd_ast::CompilationUnit::Program(program)) => {
+                assert_eq!(program.name.name, "Foo");
+            }
+            other => panic!("expected a Program, got {other:?}"),
+        }
+    }
+
+    /// `UNIT ... INTERFACE ... IMPLEMENTATION ... END.`が
+    /// `CompilationUnit::Unit`としてパースされ、`INTERFACE`部の
+    /// シグネチャと`IMPLEMENTATION`部の完全な宣言がそれぞれ正しい場所に
+    /// 収まること。
+    #[test]
+    fn parses_unit_with_interface_and_implementation() {
+        let src = r#"
+            UNIT Greetings;
+
+            INTERFACE
+
+            USES Crt;
+
+            CONST Greeting = 'H';
+
+            PROCEDURE Hello;
+            FUNCTION Add(a, b: INTEGER): INTEGER;
+
+            IMPLEMENTATION
+
+            PROCEDURE Hello;
+            BEGIN
+            END;
+
+            FUNCTION Add(a, b: INTEGER): INTEGER;
+            BEGIN
+                Add := a + b
+            END;
+
+            END.
+        "#;
+        let (unit, diags) = parse_unit_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let unit = match unit {
+            Some(wasd_ast::CompilationUnit::Unit(unit)) => unit,
+            other => panic!("expected a Unit, got {other:?}"),
+        };
+
+        assert_eq!(unit.name.name, "Greetings");
+        assert_eq!(unit.interface.uses.len(), 1);
+        assert_eq!(unit.interface.uses[0].name, "Crt");
+        assert_eq!(unit.interface.const_decls.len(), 1);
+        assert_eq!(unit.interface.proc_signatures.len(), 1);
+        assert_eq!(unit.interface.proc_signatures[0].name.name, "Hello");
+        assert_eq!(unit.interface.func_signatures.len(), 1);
+        assert_eq!(unit.interface.func_signatures[0].name.name, "Add");
+
+        assert_eq!(unit.implementation.proc_decls.len(), 1);
+        assert_eq!(unit.implementation.proc_decls[0].name.name, "Hello");
+        assert_eq!(unit.implementation.func_decls.len(), 1);
+        assert_eq!(unit.implementation.func_decls[0].name.name, "Add");
+    }
+
+    /// `PROGRAM`側の`USES`節も正しくパースされること。
+    #[test]
+    fn parses_program_with_uses_clause() {
+        let (program, diags) = parse_source("PROGRAM Foo; USES Crt, Sysutils; BEGIN END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+        assert_eq!(program.uses.len(), 2);
+        assert_eq!(program.uses[0].name, "Crt");
+        assert_eq!(program.uses[1].name, "Sysutils");
+    }
+
+    /// `CASE`文の`OTHERWISE`句がパースされ、`branches`とは別に
+    /// `otherwise`へ格納されること。
+    #[test]
+    fn parses_case_statement_with_otherwise_clause() {
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1 OTHERWISE y := 2 END END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Case {
+                branches,
+                otherwise,
+                ..
+            } => {
+                assert_eq!(branches.len(), 1);
+                match otherwise.as_deref() {
+                    Some(Statement::Assignment { target, .. }) => {
+                        assert_eq!(target.name, "y");
+                    }
+                    other => panic!("expected an OTHERWISE assignment, got {other:?}"),
+                }
+            }
+            other => panic!("expected a Case statement, got {other:?}"),
+        }
+    }
+
+    /// `OTHERWISE`句を持たない`CASE`文では`otherwise`が`None`のままである
+    /// こと（既存の挙動が壊れていないことのリグレッション確認）。
+    #[test]
+    fn case_statement_without_otherwise_has_none() {
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1 END END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Case { otherwise, .. } => assert!(otherwise.is_none()),
+            other => panic!("expected a Case statement, got {other:?}"),
+        }
+    }
+
+    /// `$FF`のような16進数リテラルが`Expr::HexIntLiteral`としてパースされ、
+    /// 値が正しくデコードされること。
+    #[test]
+    fn parses_hex_literal_expression() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := $FF END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Assignment { value, .. } => {
+                assert!(matches!(value, Expr::HexIntLiteral(0xFF, _)));
+            }
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// `STRING[n]`型が`TypeExpr::StringN`としてパースされること。
+    #[test]
+    fn parses_string_n_type() {
+        let (program, diags) = parse_source("PROGRAM Foo; VAR s: STRING[10]; BEGIN END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        assert_eq!(program.var_decls.len(), 1);
+        assert!(matches!(program.var_decls[0].ty, TypeExpr::StringN(10, _)));
+    }
+
+    /// コンパイラディレクティブが文の並びの中で
+    /// `Statement::CompilerDirective`としてパースされること。
+    #[test]
+    fn parses_compiler_directive_statement() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; BEGIN (*$I foo.pas*) END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        assert_eq!(program.body.statements.len(), 1);
+        match &program.body.statements[0] {
+            Statement::CompilerDirective { name, args, .. } => {
+                assert_eq!(name, "I");
+                assert_eq!(args, "foo.pas");
+            }
+            other => panic!("expected a CompilerDirective statement, got {other:?}"),
+        }
     }
 }

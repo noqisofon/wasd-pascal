@@ -17,6 +17,21 @@ use crate::span::Span;
 #[non_exhaustive]
 pub enum Expr {
     IntLiteral(i64, Span),
+    /// UCSD拡張の16進数リテラル（`$FF`）に由来する整数式。
+    ///
+    /// # 設計判断: `IntLiteral`と別バリアントに分ける理由
+    ///
+    /// レキサ・パーサーはdialectに関わらず`$FF`のような16進数リテラルを
+    /// 常に受理する（`wasd_ast::Dialect`のドキュメント参照）。dialectチェック
+    /// （ISO 7185では使用不可）は`wasd-sema`が行うが、そのためには
+    /// 「このリテラルが`$FF`という16進数表記で書かれていた」という情報が
+    /// 意味解析の時点まで残っている必要がある。デコード後の値（`i64`）だけを
+    /// `IntLiteral`に格納してしまうと、`$FF`（255）と`255`（10進）が
+    /// 区別できなくなり、意味解析側でdialectチェックのしようがなくなる。
+    /// そのため、値のデコード自体は`IntLiteral`と同じ（`i64`をそのまま
+    /// 保持する。元の文字列表記や桁数は保持しない）ものの、
+    /// 「16進数表記由来である」という事実だけを型レベルで区別して残す。
+    HexIntLiteral(i64, Span),
     RealLiteral(f64, Span),
     StringLiteral(String, Span),
     BoolLiteral(bool, Span),
@@ -53,6 +68,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::IntLiteral(_, span) => *span,
+            Expr::HexIntLiteral(_, span) => *span,
             Expr::RealLiteral(_, span) => *span,
             Expr::StringLiteral(_, span) => *span,
             Expr::BoolLiteral(_, span) => *span,
@@ -134,6 +150,7 @@ mod tests {
     fn every_expr_variant_reports_its_span() {
         let s = Span::new(0, 1);
         assert_eq!(Expr::IntLiteral(1, s).span(), s);
+        assert_eq!(Expr::HexIntLiteral(0xFF, s).span(), s);
         assert_eq!(Expr::RealLiteral(1.0, s).span(), s);
         assert_eq!(Expr::StringLiteral("a".into(), s).span(), s);
         assert_eq!(Expr::BoolLiteral(true, s).span(), s);

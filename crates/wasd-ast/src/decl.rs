@@ -1,30 +1,115 @@
 //! 宣言（`PROGRAM`/`VAR`/`CONST`/`PROCEDURE`/`FUNCTION`など）のASTノード。
 //!
 //! 今回のスコープ: `PROGRAM`ヘッダ、単一の`BEGIN...END.`ブロック、
-//! `VAR`セクション（組み込み型のみ）、`CONST`セクション（リテラル値のみ）、
-//! `PROCEDURE`/`FUNCTION`宣言（ローカル`VAR`宣言を含む）。
-//! `UNIT`/`INTERFACE`/`IMPLEMENTATION`、`TYPE`セクション
-//! （配列・レコード・ポインタ型を含む）は今回は含めない。
+//! `VAR`セクション（組み込み型 + UCSD拡張の`STRING[n]`）、`CONST`セクション
+//! （リテラル値のみ）、`PROCEDURE`/`FUNCTION`宣言（ローカル`VAR`宣言を含む）、
+//! UCSD拡張の`UNIT`/`INTERFACE`/`IMPLEMENTATION`/`USES`。
+//! `TYPE`セクション（配列・レコード・ポインタ型を含む）は今回は含めない。
 //!
-//! `Program`は将来`UNIT`宣言と並ぶ「コンパイル単位」の一種として
-//! `enum CompilationUnit { Program(Program), Unit(UnitDecl) }`のような形で
-//! 包まれる可能性がある。そのため`Program`自体は独立した`struct`のままにしておき、
-//! 今回はそのラッパーenumを先回りして作らない。
+//! `Program`と`Unit`はいずれも「コンパイル単位」であり、[`CompilationUnit`]
+//! でまとめて扱える。`wasd-parser`のエントリポイントは先頭トークンが
+//! `PROGRAM`か`UNIT`かを見て、どちらをパースするかを決める。
 
 use crate::expr::Literal;
 use crate::ident::Identifier;
 use crate::span::Span;
 use crate::stmt::Block;
 
+/// トップレベルのコンパイル単位。1つのソースファイルは`PROGRAM`宣言か
+/// `UNIT`宣言のどちらか一方を持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompilationUnit {
+    Program(Program),
+    Unit(Unit),
+}
+
 /// `PROGRAM <identifier>; ... BEGIN ... END.` 全体。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub name: Identifier,
+    /// UCSD拡張: `USES`節で参照する他`UNIT`名の並び。
+    ///
+    /// クロスファイル・クロスUNITなシンボル解決（`USES`で参照した`UNIT`の
+    /// 公開シンボルをどう取り込むか）は今回のスコープ外（Step 7のタスク文書
+    /// 参照）。ここでは構文的に参照名の並びを保持するだけで、名前解決は行わない。
+    pub uses: Vec<Identifier>,
     pub const_decls: Vec<ConstDecl>,
     pub var_decls: Vec<VarDecl>,
     pub proc_decls: Vec<ProcDecl>,
     pub func_decls: Vec<FuncDecl>,
     pub body: Block,
+    pub span: Span,
+}
+
+/// UCSD拡張: `UNIT name; INTERFACE ... IMPLEMENTATION ... END.` 全体。
+///
+/// # UNCONFIRMED: UNIT構文の一次資料未確認事項
+///
+/// このセッションでは一次資料（SofTech Microsystems Internal Architecture
+/// Reference Manual、pascal.hansotten.com等）へのネットワークアクセスが
+/// 環境のネットワークポリシーによりブロックされており（`WebFetch`が
+/// 全ドメインに対して`EGRESS_BLOCKED`を返した）、検索エンジンのスニペット
+/// 経由でしか裏付けが取れなかった。以下の点は広く知られているUCSD Pascalの
+/// 慣用的な用法に基づく仮実装であり、一次資料での確認が取れ次第見直すこと:
+///
+/// - `IMPLEMENTATION`部の末尾、`END.`の直前に初期化用の文の並び
+///   （`BEGIN ... END.`のような）が書けるかどうかは未確認。本実装では
+///   これを持たない（`IMPLEMENTATION`部の`PROCEDURE`/`FUNCTION`宣言の
+///   並びの直後に`END.`が来る前提）。
+/// - `IMPLEMENTATION`部だけに存在する非公開の`PROCEDURE`/`FUNCTION`
+///   （`INTERFACE`部に現れない）が許可されるかどうかは未確認。本実装では
+///   慣用的に許可されると仮定し、`INTERFACE`部の`proc_signatures`/
+///   `func_signatures`と`IMPLEMENTATION`部の`proc_decls`/`func_decls`との
+///   突き合わせ（本体を持つ宣言が対応するシグネチャを持つか等）は
+///   一切行わない。
+/// - `UNIT`間の循環参照が許可されるか禁止されるかは未確認。今回はそもそも
+///   `USES`解決自体を実装しないため、循環参照の検出も行わない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unit {
+    pub name: Identifier,
+    pub interface: InterfaceSection,
+    pub implementation: ImplementationSection,
+    pub span: Span,
+}
+
+/// `UNIT`の`INTERFACE`部。ここで宣言されたものが外部（`USES`節でこの
+/// `UNIT`を参照する側）に公開される想定（実際の公開範囲の強制・
+/// クロスファイル名前解決は今回のスコープ外）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceSection {
+    pub uses: Vec<Identifier>,
+    pub const_decls: Vec<ConstDecl>,
+    pub var_decls: Vec<VarDecl>,
+    /// 本体を持たない`PROCEDURE`シグネチャのみ。
+    pub proc_signatures: Vec<ProcSignature>,
+    pub func_signatures: Vec<FuncSignature>,
+    pub span: Span,
+}
+
+/// `UNIT`の`IMPLEMENTATION`部。`INTERFACE`部のシグネチャに対応する
+/// 実際の本体（またはIMPLEMENTATION部だけに存在する非公開の宣言。
+/// [`Unit`]のドキュメントのUNCONFIRMED項参照）を持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplementationSection {
+    pub proc_decls: Vec<ProcDecl>,
+    pub func_decls: Vec<FuncDecl>,
+    pub span: Span,
+}
+
+/// `INTERFACE`部に現れる、本体を持たない`PROCEDURE name(params);`宣言。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcSignature {
+    pub name: Identifier,
+    pub params: Vec<ParamDecl>,
+    pub span: Span,
+}
+
+/// `INTERFACE`部に現れる、本体を持たない`FUNCTION name(params): returnType;`宣言。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncSignature {
+    pub name: Identifier,
+    pub params: Vec<ParamDecl>,
+    pub return_type: TypeExpr,
     pub span: Span,
 }
 
@@ -82,12 +167,12 @@ pub struct ParamDecl {
     pub span: Span,
 }
 
-/// 型。今回は組み込み型のみ。
+/// 型。組み込み型に加え、UCSD拡張の`STRING[n]`型を持つ。
 ///
 /// `Expr`のリテラルバリアントと同様、型を書いたソース上の位置を
 /// バリアントごとに`Span`として保持する（型名の綴りに対する診断のため）。
 ///
-/// `#[non_exhaustive]`: 将来`Array`/`Record`/`Pointer`/`StringN`などを
+/// `#[non_exhaustive]`: 将来`Array`/`Record`/`Pointer`などを
 /// 追加する際に、既存の`match`をワイルドカードなしで壊さないようにするため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -96,6 +181,8 @@ pub enum TypeExpr {
     Real(Span),
     Boolean(Span),
     Char(Span),
+    /// UCSD拡張: `STRING[n]`（`n`は最大長）。
+    StringN(usize, Span),
 }
 
 impl TypeExpr {
@@ -104,7 +191,8 @@ impl TypeExpr {
             TypeExpr::Integer(span)
             | TypeExpr::Real(span)
             | TypeExpr::Boolean(span)
-            | TypeExpr::Char(span) => *span,
+            | TypeExpr::Char(span)
+            | TypeExpr::StringN(_, span) => *span,
         }
     }
 }
@@ -129,6 +217,7 @@ mod tests {
 
         let program = Program {
             name: ident("Foo", name_span),
+            uses: vec![],
             const_decls: vec![],
             var_decls: vec![],
             proc_decls: vec![],
@@ -166,6 +255,7 @@ mod tests {
 
         let program = Program {
             name: ident("Foo", s),
+            uses: vec![],
             const_decls: vec![const_decl.clone()],
             var_decls: vec![var_decl.clone()],
             proc_decls: vec![],

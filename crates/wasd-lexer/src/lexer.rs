@@ -366,6 +366,10 @@ impl<'src> Lexer<'src> {
     }
 
     /// UCSD拡張: `$FF`形式の16進数リテラル。
+    ///
+    /// `IntegerLiteral`ではなく`HexIntegerLiteral`を返す（`TokenKind`の
+    /// ドキュメント参照）。dialectチェックを`wasd-sema`で行うためには、
+    /// 「10進数の`255`」と「16進数の`$FF`」を区別できる必要があるため。
     fn scan_hex_literal(&mut self) -> Option<TokenKind> {
         let start = self.pos;
         self.bump(); // '$'
@@ -381,17 +385,17 @@ impl<'src> Lexer<'src> {
                 Span::new(start as u32, self.pos as u32),
                 "empty hexadecimal literal after '$'",
             );
-            return Some(TokenKind::IntegerLiteral(0));
+            return Some(TokenKind::HexIntegerLiteral(0));
         }
 
         match i64::from_str_radix(digits, 16) {
-            Ok(value) => Some(TokenKind::IntegerLiteral(value)),
+            Ok(value) => Some(TokenKind::HexIntegerLiteral(value)),
             Err(_) => {
                 self.error(
                     Span::new(start as u32, self.pos as u32),
                     format!("hexadecimal literal '${digits}' out of range"),
                 );
-                Some(TokenKind::IntegerLiteral(0))
+                Some(TokenKind::HexIntegerLiteral(0))
             }
         }
     }
@@ -488,6 +492,13 @@ mod tests {
 
     /// テスト対象(2): UCSD拡張トークン（UNIT/INTERFACEと16進数リテラル）が
     /// dialectエラーなしに通常のトークンとして認識されること。
+    ///
+    /// # Step 7での変更: `IntegerLiteral`ではなく`HexIntegerLiteral`を期待する
+    ///
+    /// 以前は16進数リテラルも通常の`IntegerLiteral`としてデコードするだけ
+    /// だったが、`wasd-sema`でのdialectチェック導入にあたり「10進数の`26`」と
+    /// 「16進数の`$1A`」を区別する必要が生じたため、専用の`HexIntegerLiteral`
+    /// を返すようにした（`TokenKind::HexIntegerLiteral`のドキュメント参照）。
     #[test]
     fn recognizes_ucsd_extension_tokens_without_dialect_error() {
         let kinds = kinds("unit Foo;\ninterface\nconst x = $1A;\n");
@@ -501,7 +512,7 @@ mod tests {
                 TokenKind::Const,
                 TokenKind::Identifier("x".to_string()),
                 TokenKind::Eq,
-                TokenKind::IntegerLiteral(0x1A),
+                TokenKind::HexIntegerLiteral(0x1A),
                 TokenKind::Semicolon,
                 TokenKind::Eof,
             ]
