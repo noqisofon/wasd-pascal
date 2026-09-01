@@ -61,13 +61,16 @@ pub enum Statement {
         until_cond: Expr,
         span: Span,
     },
-    /// `CASE selector OF label1, label2: stmt1; label3: stmt2; ... END`。
+    /// `CASE selector OF label1, label2: stmt1; label3: stmt2; ... [OTHERWISE stmtN] END`。
     ///
-    /// UCSD拡張の`OTHERWISE`句は今回のスコープに含めない
-    /// （`dialect`チェック導入後に追加する）。
+    /// `otherwise`はUCSD拡張の`OTHERWISE`句（どの`label`にも一致しない場合の
+    /// デフォルト分岐）。`Iso7185`では使用不可であり、dialectチェックは
+    /// `wasd-sema`が行う（`wasd_ast::Dialect`のドキュメント参照）。パーサーは
+    /// dialectに関わらず常に受理する。
     Case {
         selector: Expr,
         branches: Vec<CaseBranch>,
+        otherwise: Option<Box<Statement>>,
         span: Span,
     },
     Compound(Block),
@@ -76,6 +79,19 @@ pub enum Statement {
     ProcCall {
         name: Identifier,
         args: Vec<Expr>,
+        span: Span,
+    },
+    /// UCSD拡張: コンパイラディレクティブ `(*$I foo.pas*)`。
+    ///
+    /// 今回のスコープでは実際のプリプロセッサ的な動作（ファイルの
+    /// インクルードなど）は実装せず、ディレクティブの存在を認識し
+    /// dialectチェックの対象とするところまでに留める
+    /// （`wasd-sema`のドキュメント参照）。文の並びの中に現れた場合のみを
+    /// 扱い、宣言部など他の位置に現れた場合は今回のスコープ外
+    /// （既存の`skip_unsupported_section`等の読み飛ばし経路に委ねる）。
+    CompilerDirective {
+        name: String,
+        args: String,
         span: Span,
     },
 }
@@ -112,6 +128,7 @@ impl Statement {
             Statement::Case { span, .. } => *span,
             Statement::Compound(block) => block.span,
             Statement::ProcCall { span, .. } => *span,
+            Statement::CompilerDirective { span, .. } => *span,
         }
     }
 }

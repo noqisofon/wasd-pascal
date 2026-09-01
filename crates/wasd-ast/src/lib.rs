@@ -11,7 +11,10 @@ pub mod ident;
 pub mod span;
 pub mod stmt;
 
-pub use decl::{ConstDecl, FuncDecl, ParamDecl, ProcDecl, Program, TypeExpr, VarDecl};
+pub use decl::{
+    CompilationUnit, ConstDecl, FuncDecl, FuncSignature, ImplementationSection, InterfaceSection,
+    ParamDecl, ProcDecl, ProcSignature, Program, TypeExpr, Unit, VarDecl,
+};
 pub use diagnostic::{Diagnostic, Severity};
 pub use dialect::Dialect;
 pub use expr::{BinOp, Expr, Literal, UnOp};

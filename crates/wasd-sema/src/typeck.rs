@@ -13,13 +13,21 @@
 //! カスケードエラーを防ぐ。
 
 use wasd_ast as ast;
-use wasd_ast::{Diagnostic, Identifier, Severity, Span};
+use wasd_ast::{Dialect, Diagnostic, Identifier, Severity, Span};
 
+use crate::dialect_check;
 use crate::symbol_table::{ParamSignature, SymbolInfo, SymbolKind, SymbolTable};
 use crate::types::Type;
 
-/// 意味解析（今回のスコープでは型検査のみ）の実行コンテキスト。
+/// 意味解析（型検査 + dialectチェック）の実行コンテキスト。
 pub struct SemaContext {
+    /// 現在有効なdialect。`Dialect::Iso7185`が既定で、UCSD拡張構文
+    /// （`UNIT`/`USES`/`OTHERWISE`/`STRING[n]`/16進数リテラル/
+    /// コンパイラディレクティブ）は`Dialect::Ucsd`が明示的に指定された
+    /// 場合のみ許可される。`check_program`/`check_unit`をまたいでも
+    /// 変わらない（コンストラクタでのみ設定する）ため、両メソッドの
+    /// 冒頭のリセット処理では触らない。
+    dialect: Dialect,
     symbol_table: SymbolTable,
     diagnostics: Vec<Diagnostic>,
     /// 現在型検査中の`FUNCTION`本体の名前（小文字正規化済み）。
@@ -47,17 +55,52 @@ pub struct SemaContext {
 
 impl Default for SemaContext {
     fn default() -> Self {
-        Self::new()
+        Self::new(Dialect::default())
     }
 }
 
 impl SemaContext {
-    pub fn new() -> Self {
+    pub fn new(dialect: Dialect) -> Self {
         Self {
+            dialect,
             symbol_table: SymbolTable::new(),
             diagnostics: Vec::new(),
             current_function: None,
             for_loop_vars: Vec::new(),
+        }
+    }
+
+    /// UCSD拡張構文が現在の`dialect`で許可されているかを判定し、許可されて
+    /// いなければ`Diagnostic`を積む。判定ロジック自体は[`dialect_check`]
+    /// モジュールに切り出してある（単体テストしやすくするため）。
+    ///
+    /// この関数はエラーを報告するだけで、呼び出し元の走査を止めない。
+    /// 呼び出し元は診断の有無に関わらずASTの残りの意味解析を継続すること
+    /// （LSPで他のエラーも同時に見せるため。Step 3のドキュメント参照）。
+    fn check_dialect_gate(&mut self, span: Span, feature: &str, required: Dialect) {
+        if let Some(diag) = dialect_check::check_dialect_gate(self.dialect, span, feature, required) {
+            self.diagnostics.push(diag);
+        }
+    }
+
+    /// `wasd_ast::TypeExpr`（ソース上に書かれた型注釈）を型検査用の
+    /// `Type`へ変換する。`TypeExpr::StringN`はUCSD拡張なので、ここで
+    /// dialectチェックを行う（`self`を要求するのはこのため。以前は
+    /// フリー関数だったが、dialectチェックのために`SemaContext`のメソッドに
+    /// 変更した）。
+    fn type_from_type_expr(&mut self, ty: &ast::TypeExpr) -> Type {
+        match ty {
+            ast::TypeExpr::Integer(_) => Type::Integer,
+            ast::TypeExpr::Real(_) => Type::Real,
+            ast::TypeExpr::Boolean(_) => Type::Boolean,
+            ast::TypeExpr::Char(_) => Type::Char,
+            ast::TypeExpr::StringN(n, span) => {
+                self.check_dialect_gate(*span, "STRING[n] type", Dialect::Ucsd);
+                Type::StringN(*n)
+            }
+            // `TypeExpr`は`#[non_exhaustive]`。配列型/レコード型などが将来
+            // 追加された際は、ここを拡張するまでの間`Type::Error`とする。
+            _ => Type::Error,
         }
     }
 
@@ -87,6 +130,8 @@ impl SemaContext {
         self.current_function = None;
         self.for_loop_vars = Vec::new();
 
+        self.check_uses_clause(&program.uses);
+
         self.collect_const_decls(&program.const_decls);
         self.collect_var_decls(&program.var_decls);
 
@@ -102,13 +147,57 @@ impl SemaContext {
         std::mem::take(&mut self.diagnostics)
     }
 
+    /// `Unit`を走査し、dialectチェック + 型検査を行う。
+    ///
+    /// # 今回のスコープ: `INTERFACE`/`IMPLEMENTATION`間の突き合わせは行わない
+    ///
+    /// `INTERFACE`部の`PROCEDURE`/`FUNCTION`シグネチャ（`proc_signatures`/
+    /// `func_signatures`）はシンボルテーブルへ登録しない。`IMPLEMENTATION`部
+    /// の完全な宣言（`proc_decls`/`func_decls`）が対応するシグネチャを
+    /// 持つかどうかの検証や、`INTERFACE`部の宣言と`IMPLEMENTATION`部の
+    /// 宣言が同名の場合の整合性チェックは、`USES`によるクロスファイル・
+    /// クロスUNITなシンボル解決と合わせて次のステップに切り出す
+    /// （`wasd_ast::Unit`のドキュメント参照）。今回はUNIT自体・`USES`節に
+    /// 対するdialectチェックと、`INTERFACE`部の`CONST`/`VAR`宣言、
+    /// `IMPLEMENTATION`部の`PROCEDURE`/`FUNCTION`本体の型検査のみを行う。
+    pub fn check_unit(&mut self, unit: &ast::Unit) -> Vec<Diagnostic> {
+        self.symbol_table = SymbolTable::new();
+        self.diagnostics = Vec::new();
+        self.current_function = None;
+        self.for_loop_vars = Vec::new();
+
+        self.check_dialect_gate(unit.span, "UNIT declarations", Dialect::Ucsd);
+        self.check_uses_clause(&unit.interface.uses);
+
+        self.collect_const_decls(&unit.interface.const_decls);
+        self.collect_var_decls(&unit.interface.var_decls);
+
+        for proc in &unit.implementation.proc_decls {
+            self.check_proc_decl(proc);
+        }
+        for func in &unit.implementation.func_decls {
+            self.check_func_decl(func);
+        }
+
+        std::mem::take(&mut self.diagnostics)
+    }
+
+    /// UCSD拡張: `USES`節のdialectチェック。空であれば何もしない
+    /// （`USES`節自体が存在しなければ、そもそもdialectを問う対象がない）。
+    fn check_uses_clause(&mut self, uses: &[Identifier]) {
+        if let (Some(first), Some(last)) = (uses.first(), uses.last()) {
+            let span = Span::new(first.span.start, last.span.end);
+            self.check_dialect_gate(span, "USES clauses", Dialect::Ucsd);
+        }
+    }
+
     // ---- PROCEDURE/FUNCTION宣言 ----
 
-    fn param_signatures(&self, params: &[ast::ParamDecl]) -> Vec<ParamSignature> {
+    fn param_signatures(&mut self, params: &[ast::ParamDecl]) -> Vec<ParamSignature> {
         params
             .iter()
             .map(|p| ParamSignature {
-                ty: type_from_type_expr(&p.ty),
+                ty: self.type_from_type_expr(&p.ty),
                 by_ref: p.by_ref,
             })
             .collect()
@@ -116,7 +205,7 @@ impl SemaContext {
 
     fn declare_params(&mut self, params: &[ast::ParamDecl]) {
         for p in params {
-            let ty = type_from_type_expr(&p.ty);
+            let ty = self.type_from_type_expr(&p.ty);
             self.declare(&p.name, ty, SymbolKind::Param { by_ref: p.by_ref }, p.span);
         }
     }
@@ -146,7 +235,7 @@ impl SemaContext {
 
     fn check_func_decl(&mut self, decl: &ast::FuncDecl) {
         let params = self.param_signatures(&decl.params);
-        let return_type = type_from_type_expr(&decl.return_type);
+        let return_type = self.type_from_type_expr(&decl.return_type);
         self.declare(
             &decl.name,
             return_type,
@@ -181,7 +270,7 @@ impl SemaContext {
 
     fn collect_var_decls(&mut self, decls: &[ast::VarDecl]) {
         for decl in decls {
-            let ty = type_from_type_expr(&decl.ty);
+            let ty = self.type_from_type_expr(&decl.ty);
             for name in &decl.names {
                 self.declare(name, ty, SymbolKind::Var, decl.span);
             }
@@ -255,13 +344,17 @@ impl SemaContext {
             ast::Statement::Case {
                 selector,
                 branches,
+                otherwise,
                 ..
             } => {
-                self.check_case_statement(selector, branches);
+                self.check_case_statement(selector, branches, otherwise);
             }
             ast::Statement::Compound(block) => self.check_block(block),
             ast::Statement::ProcCall { name, args, .. } => {
                 self.check_proc_call(name, args);
+            }
+            ast::Statement::CompilerDirective { name, span, .. } => {
+                self.check_compiler_directive(name, *span);
             }
             // `Statement`は`#[non_exhaustive]`。将来追加されるバリアントは、
             // 追加時にこの型検査を拡張するまでの間、ここでは何もしない
@@ -270,12 +363,47 @@ impl SemaContext {
         }
     }
 
-    /// `CASE selector OF label1, label2: stmt1; ... END`の型検査。
+    /// UCSD拡張: コンパイラディレクティブ `(*$I foo.pas*)`のdialectチェック。
+    ///
+    /// # UNCONFIRMED: `$I`（include）以外のディレクティブ
+    ///
+    /// このセッションでは一次資料（SofTech Microsystems Internal
+    /// Architecture Reference Manual等）へのネットワークアクセスが
+    /// 環境のネットワークポリシーによりブロックされており（`WebFetch`が
+    /// 全ドメインで`EGRESS_BLOCKED`）、検索エンジンのスニペット経由でしか
+    /// 裏付けが取れなかった。`$I`（include。引数にファイル名を取る）は
+    /// UCSD PascalとBorland Pascalに共通する既知のディレクティブとして
+    /// 間接的に確認できたが、それ以外（`$U`/`$S`/`$R`等、トグル式の
+    /// ディレクティブがUCSD Pascalに存在した可能性はある）は未確認のため、
+    /// 既知のディレクティブとして断定しない。未知のディレクティブは
+    /// エラーではなく警告に留める（実際にファイルをincludeする処理自体は
+    /// 今回のスコープ外。`wasd_ast::Statement::CompilerDirective`の
+    /// ドキュメント参照）。
+    fn check_compiler_directive(&mut self, name: &str, span: Span) {
+        self.check_dialect_gate(span, "compiler directives ((*$...*))", Dialect::Ucsd);
+
+        let known = name.eq_ignore_ascii_case("I");
+        if !known {
+            self.diagnostics.push(Diagnostic::new(
+                span,
+                Severity::Warning,
+                format!(
+                    "unknown compiler directive '${name}' (not verified against primary UCSD \
+                     Pascal documentation in this implementation; UNCONFIRMED)"
+                ),
+            ));
+        }
+    }
+
+    /// `CASE selector OF label1, label2: stmt1; ... [OTHERWISE stmtN] END`の型検査。
     ///
     /// - `selector`は順序型でなければならない。今回のスコープでは
     ///   `INTEGER`/`CHAR`/`BOOLEAN`のみをサポートする（`REAL`は不可）。
     /// - 各`label`の型は`selector`の型と一致しなければならない。
     /// - `label`はすべての分岐を通じて重複してはならない。
+    /// - UCSD拡張の`otherwise`が`Some`の場合、`Dialect::Ucsd`が要求される
+    ///   （`Iso7185`では使用不可）。dialectエラーを報告した後も`otherwise`の
+    ///   本体自体は型検査を継続する。
     ///
     /// # 方針: 非網羅性（どの分岐にも一致しない値が来た場合）は診断しない
     ///
@@ -284,10 +412,14 @@ impl SemaContext {
     /// 「網羅性」を機械的に判定することも一般には困難である
     /// （`INTEGER`は事実上無限の値域を持つため、静的な網羅性チェックには
     /// 意味がない）。そのため本実装は非網羅性を診断しない
-    /// （エラーにも警告にもしない）。UCSD拡張の`OTHERWISE`句
-    /// （今回のスコープ外）を導入すれば、利用者が明示的にフォールバックを
-    /// 書けるようになる。
-    fn check_case_statement(&mut self, selector: &ast::Expr, branches: &[ast::CaseBranch]) {
+    /// （エラーにも警告にもしない）。UCSD拡張の`OTHERWISE`句を使えば、
+    /// 利用者が明示的にフォールバックを書ける。
+    fn check_case_statement(
+        &mut self,
+        selector: &ast::Expr,
+        branches: &[ast::CaseBranch],
+        otherwise: &Option<Box<ast::Statement>>,
+    ) {
         let selector_ty = self.infer_expr_type(selector);
         let selector_is_ordinal = matches!(selector_ty, Type::Integer | Type::Boolean | Type::Char);
         if !selector_is_ordinal && selector_ty != Type::Error {
@@ -331,6 +463,11 @@ impl SemaContext {
                 }
             }
             self.check_statement(&branch.body);
+        }
+
+        if let Some(otherwise_stmt) = otherwise {
+            self.check_dialect_gate(otherwise_stmt.span(), "OTHERWISE clause", Dialect::Ucsd);
+            self.check_statement(otherwise_stmt);
         }
     }
 
@@ -689,6 +826,13 @@ impl SemaContext {
     fn infer_expr_type(&mut self, expr: &ast::Expr) -> Type {
         match expr {
             ast::Expr::IntLiteral(..) => Type::Integer,
+            ast::Expr::HexIntLiteral(_, span) => {
+                // UCSD拡張: `$FF`。値そのものは通常のINTEGERと同じ意味を
+                // 持つため、dialectエラーを報告した後も型はINTEGERのまま
+                // 扱う（以降の演算・代入の型検査を継続できるようにするため）。
+                self.check_dialect_gate(*span, "hexadecimal literals ($FF)", Dialect::Ucsd);
+                Type::Integer
+            }
             ast::Expr::RealLiteral(..) => Type::Real,
             ast::Expr::BoolLiteral(..) => Type::Boolean,
             ast::Expr::StringLiteral(value, span) => self.infer_string_literal_type(value, *span),
@@ -771,35 +915,43 @@ impl SemaContext {
     ///
     /// # 方針: 長さ1の文字列リテラルのみ`CHAR`として扱う
     ///
-    /// 現在の`wasd-ast`には正式な`STRING`型が存在しない
-    /// （`ast::TypeExpr`はINTEGER/REAL/BOOLEAN/CHARのみ）。ISO 7185の
-    /// Pascalでも文字列リテラルは本来`PACKED ARRAY [1..n] OF CHAR`型の
-    /// 値であり、配列型が未実装の現時点でその型を正しく表現することは
-    /// できない。一方で、長さ1の文字列リテラル（`'x'`）はISO 7185上も
-    /// `CHAR`型の値として直接使えるため、この場合に限り`CHAR`として
-    /// 受理する。
+    /// 長さ1の文字列リテラル（`'x'`）はISO 7185上も`CHAR`型の値として
+    /// 直接使えるため、dialectに関わらずこの場合は`CHAR`として受理する。
     ///
-    /// 長さ0または2文字以上の文字列リテラルは、対応する型（配列型/
-    /// `STRING[n]`型）が未実装であることを`Severity::Warning`の診断で
-    /// 知らせたうえで（今回のスコープでは複数文字の文字列を扱えないのは
-    /// 既知の制約であり、まだ実装していない機能を使おうとしたことを表す
-    /// のであって、書いたプログラム自体の意味エラーではないため
-    /// `Error`ではなく`Warning`とする）、`Type::Error`を返す。これにより
-    /// この式を使った以降の演算・代入で無関係なカスケードエラーが
-    /// 出るのを防ぐ。配列型/`STRING[n]`型を追加する際にここを見直すこと。
+    /// # `Dialect::Ucsd`: 長さ1以外の文字列リテラルは`STRING[n]`型
+    ///
+    /// `Dialect::Ucsd`では`STRING[n]`型（Step 7で導入）が使えるため、
+    /// 長さ`n`（`n != 1`）の文字列リテラルはその長さの`Type::StringN(n)`
+    /// として扱う。`STRING[n]`同士の長さ互換性判定（異なる`n`を持つ
+    /// `STRING`変数への代入可否）は行わない暫定実装であることに注意
+    /// （`crate::types::Type::StringN`のドキュメント参照）。
+    ///
+    /// # `Dialect::Iso7185`: 長さ1以外の文字列リテラルは未対応
+    ///
+    /// ISO 7185のPascalでも文字列リテラルは本来
+    /// `PACKED ARRAY [1..n] OF CHAR`型の値であり、配列型が未実装の
+    /// 現時点ではその型を正しく表現できない。そのため`Severity::Warning`の
+    /// 診断で「対応する型が未実装であること」を知らせたうえで（書いた
+    /// プログラム自体の意味エラーではなく、まだ実装していない機能を
+    /// 使おうとしたことを表すため`Error`ではなく`Warning`とする）、
+    /// `Type::Error`を返す。これによりこの式を使った以降の演算・代入で
+    /// 無関係なカスケードエラーが出るのを防ぐ。
     fn infer_string_literal_type(&mut self, value: &str, span: Span) -> Type {
-        if value.chars().count() == 1 {
-            Type::Char
-        } else {
-            self.diagnostics.push(Diagnostic::new(
-                span,
-                Severity::Warning,
-                "string literals with a length other than 1 are not supported yet \
-                 (STRING/array types are not implemented); this literal is ignored \
-                 for type checking purposes",
-            ));
-            Type::Error
+        let len = value.chars().count();
+        if len == 1 {
+            return Type::Char;
         }
+        if self.dialect == Dialect::Ucsd {
+            return Type::StringN(len);
+        }
+        self.diagnostics.push(Diagnostic::new(
+            span,
+            Severity::Warning,
+            "string literals with a length other than 1 are not supported yet \
+             (STRING/array types are not implemented); this literal is ignored \
+             for type checking purposes",
+        ));
+        Type::Error
     }
 
     fn infer_literal_type(&mut self, literal: &ast::Literal) -> Type {
@@ -943,17 +1095,6 @@ fn bin_op_symbol(op: ast::BinOp) -> &'static str {
     }
 }
 
-fn type_from_type_expr(ty: &ast::TypeExpr) -> Type {
-    match ty {
-        ast::TypeExpr::Integer(_) => Type::Integer,
-        ast::TypeExpr::Real(_) => Type::Real,
-        ast::TypeExpr::Boolean(_) => Type::Boolean,
-        ast::TypeExpr::Char(_) => Type::Char,
-        // `TypeExpr`は`#[non_exhaustive]`。配列型/レコード型などが将来
-        // 追加された際は、ここを拡張するまでの間`Type::Error`とする。
-        _ => Type::Error,
-    }
-}
 
 /// `CASE`ラベルの重複検出用キー。型の種類ごとに接頭辞を分けることで、
 /// 異なる型のリテラル同士（例えば整数の`1`と実数の`1.0`）を誤って
@@ -982,10 +1123,15 @@ mod tests {
     use super::*;
 
     /// ソース文字列を`wasd-lexer`→`wasd-parser`→`wasd-sema`の順に通し、
-    /// 型検査の診断だけを取り出す統合テスト用ヘルパー。字句解析・構文解析
-    /// 自体のエラーはこのテストスイートの対象外なので、両方とも空である
-    /// ことをアサートしてから型検査に進む。
+    /// 型検査の診断だけを取り出す統合テスト用ヘルパー（`Dialect::Iso7185`
+    /// 固定）。字句解析・構文解析自体のエラーはこのテストスイートの対象外
+    /// なので、両方とも空であることをアサートしてから型検査に進む。
     fn check(source: &str) -> Vec<Diagnostic> {
+        check_with_dialect(source, Dialect::Iso7185)
+    }
+
+    /// [`check`]のdialect指定版。UCSD拡張構文のdialectチェックのテストに使う。
+    fn check_with_dialect(source: &str, dialect: Dialect) -> Vec<Diagnostic> {
         let (tokens, lex_diags) = wasd_lexer::Lexer::new(source).tokenize();
         assert!(
             lex_diags.is_empty(),
@@ -997,7 +1143,27 @@ mod tests {
             "unexpected parser diagnostics for {source:?}: {parse_diags:?}"
         );
         let program = program.expect("should parse a Program");
-        SemaContext::new().check_program(&program)
+        SemaContext::new(dialect).check_program(&program)
+    }
+
+    /// `UNIT`ソース文字列を`wasd-lexer`→`wasd-parser`(`parse_unit`相当)→
+    /// `wasd-sema`(`check_unit`)の順に通す統合テスト用ヘルパー。
+    fn check_unit_with_dialect(source: &str, dialect: Dialect) -> Vec<Diagnostic> {
+        let (tokens, lex_diags) = wasd_lexer::Lexer::new(source).tokenize();
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics for {source:?}: {lex_diags:?}"
+        );
+        let (unit, parse_diags) = wasd_parser::Parser::new(tokens).parse_compilation_unit();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics for {source:?}: {parse_diags:?}"
+        );
+        let unit = match unit.expect("should parse a CompilationUnit") {
+            ast::CompilationUnit::Unit(unit) => unit,
+            ast::CompilationUnit::Program(_) => panic!("expected a UNIT, got a PROGRAM"),
+        };
+        SemaContext::new(dialect).check_unit(&unit)
     }
 
     fn errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
@@ -1757,6 +1923,301 @@ mod tests {
     fn non_exhaustive_case_statement_is_not_diagnosed() {
         let diags =
             check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1 END END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7: dialectチェック
+    // ------------------------------------------------------------------
+
+    /// OTHERWISE: `Dialect::Ucsd`では正常に受理される。
+    #[test]
+    fn otherwise_clause_is_accepted_under_ucsd_dialect() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1 OTHERWISE y := 2 END END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// OTHERWISE: 既定の`Dialect::Iso7185`ではdialectエラーになる。
+    #[test]
+    fn otherwise_clause_is_rejected_under_iso7185_dialect() {
+        let diags = check(
+            "PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1 OTHERWISE y := 2 END END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("OTHERWISE"));
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// OTHERWISE: dialectエラーが出ても、`OTHERWISE`本体内の無関係な
+    /// 型エラーは引き続き検出される（エラー耐性）。
+    #[test]
+    fn otherwise_clause_dialect_error_does_not_suppress_body_type_errors() {
+        let diags = check(
+            "PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1 OTHERWISE x := TRUE END END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 2, "diagnostics: {diags:?}");
+        assert!(errs.iter().any(|d| d.message.contains("OTHERWISE")));
+        assert!(errs.iter().any(|d| d.message.contains("Type mismatch")));
+    }
+
+    /// 16進数リテラル: `Dialect::Ucsd`では正常に受理される。
+    #[test]
+    fn hex_literal_is_accepted_under_ucsd_dialect() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; VAR x: INTEGER; BEGIN x := $FF END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 16進数リテラル: 既定の`Dialect::Iso7185`ではdialectエラーになる。
+    #[test]
+    fn hex_literal_is_rejected_under_iso7185_dialect() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x := $FF END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// 16進数リテラル: dialectエラーが出ても値はINTEGERとして扱われ続け、
+    /// 以降の型検査（この場合は代入自体）はカスケードエラーにならない。
+    #[test]
+    fn hex_literal_dialect_error_does_not_cascade() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x := $FF + 1 END.");
+        let errs = errors(&diags);
+        // '$FF'自体のdialectエラー1件のみで、'+'や代入についての追加の
+        // 型エラーは出ない（INTEGER + INTEGERとして正しく検査される）。
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// STRING[n]型: `Dialect::Ucsd`では正常に受理される。
+    #[test]
+    fn string_n_type_is_accepted_under_ucsd_dialect() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; VAR s: STRING[10]; BEGIN END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// STRING[n]型: 既定の`Dialect::Iso7185`ではdialectエラーになる。
+    #[test]
+    fn string_n_type_is_rejected_under_iso7185_dialect() {
+        let diags = check("PROGRAM Foo; VAR s: STRING[10]; BEGIN END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("STRING"));
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// STRING[n]型: dialectエラーが出た後も、プログラム中の他の無関係な
+    /// 型エラーは引き続き検出される（エラー耐性）。
+    #[test]
+    fn string_n_type_dialect_error_does_not_suppress_other_errors() {
+        let diags = check(
+            "PROGRAM Foo; VAR s: STRING[10]; x: INTEGER; BEGIN x := TRUE END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 2, "diagnostics: {diags:?}");
+        assert!(errs.iter().any(|d| d.message.contains("STRING")));
+        assert!(errs.iter().any(|d| d.message.contains("Type mismatch")));
+    }
+
+    /// `Dialect::Ucsd`では、長さ1以外の文字列リテラルが`STRING[n]`型として
+    /// 扱われ、`STRING[n]`変数への代入が（長さが完全一致する場合）許可される。
+    #[test]
+    fn ucsd_dialect_infers_string_n_type_for_multi_char_literal() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; VAR s: STRING[5]; BEGIN s := 'hello' END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 既定の`Dialect::Iso7185`では、長さ1以外の文字列リテラルは以前と
+    /// 変わらず警告のみ（型エラーではない）で、既存の挙動が壊れていない
+    /// こと（リグレッション確認）。
+    #[test]
+    fn iso7185_dialect_keeps_multi_char_string_literal_as_warning_only() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x := 1 END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let diags = check("PROGRAM Foo; BEGIN WriteLn('hello') END.");
+        assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning),
+            "expected a warning for the multi-char string literal: {diags:?}"
+        );
+    }
+
+    /// USES節: `Dialect::Ucsd`では正常に受理される。
+    #[test]
+    fn uses_clause_is_accepted_under_ucsd_dialect() {
+        let diags = check_with_dialect("PROGRAM Foo; USES Crt; BEGIN END.", Dialect::Ucsd);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// USES節: 既定の`Dialect::Iso7185`ではdialectエラーになる。
+    #[test]
+    fn uses_clause_is_rejected_under_iso7185_dialect() {
+        let diags = check("PROGRAM Foo; USES Crt; BEGIN END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("USES"));
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// コンパイラディレクティブ: `Dialect::Ucsd`かつ既知の`$I`であれば
+    /// 警告・エラーいずれも出ない。
+    #[test]
+    fn known_compiler_directive_is_accepted_under_ucsd_dialect_without_warning() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; BEGIN (*$I foo.pas*) END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// コンパイラディレクティブ: 既定の`Dialect::Iso7185`ではdialectエラーに
+    /// なる。
+    #[test]
+    fn compiler_directive_is_rejected_under_iso7185_dialect() {
+        let diags = check("PROGRAM Foo; BEGIN (*$I foo.pas*) END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// コンパイラディレクティブ: `Dialect::Ucsd`でも未知のディレクティブ名は
+    /// 警告になる（エラーにはしない。UNCONFIRMEDの方針）。
+    #[test]
+    fn unknown_compiler_directive_is_warned_about_under_ucsd_dialect() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; BEGIN (*$Q mystery*) END.",
+            Dialect::Ucsd,
+        );
+        assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("$Q")),
+            "expected a warning about the unknown directive: {diags:?}"
+        );
+    }
+
+    /// UNIT: `Dialect::Ucsd`では正常に受理される（INTERFACE/IMPLEMENTATIONの
+    /// 宣言も型検査される）。
+    #[test]
+    fn unit_declaration_is_accepted_under_ucsd_dialect() {
+        let src = r#"
+            UNIT Greetings;
+            INTERFACE
+            CONST Greeting = 'H';
+            PROCEDURE Hello;
+            IMPLEMENTATION
+            PROCEDURE Hello;
+            VAR x: INTEGER;
+            BEGIN
+                x := 1
+            END;
+            END.
+        "#;
+        let diags = check_unit_with_dialect(src, Dialect::Ucsd);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// UNIT: 既定の`Dialect::Iso7185`ではUNIT自体がdialectエラーになる。
+    #[test]
+    fn unit_declaration_is_rejected_under_iso7185_dialect() {
+        let src = r#"
+            UNIT Greetings;
+            INTERFACE
+            IMPLEMENTATION
+            END.
+        "#;
+        let diags = check_unit_with_dialect(src, Dialect::Iso7185);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("UNIT"));
+        assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// UNIT: `Iso7185`でのUNIT自体のdialectエラーが出ても、
+    /// `IMPLEMENTATION`部の無関係な型エラーは引き続き検出される
+    /// （エラー耐性）。
+    #[test]
+    fn unit_dialect_error_does_not_suppress_implementation_type_errors() {
+        let src = r#"
+            UNIT Greetings;
+            INTERFACE
+            IMPLEMENTATION
+            PROCEDURE Oops;
+            VAR x: INTEGER;
+            BEGIN
+                x := TRUE
+            END;
+            END.
+        "#;
+        let diags = check_unit_with_dialect(src, Dialect::Iso7185);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 2, "diagnostics: {diags:?}");
+        assert!(errs.iter().any(|d| d.message.contains("UNIT")));
+        assert!(errs.iter().any(|d| d.message.contains("Type mismatch")));
+    }
+
+    /// UNIT: `USES`節を持つUNITも、既定の`Dialect::Iso7185`では両方
+    /// （UNIT自体・USES節）についてdialectエラーが出ること。
+    #[test]
+    fn unit_with_uses_clause_reports_both_dialect_errors_under_iso7185() {
+        let src = r#"
+            UNIT Greetings;
+            INTERFACE
+            USES Crt;
+            IMPLEMENTATION
+            END.
+        "#;
+        let diags = check_unit_with_dialect(src, Dialect::Iso7185);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 2, "diagnostics: {diags:?}");
+        assert!(errs.iter().any(|d| d.message.contains("UNIT")));
+        assert!(errs.iter().any(|d| d.message.contains("USES")));
+    }
+
+    /// リグレッション確認: Step 6までのISO 7185相当のテストが、dialectの
+    /// 明示指定なし（既定の`Iso7185`）で引き続き全て通ること
+    /// （代表例としてPROCEDURE/FUNCTION/FOR/REPEAT/CASEを含むプログラムを
+    /// 1本にまとめて検証する）。
+    #[test]
+    fn iso7185_regression_program_with_procedures_for_repeat_case_has_no_diagnostics() {
+        let src = r#"
+            PROGRAM Regression;
+            VAR total, i: INTEGER;
+
+            FUNCTION Square(n: INTEGER): INTEGER;
+            BEGIN
+                Square := n * n
+            END;
+
+            BEGIN
+                total := 0;
+                FOR i := 1 TO 5 DO
+                    total := total + Square(i);
+                REPEAT
+                    total := total - 1
+                UNTIL total <= 0;
+                CASE i OF
+                    1, 2: total := 1;
+                    3: total := 2
+                END
+            END.
+        "#;
+        let diags = check(src);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

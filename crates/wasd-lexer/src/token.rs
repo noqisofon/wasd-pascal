@@ -78,6 +78,11 @@ pub enum TokenKind {
     // --- 識別子・リテラル ---
     Identifier(String),
     IntegerLiteral(i64),
+    /// UCSD拡張の16進数リテラル（`$FF`）。デコード後の値は`IntegerLiteral`と
+    /// 同じ`i64`だが、`wasd-sema`のdialectチェックが「これは16進数表記
+    /// 由来である」と判定できるよう、`IntegerLiteral`とは別種別として保持する
+    /// （`wasd_ast::Expr::HexIntLiteral`のドキュメント参照）。
+    HexIntegerLiteral(i64),
     RealLiteral(f64),
     /// 文字列リテラル。`''`によるシングルクォートのエスケープは解決済みの値を持つ。
     ///
