@@ -43,27 +43,59 @@ pub struct Program {
 
 /// UCSD拡張: `UNIT name; INTERFACE ... IMPLEMENTATION ... END.` 全体。
 ///
-/// # UNCONFIRMED: UNIT構文の一次資料未確認事項
+/// # CONFIRMED: UNIT構文の基本構造
 ///
-/// このセッションでは一次資料（SofTech Microsystems Internal Architecture
-/// Reference Manual、pascal.hansotten.com等）へのネットワークアクセスが
-/// 環境のネットワークポリシーによりブロックされており（`WebFetch`が
-/// 全ドメインに対して`EGRESS_BLOCKED`を返した）、検索エンジンのスニペット
-/// 経由でしか裏付けが取れなかった。以下の点は広く知られているUCSD Pascalの
-/// 慣用的な用法に基づく仮実装であり、一次資料での確認が取れ次第見直すこと:
+/// 2026-09-01の一次資料調査（リポジトリのUCSD Pascal一次資料調査メモ参照）
+/// により、以下の基本構造が確認できた:
 ///
-/// - `IMPLEMENTATION`部の末尾、`END.`の直前に初期化用の文の並び
-///   （`BEGIN ... END.`のような）が書けるかどうかは未確認。本実装では
-///   これを持たない（`IMPLEMENTATION`部の`PROCEDURE`/`FUNCTION`宣言の
-///   並びの直後に`END.`が来る前提）。
+/// - `INTERFACE`部には実装（本体）を書いてはならず、宣言・シグネチャのみを
+///   持つ。本実装の[`InterfaceSection`]（シグネチャのみ保持）はこの設計に
+///   合致する。
+/// - `IMPLEMENTATION`部に実際の`PROCEDURE`/`FUNCTION`の本体を書く。
+/// - `UNIT`は単体では実行できないが、それ以外は`PROGRAM`と類似した構造
+///   （定数・型・変数・ルーチンの定義）を持つ。
+/// - `USES`節はコンパイラに対し、指定した`UNIT`のコードを取り込み、その
+///   `UNIT`の`INTERFACE`部で宣言された識別子を、あたかも自分のモジュールの
+///   一部であるかのように利用可能にするよう指示する。
+///
+/// 出典: Wikibooks, "Pascal Programming/Units"
+/// <https://en.wikibooks.org/wiki/Pascal_Programming/Units>（一次資料では
+/// ないが、UCSD Pascalのunit機構の基本構造の確認に用いた）。より一次資料に
+/// 近い *UCSD PASCAL I.5 Manual* (Version I.5, September 1978) Section
+/// 2.2.21「UNITS」（目次上はp.156付近）にも該当の解説があるはずだが、OCR化
+/// されたテキストの文字化けにより本文の直接確認はまだ取れていない。
+///
+/// # 未実装: UNIT初期化・終了処理（p-machineレベルでは存在を確認済み）
+///
+/// SofTech Microsystems, *UCSD p-System and UCSD Pascal Version IV: Internal
+/// Architecture Guide* (First edition, March 1981)
+/// <https://archive.org/details/UCSD_P-System_UCSD_PASCAL_Internal_Architecture_Guide>
+/// により、p-machine内部では各`UNIT`がコンパイル単位ごとに「セグメント参照
+/// リスト」を持ち、名前`'***'`の特別なセグメント参照を通じて初期化・終了
+/// コードセクションが実行されることが確認できた。ホストプログラムを実行する
+/// 前に、オペレーティングシステムは使用中の全`UNIT`のリストを構築し、その
+/// リストを使ってホストプログラムの呼び出し前後に各`UNIT`の初期化・終了
+/// セクションを実行する。
+///
+/// ただしこれはp-machine内部仕様レベルの確認であり、Pascal言語レベルで
+/// どのような構文（`IMPLEMENTATION`部末尾の`BEGIN ... END.`など）で書くのか
+/// はUsers' Manual該当章のOCR文字化けにより今回未確認（UNCONFIRMED）のまま
+/// である。そのため本実装の[`ImplementationSection`]には対応するフィールド
+/// （例: `init_body: Option<Block>`）を**まだ追加していない**。次のAST拡張
+/// ステップで、正確な構文が確認でき次第の追加を検討すること。
+///
+/// # UNCONFIRMED: 残る未確認事項
+///
 /// - `IMPLEMENTATION`部だけに存在する非公開の`PROCEDURE`/`FUNCTION`
-///   （`INTERFACE`部に現れない）が許可されるかどうかは未確認。本実装では
-///   慣用的に許可されると仮定し、`INTERFACE`部の`proc_signatures`/
-///   `func_signatures`と`IMPLEMENTATION`部の`proc_decls`/`func_decls`との
-///   突き合わせ（本体を持つ宣言が対応するシグネチャを持つか等）は
-///   一切行わない。
-/// - `UNIT`間の循環参照が許可されるか禁止されるかは未確認。今回はそもそも
-///   `USES`解決自体を実装しないため、循環参照の検出も行わない。
+///   （`INTERFACE`部に現れない）が許可されるかどうかは、一次資料での明記が
+///   見つかっていない（Wikibooks等の二次資料では一般的なPascal unit解説として
+///   触れられている）。本実装では慣用的に許可されると仮定し、`INTERFACE`部の
+///   `proc_signatures`/`func_signatures`と`IMPLEMENTATION`部の`proc_decls`/
+///   `func_decls`との突き合わせ（本体を持つ宣言が対応するシグネチャを持つか
+///   等）は一切行わない。
+/// - `UNIT`間の循環参照が許可されるか禁止されるかは、これを明記した一次資料が
+///   見つかっておらず未確認。今回はそもそも`USES`解決自体を実装しないため、
+///   循環参照の検出も行わない。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unit {
     pub name: Identifier,
@@ -88,7 +120,9 @@ pub struct InterfaceSection {
 
 /// `UNIT`の`IMPLEMENTATION`部。`INTERFACE`部のシグネチャに対応する
 /// 実際の本体（またはIMPLEMENTATION部だけに存在する非公開の宣言。
-/// [`Unit`]のドキュメントのUNCONFIRMED項参照）を持つ。
+/// [`Unit`]のドキュメントのUNCONFIRMED項参照）を持つ。初期化・終了処理
+/// （`'***'`セグメント参照。[`Unit`]のドキュメント参照）に対応するフィールド
+/// はまだ持たない。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplementationSection {
     pub proc_decls: Vec<ProcDecl>,

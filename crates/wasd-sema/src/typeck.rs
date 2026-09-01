@@ -365,24 +365,34 @@ impl SemaContext {
 
     /// UCSD拡張: コンパイラディレクティブ `(*$I foo.pas*)`のdialectチェック。
     ///
-    /// # UNCONFIRMED: `$I`（include）以外のディレクティブ
+    /// # CONFIRMED: `$I`と`$R2`/`$R4`
     ///
-    /// このセッションでは一次資料（SofTech Microsystems Internal
-    /// Architecture Reference Manual等）へのネットワークアクセスが
-    /// 環境のネットワークポリシーによりブロックされており（`WebFetch`が
-    /// 全ドメインで`EGRESS_BLOCKED`）、検索エンジンのスニペット経由でしか
-    /// 裏付けが取れなかった。`$I`（include。引数にファイル名を取る）は
-    /// UCSD PascalとBorland Pascalに共通する既知のディレクティブとして
-    /// 間接的に確認できたが、それ以外（`$U`/`$S`/`$R`等、トグル式の
-    /// ディレクティブがUCSD Pascalに存在した可能性はある）は未確認のため、
-    /// 既知のディレクティブとして断定しない。未知のディレクティブは
-    /// エラーではなく警告に留める（実際にファイルをincludeする処理自体は
-    /// 今回のスコープ外。`wasd_ast::Statement::CompilerDirective`の
-    /// ドキュメント参照）。
+    /// `$I`（include。引数にファイル名を取る）はUCSD PascalとBorland Pascal
+    /// に共通する既知のディレクティブとして確認できた。加えて2026-09-01の
+    /// 一次資料調査（リポジトリのUCSD Pascal一次資料調査メモ参照）により、
+    /// SofTech Microsystems, *UCSD p-System and UCSD Pascal Version IV:
+    /// Internal Architecture Guide* (First edition, March 1981)から`$R2`/
+    /// `$R4`（`realsize`を32/64bitに設定するディレクティブ）の存在も確認
+    /// できたため、これらもここでは既知のディレクティブとして扱う。
+    ///
+    /// `name`にはレキサー（`wasd_lexer::scan_compiler_directive`）が`$`直後の
+    /// 連続した英数字を貪欲に取った結果が入る（`wasd_lexer::TokenKind::
+    /// CompilerDirective`のドキュメント参照）ため、`$R2`/`$R4`は`name`が
+    /// `"R"`ではなく`"R2"`/`"R4"`そのものになる点に注意。実際に`realsize`を
+    /// 切り替えたりファイルをincludeしたりする処理自体は今回のスコープ外
+    /// （`wasd_ast::Statement::CompilerDirective`のドキュメント参照）。
+    ///
+    /// # UNCONFIRMED: `$I`/`$R2`/`$R4`以外のディレクティブ
+    ///
+    /// `$U`/`$S`等、トグル式の他のディレクティブがUCSD Pascalに存在した
+    /// 可能性はあるが、一次資料での確認は取れていない。既知のディレクティブ
+    /// として断定せず、未知のディレクティブはエラーではなく警告に留める。
     fn check_compiler_directive(&mut self, name: &str, span: Span) {
         self.check_dialect_gate(span, "compiler directives ((*$...*))", Dialect::Ucsd);
 
-        let known = name.eq_ignore_ascii_case("I");
+        let known = name.eq_ignore_ascii_case("I")
+            || name.eq_ignore_ascii_case("R2")
+            || name.eq_ignore_ascii_case("R4");
         if !known {
             self.diagnostics.push(Diagnostic::new(
                 span,
@@ -2092,6 +2102,20 @@ mod tests {
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("UCSD"));
+    }
+
+    /// コンパイラディレクティブ: `Dialect::Ucsd`かつ既知の`$R2`/`$R4`
+    /// （`realsize`設定。Internal Architecture Guideで確認済み）であれば
+    /// 警告・エラーいずれも出ない。
+    #[test]
+    fn known_realsize_directive_is_accepted_under_ucsd_dialect_without_warning() {
+        for src in [
+            "PROGRAM Foo; BEGIN (*$R2*) END.",
+            "PROGRAM Foo; BEGIN (*$R4*) END.",
+        ] {
+            let diags = check_with_dialect(src, Dialect::Ucsd);
+            assert!(diags.is_empty(), "unexpected diagnostics for {src:?}: {diags:?}");
+        }
     }
 
     /// コンパイラディレクティブ: `Dialect::Ucsd`でも未知のディレクティブ名は
