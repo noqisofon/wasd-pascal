@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wasd-ast",
+    "crates/wasd-lexer",
+    "crates/wasd-parser",
+    "crates/wasd-sema",
+    "crates/wasd-pcode",
+    "crates/wasd-driver",
+    "crates/wasd-cli",
+    "crates/wasd-lsp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/noqisofon/wasd-pascal"
+
+[workspace.dependencies]
+wasd-ast = { path = "crates/wasd-ast" }
+wasd-lexer = { path = "crates/wasd-lexer" }
+wasd-parser = { path = "crates/wasd-parser" }
+wasd-sema = { path = "crates/wasd-sema" }
+wasd-pcode = { path = "crates/wasd-pcode" }
+wasd-driver = { path = "crates/wasd-driver" }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+clap = { version = "4", features = ["derive"] }

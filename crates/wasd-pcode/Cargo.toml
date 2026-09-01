@@ -1,0 +1,11 @@
+[package]
+name = "wasd-pcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "p-code (IR) generation for WASD Pascal."
+
+[dependencies]
+wasd-ast.workspace = true
+wasd-sema.workspace = true

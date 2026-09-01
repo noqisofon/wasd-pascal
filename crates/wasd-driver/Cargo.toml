@@ -1,0 +1,14 @@
+[package]
+name = "wasd-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core API shared by the wasdc CLI and the LSP server: source loading, dialect selection, compile pipeline orchestration."
+
+[dependencies]
+wasd-ast.workspace = true
+wasd-lexer.workspace = true
+wasd-parser.workspace = true
+wasd-sema.workspace = true
+wasd-pcode.workspace = true

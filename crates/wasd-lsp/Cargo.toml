@@ -1,0 +1,16 @@
+[package]
+name = "wasd-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language Server Protocol server for WASD Pascal."
+
+[[bin]]
+name = "wasd-lsp"
+path = "src/main.rs"
+
+[dependencies]
+wasd-driver.workspace = true
+tower-lsp.workspace = true
+tokio.workspace = true
