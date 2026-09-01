@@ -8,3 +8,7 @@ description = "Semantic analysis, type checking, and dialect checking for WASD P
 
 [dependencies]
 wasd-ast.workspace = true
+
+[dev-dependencies]
+wasd-lexer.workspace = true
+wasd-parser.workspace = true

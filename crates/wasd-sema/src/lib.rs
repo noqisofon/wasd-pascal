@@ -6,4 +6,10 @@
 //! 責務となる。詳細は`wasd_ast::Dialect`のドキュメントを参照。
 
 pub mod dialect_check;
+pub mod symbol_table;
 pub mod typeck;
+pub mod types;
+
+pub use symbol_table::{SymbolInfo, SymbolKind, SymbolTable};
+pub use typeck::SemaContext;
+pub use types::Type;

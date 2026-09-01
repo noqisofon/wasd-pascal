@@ -864,6 +864,8 @@ name = "wasd-sema"
 version = "0.1.0"
 dependencies = [
  "wasd-ast",
+ "wasd-lexer",
+ "wasd-parser",
 ]
 
 [[package]]
