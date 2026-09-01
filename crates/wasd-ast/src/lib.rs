@@ -7,9 +7,14 @@ pub mod decl;
 pub mod diagnostic;
 pub mod dialect;
 pub mod expr;
+pub mod ident;
 pub mod span;
 pub mod stmt;
 
+pub use decl::{ConstDecl, Program, TypeExpr, VarDecl};
 pub use diagnostic::{Diagnostic, Severity};
 pub use dialect::Dialect;
+pub use expr::{BinOp, Expr, Literal, UnOp};
+pub use ident::Identifier;
 pub use span::Span;
+pub use stmt::{Block, Statement};
