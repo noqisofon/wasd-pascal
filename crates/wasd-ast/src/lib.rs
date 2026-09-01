@@ -11,10 +11,10 @@ pub mod ident;
 pub mod span;
 pub mod stmt;
 
-pub use decl::{ConstDecl, Program, TypeExpr, VarDecl};
+pub use decl::{ConstDecl, FuncDecl, ParamDecl, ProcDecl, Program, TypeExpr, VarDecl};
 pub use diagnostic::{Diagnostic, Severity};
 pub use dialect::Dialect;
 pub use expr::{BinOp, Expr, Literal, UnOp};
 pub use ident::Identifier;
 pub use span::Span;
-pub use stmt::{Block, Statement};
+pub use stmt::{Block, CaseBranch, ForDirection, Statement};
