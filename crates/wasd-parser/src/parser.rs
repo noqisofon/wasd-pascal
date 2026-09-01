@@ -151,8 +151,10 @@ impl Parser {
     /// `UNIT name; INTERFACE ... IMPLEMENTATION ... END.`
     ///
     /// UNCONFIRMED: `IMPLEMENTATION`部の末尾（`END.`の直前）に初期化用の
-    /// 文の並びが書けるかどうかは一次資料で未確認のため、今回は実装しない
-    /// （`wasd_ast::Unit`のドキュメント参照）。
+    /// 文の並びが書けるかどうかは、Pascal言語レベルの正確な構文としては
+    /// 一次資料で未確認のため、今回は実装しない（p-machine内部仕様レベルでは
+    /// `'***'`セグメント参照を通じた初期化・終了処理の存在自体は確認できて
+    /// いる。`wasd_ast::Unit`のドキュメント参照）。
     fn parse_unit(&mut self) -> (Option<Unit>, Vec<Diagnostic>) {
         if self.is_eof() {
             let span = self.peek_span();
@@ -445,10 +447,10 @@ impl Parser {
     /// `type_start`はその`STRING`識別子自体のspan（`[n]`を含まない）。
     ///
     /// UNCONFIRMED: 角括弧`[n]`を省略した`STRING`単体の宣言が許されるか、
-    /// 許される場合の既定最大長は何かは一次資料で未確認
-    /// （このセッションでは一次資料へのネットワークアクセスがブロックされて
-    /// いた）。ここでは慣用的によく引用される既定値`80`を仮に採用し、
-    /// パーサーレベルでは拒否しない（`wasd_ast::Dialect`の設計方針どおり、
+    /// 許される場合の既定最大長は何かは一次資料で未確認のまま（2026-09-01の
+    /// 一次資料調査でも未調査。継続調査が必要。リポジトリのUCSD Pascal
+    /// 一次資料調査メモ参照）。ここでは慣用的によく引用される既定値`80`を
+    /// 仮に採用し、パーサーレベルでは拒否しない（`wasd_ast::Dialect`の設計方針どおり、
     /// UCSD拡張構文は常に受理する）。
     fn parse_string_n_type(&mut self, type_start: Span) -> TypeExpr {
         if !self.check(&TokenKind::LBracket) {
