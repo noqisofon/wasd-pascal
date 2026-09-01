@@ -1,9 +1,9 @@
 //! 文のASTノード。
 //!
-//! 今回のスコープ: 代入・IF・WHILE・複合文・引数なし/単純な式引数のみの
-//! 手続き呼び出し。`FOR`/`REPEAT UNTIL`/`CASE`は含めない。
+//! 今回のスコープ: 代入・IF・WHILE・FOR・REPEAT UNTIL・CASE・複合文・
+//! 引数なし/単純な式引数のみの手続き呼び出し。
 
-use crate::expr::Expr;
+use crate::expr::{Expr, Literal};
 use crate::ident::Identifier;
 use crate::span::Span;
 
@@ -16,10 +16,10 @@ pub struct Block {
 
 /// 文。
 ///
-/// `#[non_exhaustive]`: 将来`FOR`/`REPEAT UNTIL`/`CASE`などのバリアントを
-/// 追加してもワークスペース内の他クレートでの`match`が静かに壊れない
-/// （ワイルドカードアームがなければコンパイルエラーになり、対応漏れに気付ける）
-/// ようにするため。
+/// `#[non_exhaustive]`: 将来のバリアント追加（配列型導入後の`WITH`文など）で
+/// もワークスペース内の他クレートでの`match`が静かに壊れない
+/// （ワイルドカードアームがなければコンパイルエラーになり、対応漏れに
+/// 気付ける）ようにするため。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Statement {
@@ -39,6 +39,37 @@ pub enum Statement {
         body: Box<Statement>,
         span: Span,
     },
+    /// `FOR var := start (TO|DOWNTO) end DO body`。
+    For {
+        var: Identifier,
+        start: Expr,
+        end: Expr,
+        direction: ForDirection,
+        body: Box<Statement>,
+        span: Span,
+    },
+    /// `REPEAT stmt1; stmt2; ... UNTIL cond`。
+    ///
+    /// `WHILE`とは異なり`BEGIN...END`なしで複数文を直接書ける
+    /// （`REPEAT`〜`UNTIL`自体が文の並びの区切りとなるため）。また、
+    /// 条件を末尾で判定するため、本体`body`は`WHILE`とは違って
+    /// 少なくとも1回は実行される（`Vec<Statement>`として直接保持している
+    /// ことと、条件`until_cond`が本体の"後"に置かれているというこの
+    /// フィールドの並び自体が、その意味論の違いを表している）。
+    Repeat {
+        body: Vec<Statement>,
+        until_cond: Expr,
+        span: Span,
+    },
+    /// `CASE selector OF label1, label2: stmt1; label3: stmt2; ... END`。
+    ///
+    /// UCSD拡張の`OTHERWISE`句は今回のスコープに含めない
+    /// （`dialect`チェック導入後に追加する）。
+    Case {
+        selector: Expr,
+        branches: Vec<CaseBranch>,
+        span: Span,
+    },
     Compound(Block),
     /// 手続き呼び出し文。今回のスコープでは引数は単純な式のみ
     /// （`var`引数や既定引数のような特殊な引数渡しは扱わない）。
@@ -49,12 +80,36 @@ pub enum Statement {
     },
 }
 
+/// `CASE`文中の1分岐（`label1, label2: statement`の部分）。
+///
+/// `body`は`Box`で包まない。`CaseBranch`自体が常に`Vec<CaseBranch>`
+/// （ヒープ上）の要素として存在するため、`Statement`を直接持たせても
+/// 無限サイズにはならない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseBranch {
+    pub labels: Vec<Literal>,
+    pub body: Statement,
+    pub span: Span,
+}
+
+/// `FOR`文のループ方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForDirection {
+    /// `FOR i := 1 TO 10`: ループ変数を1ずつ増やす。
+    To,
+    /// `FOR i := 10 DOWNTO 1`: ループ変数を1ずつ減らす。
+    DownTo,
+}
+
 impl Statement {
     pub fn span(&self) -> Span {
         match self {
             Statement::Assignment { span, .. } => *span,
             Statement::If { span, .. } => *span,
             Statement::While { span, .. } => *span,
+            Statement::For { span, .. } => *span,
+            Statement::Repeat { span, .. } => *span,
+            Statement::Case { span, .. } => *span,
             Statement::Compound(block) => block.span,
             Statement::ProcCall { span, .. } => *span,
         }

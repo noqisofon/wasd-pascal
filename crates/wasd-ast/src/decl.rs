@@ -1,8 +1,9 @@
-//! 宣言（`PROGRAM`/`VAR`/`CONST`など）のASTノード。
+//! 宣言（`PROGRAM`/`VAR`/`CONST`/`PROCEDURE`/`FUNCTION`など）のASTノード。
 //!
 //! 今回のスコープ: `PROGRAM`ヘッダ、単一の`BEGIN...END.`ブロック、
-//! `VAR`セクション（組み込み型のみ）、`CONST`セクション（リテラル値のみ）。
-//! `UNIT`/`INTERFACE`/`IMPLEMENTATION`、`PROCEDURE`/`FUNCTION`、`TYPE`セクション
+//! `VAR`セクション（組み込み型のみ）、`CONST`セクション（リテラル値のみ）、
+//! `PROCEDURE`/`FUNCTION`宣言（ローカル`VAR`宣言を含む）。
+//! `UNIT`/`INTERFACE`/`IMPLEMENTATION`、`TYPE`セクション
 //! （配列・レコード・ポインタ型を含む）は今回は含めない。
 //!
 //! `Program`は将来`UNIT`宣言と並ぶ「コンパイル単位」の一種として
@@ -21,6 +22,8 @@ pub struct Program {
     pub name: Identifier,
     pub const_decls: Vec<ConstDecl>,
     pub var_decls: Vec<VarDecl>,
+    pub proc_decls: Vec<ProcDecl>,
+    pub func_decls: Vec<FuncDecl>,
     pub body: Block,
     pub span: Span,
 }
@@ -38,6 +41,44 @@ pub struct VarDecl {
 pub struct ConstDecl {
     pub name: Identifier,
     pub value: Literal,
+    pub span: Span,
+}
+
+/// `PROCEDURE name(params); [VAR ...] BEGIN ... END;` 宣言。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcDecl {
+    pub name: Identifier,
+    pub params: Vec<ParamDecl>,
+    /// ローカル変数（`VAR`セクション）。
+    pub var_decls: Vec<VarDecl>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// `FUNCTION name(params): returnType; [VAR ...] BEGIN ... END;` 宣言。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncDecl {
+    pub name: Identifier,
+    pub params: Vec<ParamDecl>,
+    pub return_type: TypeExpr,
+    /// ローカル変数（`VAR`セクション）。
+    pub var_decls: Vec<VarDecl>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// 仮引数リスト中の1引数。
+///
+/// `PROCEDURE P(VAR a, b: INTEGER; c: REAL)`のように、1つの
+/// `formal-parameter-section`が複数の名前を共有することがあるが、
+/// ここでは名前ごとに展開した1件を表す（`by_ref`/`ty`はグループ内の
+/// 全員で共通の値を持つ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamDecl {
+    pub name: Identifier,
+    pub ty: TypeExpr,
+    /// `VAR`引数（参照渡し）かどうか。
+    pub by_ref: bool,
     pub span: Span,
 }
 
@@ -90,6 +131,8 @@ mod tests {
             name: ident("Foo", name_span),
             const_decls: vec![],
             var_decls: vec![],
+            proc_decls: vec![],
+            func_decls: vec![],
             body: Block {
                 statements: vec![],
                 span: body_span,
@@ -125,6 +168,8 @@ mod tests {
             name: ident("Foo", s),
             const_decls: vec![const_decl.clone()],
             var_decls: vec![var_decl.clone()],
+            proc_decls: vec![],
+            func_decls: vec![],
             body: Block {
                 statements: vec![],
                 span: s,

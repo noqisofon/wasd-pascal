@@ -5,14 +5,15 @@
 //! `wasd-ast`の最小定義に一致させる:
 //! - `PROGRAM <identifier>;` ヘッダ + 単一の`BEGIN...END.`ブロック
 //! - `VAR`/`CONST`宣言（組み込み型`INTEGER`/`REAL`/`BOOLEAN`/`CHAR`のみ）
+//! - `PROCEDURE`/`FUNCTION`宣言（仮引数リスト、`VAR`引数、ローカル`VAR`宣言）
 //! - 文: 代入、`IF...THEN...[ELSE...]`、`WHILE...DO...`、複合文`BEGIN...END`、
 //!   手続き呼び出し
-//! - 式: リテラル、識別子、二項演算、単項演算、括弧
+//! - 式: リテラル、識別子、二項演算、単項演算、括弧、関数呼び出し
 //!
-//! `PROCEDURE`/`FUNCTION`宣言、`FOR`/`REPEAT`/`CASE`文、配列・レコード型、
-//! `UNIT`等のUCSD拡張構文はまだパースしない。レキサはこれらをトークンとして
-//! 認識できるが、このパーサーはまだ対応する文法規則を持たないというだけの
-//! 状態であり、遭遇した場合は構文エラーの`Diagnostic`を発する。
+//! `FOR`/`REPEAT`/`CASE`文、配列・レコード型、`UNIT`等のUCSD拡張構文は
+//! まだパースしない。レキサはこれらをトークンとして認識できるが、
+//! このパーサーはまだ対応する文法規則を持たないというだけの状態であり、
+//! 遭遇した場合は構文エラーの`Diagnostic`を発する。
 //!
 //! # エラー耐性（パニックモード回復）
 //!
@@ -25,8 +26,8 @@
 //! 想定した設計。
 
 use wasd_ast::{
-    BinOp, Block, ConstDecl, Diagnostic, Expr, Identifier, Literal, Program, Severity, Span,
-    Statement, TypeExpr, UnOp, VarDecl,
+    BinOp, Block, CaseBranch, ConstDecl, Diagnostic, Expr, ForDirection, FuncDecl, Identifier,
+    Literal, ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
 };
 use wasd_lexer::{Token, TokenKind};
 
@@ -70,17 +71,16 @@ impl Parser {
 
         let mut const_decls = Vec::new();
         let mut var_decls = Vec::new();
+        let mut proc_decls = Vec::new();
+        let mut func_decls = Vec::new();
 
         loop {
             match self.peek() {
                 TokenKind::Const => const_decls.extend(self.parse_const_section()),
                 TokenKind::Var => var_decls.extend(self.parse_var_section()),
-                TokenKind::Procedure
-                | TokenKind::Function
-                | TokenKind::Type
-                | TokenKind::Label
-                | TokenKind::Unit
-                | TokenKind::Uses => {
+                TokenKind::Procedure => proc_decls.push(self.parse_proc_decl()),
+                TokenKind::Function => func_decls.push(self.parse_func_decl()),
+                TokenKind::Type | TokenKind::Label | TokenKind::Unit | TokenKind::Uses => {
                     let kind = self.peek().clone();
                     let span = self.peek_span();
                     self.error(
@@ -96,24 +96,7 @@ impl Parser {
             }
         }
 
-        let body = match self.peek() {
-            TokenKind::Begin => match self.parse_compound_statement() {
-                Some(Statement::Compound(block)) => block,
-                _ => Block {
-                    statements: vec![],
-                    span: self.peek_span(),
-                },
-            },
-            other => {
-                let span = self.peek_span();
-                let found = describe(other);
-                self.error(span, format!("expected 'BEGIN', found {found}"));
-                Block {
-                    statements: vec![],
-                    span,
-                }
-            }
-        };
+        let body = self.parse_subprogram_body();
 
         self.expect(&TokenKind::Dot, "'.'");
 
@@ -122,6 +105,8 @@ impl Parser {
             name,
             const_decls,
             var_decls,
+            proc_decls,
+            func_decls,
             body,
             span: Span::new(start.start, end),
         };
@@ -266,6 +251,149 @@ impl Parser {
         }
     }
 
+    /// `PROCEDURE name(params); [VAR ...] BEGIN ... END;`
+    fn parse_proc_decl(&mut self) -> ProcDecl {
+        let start = self.peek_span();
+        self.advance(); // PROCEDURE
+        let name = self.parse_identifier("procedure name");
+        let params = self.parse_param_list();
+        self.expect(&TokenKind::Semicolon, "';'");
+        let var_decls = self.parse_local_declarations();
+        let body = self.parse_subprogram_body();
+        self.expect(&TokenKind::Semicolon, "';'");
+        let end = self.previous_span().end;
+        ProcDecl {
+            name,
+            params,
+            var_decls,
+            body,
+            span: Span::new(start.start, end),
+        }
+    }
+
+    /// `FUNCTION name(params): returnType; [VAR ...] BEGIN ... END;`
+    fn parse_func_decl(&mut self) -> FuncDecl {
+        let start = self.peek_span();
+        self.advance(); // FUNCTION
+        let name = self.parse_identifier("function name");
+        let params = self.parse_param_list();
+        self.expect(&TokenKind::Colon, "':'");
+        let return_type = self.parse_type();
+        self.expect(&TokenKind::Semicolon, "';'");
+        let var_decls = self.parse_local_declarations();
+        let body = self.parse_subprogram_body();
+        self.expect(&TokenKind::Semicolon, "';'");
+        let end = self.previous_span().end;
+        FuncDecl {
+            name,
+            params,
+            return_type,
+            var_decls,
+            body,
+            span: Span::new(start.start, end),
+        }
+    }
+
+    fn parse_subprogram_body(&mut self) -> Block {
+        match self.peek() {
+            TokenKind::Begin => match self.parse_compound_statement() {
+                Some(Statement::Compound(block)) => block,
+                _ => Block {
+                    statements: vec![],
+                    span: self.peek_span(),
+                },
+            },
+            other => {
+                let span = self.peek_span();
+                let found = describe(other);
+                self.error(span, format!("expected 'BEGIN', found {found}"));
+                Block {
+                    statements: vec![],
+                    span,
+                }
+            }
+        }
+    }
+
+    /// 仮引数リスト`(a, b: integer; VAR c: real)`。括弧自体が省略された
+    /// （引数なしの）場合は空の`Vec`を返す。
+    fn parse_param_list(&mut self) -> Vec<ParamDecl> {
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::LParen) {
+            return params;
+        }
+        self.advance(); // (
+        if self.check(&TokenKind::RParen) {
+            self.advance();
+            return params;
+        }
+
+        loop {
+            let by_ref = self.eat(&TokenKind::Var);
+            let mut names = vec![self.parse_identifier("parameter name")];
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                names.push(self.parse_identifier("parameter name"));
+            }
+            self.expect(&TokenKind::Colon, "':'");
+            let ty = self.parse_type();
+            for name in names {
+                let span = Span::new(name.span.start, ty.span().end);
+                params.push(ParamDecl {
+                    name,
+                    ty,
+                    by_ref,
+                    span,
+                });
+            }
+
+            if self.check(&TokenKind::Semicolon) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenKind::RParen, "')'");
+        params
+    }
+
+    /// `PROCEDURE`/`FUNCTION`本体内のローカル宣言。今回のスコープでは
+    /// ローカル`VAR`宣言のみをサポートする（ローカル`CONST`宣言、
+    /// ネストした`PROCEDURE`/`FUNCTION`は今回のスコープ外）。
+    fn parse_local_declarations(&mut self) -> Vec<VarDecl> {
+        let mut var_decls = Vec::new();
+        loop {
+            match self.peek() {
+                TokenKind::Var => var_decls.extend(self.parse_var_section()),
+                TokenKind::Const
+                | TokenKind::Type
+                | TokenKind::Procedure
+                | TokenKind::Function
+                | TokenKind::Label => {
+                    let kind = self.peek().clone();
+                    let span = self.peek_span();
+                    self.error(
+                        span,
+                        format!(
+                            "{} declarations are not supported inside a PROCEDURE/FUNCTION body yet (only VAR sections are supported)",
+                            describe(&kind)
+                        ),
+                    );
+                    // このアームに来るトークン(CONST/VAR以外)は`skip_unsupported_
+                    // section`が停止条件として扱わないため、まずここで1つ消費して
+                    // から読み飛ばしを行う。`CONST`はスキップの停止条件に含まれる
+                    // ため、先に消費しておかないと同じ`CONST`に対して無限に
+                    // このアームへ戻ってきてしまう。
+                    self.advance();
+                    self.skip_unsupported_section();
+                }
+                _ => break,
+            }
+        }
+        var_decls
+    }
+
     /// `PROCEDURE`/`FUNCTION`/`TYPE`/`UNIT`など、まだ対応していない宣言
     /// セクションを読み飛ばす。`BEGIN`/`END`のネストを大まかに数え、
     /// トップレベルの`CONST`/`VAR`/`BEGIN`（本体の開始）まで読み飛ばす。
@@ -306,6 +434,9 @@ impl Parser {
             TokenKind::Begin => self.parse_compound_statement(),
             TokenKind::If => self.parse_if_statement(),
             TokenKind::While => self.parse_while_statement(),
+            TokenKind::For => self.parse_for_statement(),
+            TokenKind::Repeat => self.parse_repeat_statement(),
+            TokenKind::Case => self.parse_case_statement(),
             TokenKind::Identifier(_) => self.parse_assignment_or_call(),
 
             // 空文（empty statement）。ISO 7185の文法は`statement`の一種として
@@ -320,19 +451,12 @@ impl Parser {
                 }))
             }
 
-            TokenKind::Procedure
-            | TokenKind::Function
-            | TokenKind::For
-            | TokenKind::Repeat
-            | TokenKind::Case
-            | TokenKind::With
-            | TokenKind::Goto
-            | TokenKind::Label => {
+            TokenKind::With | TokenKind::Goto | TokenKind::Label => {
                 let span = self.peek_span();
                 self.error(
                     span,
                     format!(
-                        "{} is not supported by this parser yet (only assignment, IF/THEN/ELSE, WHILE/DO, compound statements, and procedure calls are supported)",
+                        "{} is not supported by this parser yet (only assignment, IF/THEN/ELSE, WHILE/DO, FOR/DO, REPEAT/UNTIL, CASE/OF, compound statements, and procedure calls are supported)",
                         describe(&kind)
                     ),
                 );
@@ -373,13 +497,25 @@ impl Parser {
             return None;
         }
 
+        let statements = self.parse_statement_sequence(&TokenKind::End, "'END'");
+        let end_span = self.expect_and_span(&TokenKind::End, "'END'");
+        Some(Statement::Compound(Block {
+            statements,
+            span: Span::new(start.start, end_span.end),
+        }))
+    }
+
+    /// `;`区切りの文の並びを、`terminator`（`BEGIN...END`なら`END`、
+    /// `REPEAT...UNTIL`なら`UNTIL`）の手前までパースする。`terminator`
+    /// 自体は消費せず、呼び出し元が消費する。
+    fn parse_statement_sequence(&mut self, terminator: &TokenKind, terminator_desc: &str) -> Vec<Statement> {
         let mut statements = Vec::new();
         loop {
             // 連続するセミコロン（空文）を読み飛ばす。
             while self.check(&TokenKind::Semicolon) {
                 self.advance();
             }
-            if self.check(&TokenKind::End) || self.is_eof() {
+            if self.check(terminator) || self.is_eof() {
                 break;
             }
 
@@ -389,13 +525,27 @@ impl Parser {
 
                     if self.check(&TokenKind::Semicolon) {
                         continue;
-                    } else if self.check(&TokenKind::End) || self.is_eof() {
+                    } else if self.check(terminator) || self.is_eof() {
                         break;
                     } else {
                         let span = self.peek_span();
                         let found = describe(self.peek());
-                        self.error(span, format!("expected ';' or 'END', found {found}"));
+                        self.error(
+                            span,
+                            format!("expected ';' or {terminator_desc}, found {found}"),
+                        );
+                        // `synchronize_to_statement_boundary`は`ELSE`/`UNTIL`の
+                        // 手前で止まる。ここに来る`ELSE`/`UNTIL`は（`IF`/`REPEAT`
+                        // に対応しない）迷子のトークンであり、`parse_statement`は
+                        // これらを消費しない空文として返すため、何もせず
+                        // 素通りすると同じ位置に戻ってきて無限ループになる。
+                        // 同期処理が全く前進しなかった場合は、無限ループ防止の
+                        // ため強制的に1トークン読み飛ばす。
+                        let pos_before_sync = self.pos;
                         self.synchronize_to_statement_boundary();
+                        if self.pos == pos_before_sync {
+                            self.advance();
+                        }
                     }
                 }
                 None => {
@@ -410,12 +560,79 @@ impl Parser {
                 }
             }
         }
+        statements
+    }
+
+    /// `REPEAT stmt1; stmt2; ... UNTIL cond`
+    fn parse_repeat_statement(&mut self) -> Option<Statement> {
+        let start = self.peek_span();
+        self.advance(); // REPEAT
+        let body = self.parse_statement_sequence(&TokenKind::Until, "'UNTIL'");
+        self.expect(&TokenKind::Until, "'UNTIL'");
+        let until_cond = self.parse_expr();
+        let span = Span::new(start.start, until_cond.span().end);
+        Some(Statement::Repeat {
+            body,
+            until_cond,
+            span,
+        })
+    }
+
+    /// `CASE selector OF label1, label2: stmt1; label3: stmt2 END`
+    ///
+    /// UCSD拡張の`OTHERWISE`句は今回のスコープに含めない。
+    fn parse_case_statement(&mut self) -> Option<Statement> {
+        let start = self.peek_span();
+        self.advance(); // CASE
+        let selector = self.parse_expr();
+        self.expect(&TokenKind::Of, "'OF'");
+
+        let mut branches = Vec::new();
+        loop {
+            while self.check(&TokenKind::Semicolon) {
+                self.advance();
+            }
+            if self.check(&TokenKind::End) || self.is_eof() {
+                break;
+            }
+
+            let branch_start = self.peek_span();
+            let mut labels = vec![self.parse_const_literal()];
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                labels.push(self.parse_const_literal());
+            }
+            self.expect(&TokenKind::Colon, "':'");
+            let body = self.parse_statement_or_recover();
+            let branch_span = Span::new(branch_start.start, body.span().end);
+            branches.push(CaseBranch {
+                labels,
+                body,
+                span: branch_span,
+            });
+
+            if self.check(&TokenKind::Semicolon) {
+                continue;
+            } else if self.check(&TokenKind::End) || self.is_eof() {
+                break;
+            } else {
+                let span = self.peek_span();
+                let found = describe(self.peek());
+                self.error(span, format!("expected ';' or 'END', found {found}"));
+                let pos_before_sync = self.pos;
+                self.synchronize_to_statement_boundary();
+                if self.pos == pos_before_sync {
+                    self.advance();
+                }
+            }
+        }
 
         let end_span = self.expect_and_span(&TokenKind::End, "'END'");
-        Some(Statement::Compound(Block {
-            statements,
+        Some(Statement::Case {
+            selector,
+            branches,
             span: Span::new(start.start, end_span.end),
-        }))
+        })
     }
 
     fn parse_if_statement(&mut self) -> Option<Statement> {
@@ -459,6 +676,39 @@ impl Parser {
         })
     }
 
+    /// `FOR var := start (TO|DOWNTO) end DO body`
+    fn parse_for_statement(&mut self) -> Option<Statement> {
+        let start = self.peek_span();
+        self.advance(); // FOR
+        let var = self.parse_identifier("loop variable");
+        self.expect(&TokenKind::Assign, "':='");
+        let start_expr = self.parse_expr();
+
+        let direction = if self.eat(&TokenKind::To) {
+            ForDirection::To
+        } else if self.eat(&TokenKind::DownTo) {
+            ForDirection::DownTo
+        } else {
+            let span = self.peek_span();
+            let found = describe(self.peek());
+            self.error(span, format!("expected 'TO' or 'DOWNTO', found {found}"));
+            ForDirection::To
+        };
+
+        let end_expr = self.parse_expr();
+        self.expect(&TokenKind::Do, "'DO'");
+        let body = self.parse_statement_or_recover();
+        let span = Span::new(start.start, body.span().end);
+        Some(Statement::For {
+            var,
+            start: start_expr,
+            end: end_expr,
+            direction,
+            body: Box::new(body),
+            span,
+        })
+    }
+
     /// 代入文 `identifier := expr` と手続き呼び出し文
     /// `identifier(expr, ...)` / `identifier` は共に識別子から始まるため、
     /// ここでまとめて先読み分岐する。
@@ -472,17 +722,7 @@ impl Parser {
             Some(Statement::Assignment { target: name, value, span })
         } else if self.check(&TokenKind::LParen) {
             self.advance();
-            let mut args = Vec::new();
-            if !self.check(&TokenKind::RParen) {
-                loop {
-                    args.push(self.parse_expr());
-                    if self.check(&TokenKind::Comma) {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
+            let args = self.parse_call_args();
             let close = self.expect_and_span(&TokenKind::RParen, "')'");
             let span = Span::new(name.span.start, close.end.max(name.span.end));
             Some(Statement::ProcCall { name, args, span })
@@ -665,10 +905,28 @@ impl Parser {
             }
             TokenKind::Identifier(name) => {
                 self.advance();
-                match name.to_ascii_lowercase().as_str() {
-                    "true" => Expr::BoolLiteral(true, span),
-                    "false" => Expr::BoolLiteral(false, span),
-                    _ => Expr::Identifier(Identifier::new(name, span)),
+                let lower = name.to_ascii_lowercase();
+                if lower == "true" {
+                    Expr::BoolLiteral(true, span)
+                } else if lower == "false" {
+                    Expr::BoolLiteral(false, span)
+                } else if self.check(&TokenKind::LParen) {
+                    // `identifier(args)`: 括弧を伴う場合は関数呼び出し式として
+                    // 組み立てる。括弧を省略した引数なしの関数呼び出し
+                    // （`x := Foo`）は、この時点では単なる変数参照と構文上
+                    // 区別が付かないため、`Expr::Identifier`のままにして
+                    // 意味解析側で解決する（`wasd_ast::expr::Expr::FuncCall`
+                    // のドキュメント参照）。
+                    self.advance();
+                    let args = self.parse_call_args();
+                    let close = self.expect_and_span(&TokenKind::RParen, "')'");
+                    Expr::FuncCall {
+                        name: Identifier::new(name, span),
+                        args,
+                        span: Span::new(span.start, close.end.max(span.end)),
+                    }
+                } else {
+                    Expr::Identifier(Identifier::new(name, span))
                 }
             }
             TokenKind::LParen => {
@@ -702,6 +960,23 @@ impl Parser {
     // ------------------------------------------------------------------
     // 共通ヘルパー
     // ------------------------------------------------------------------
+
+    /// 呼び出し式の実引数リスト。呼び出し元が既に開き括弧`(`を消費済みで、
+    /// 閉じ括弧`)`はまだ消費していない前提（閉じ括弧の消費は呼び出し元が行う）。
+    fn parse_call_args(&mut self) -> Vec<Expr> {
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr());
+                if self.check(&TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        args
+    }
 
     fn parse_identifier(&mut self, what: &str) -> Identifier {
         match self.peek().clone() {
@@ -1096,17 +1371,17 @@ mod tests {
     /// 未対応構文（FOR）に遭遇してもパニックせず、Diagnosticを出しつつ
     /// 後続の文のパースを継続できる。
     #[test]
-    fn reports_diagnostic_for_unsupported_for_statement_without_panicking() {
+    fn reports_diagnostic_for_unsupported_goto_statement_without_panicking() {
         let src = r#"
             PROGRAM Foo;
             VAR x: INTEGER;
             BEGIN
-                FOR x := 1 TO 10 DO ;
+                GOTO 1;
                 x := 1
             END.
         "#;
         let (program, diags) = parse_source(src);
-        assert!(!diags.is_empty(), "expected at least one diagnostic for FOR");
+        assert!(!diags.is_empty(), "expected at least one diagnostic for GOTO");
         let program = program.expect("parser should still produce a Program despite the error");
         assert_eq!(program.body.statements.len(), 1);
         match &program.body.statements[0] {
@@ -1114,6 +1389,209 @@ mod tests {
                 assert!(matches!(value, Expr::IntLiteral(1, _)));
             }
             other => panic!("expected the recovered assignment, got {other:?}"),
+        }
+    }
+
+    /// 対応する`REPEAT`のない迷子の`UNTIL`に遭遇してもパーサーが無限ループに
+    /// 陥らないこと。`UNTIL`は`parse_statement`の「空文」扱いのトークン集合
+    /// （`;`/`END`/`ELSE`/`UNTIL`）に含まれるため、同期処理が前進せず
+    /// 無限ループになる回帰が過去にあった。
+    #[test]
+    fn does_not_hang_on_stray_until_token() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR x: INTEGER;
+            BEGIN
+                UNTIL x = 1;
+                x := 1
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic for the stray UNTIL");
+        assert!(
+            program.is_some(),
+            "parser should still produce a Program despite the error"
+        );
+    }
+
+    /// `FOR ... TO ... DO`が正しくパースされること。
+    #[test]
+    fn parses_for_to_statement() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR i, x: INTEGER;
+            BEGIN
+                FOR i := 1 TO 10 DO
+                    x := i
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::For {
+                var,
+                start,
+                end,
+                direction,
+                body,
+                ..
+            } => {
+                assert_eq!(var.name, "i");
+                assert!(matches!(start, Expr::IntLiteral(1, _)));
+                assert!(matches!(end, Expr::IntLiteral(10, _)));
+                assert_eq!(*direction, ForDirection::To);
+                assert!(matches!(body.as_ref(), Statement::Assignment { .. }));
+            }
+            other => panic!("expected a For statement, got {other:?}"),
+        }
+    }
+
+    /// `FOR ... DOWNTO ... DO`が正しくパースされること。
+    #[test]
+    fn parses_for_downto_statement() {
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 10 DOWNTO 1 DO i := i END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::For { direction, .. } => {
+                assert_eq!(*direction, ForDirection::DownTo);
+            }
+            other => panic!("expected a For statement, got {other:?}"),
+        }
+    }
+
+    /// `FOR`の本体にBEGIN...ENDの複合文を使えること（複数文のループ本体）。
+    #[test]
+    fn parses_for_with_compound_body() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR i, sum: INTEGER;
+            BEGIN
+                sum := 0;
+                FOR i := 1 TO 10 DO
+                BEGIN
+                    sum := sum + i
+                END
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[1] {
+            Statement::For { body, .. } => {
+                assert!(matches!(body.as_ref(), Statement::Compound(_)));
+            }
+            other => panic!("expected a For statement, got {other:?}"),
+        }
+    }
+
+    /// `REPEAT ... UNTIL`が`BEGIN...END`なしで複数文を直接パースできること。
+    #[test]
+    fn parses_repeat_until_with_multiple_statements() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR i: INTEGER;
+            BEGIN
+                i := 0;
+                REPEAT
+                    i := i + 1;
+                    i := i + 1
+                UNTIL i >= 10
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[1] {
+            Statement::Repeat { body, until_cond, .. } => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(
+                    until_cond,
+                    Expr::BinaryOp {
+                        op: BinOp::GtEq,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected a Repeat statement, got {other:?}"),
+        }
+    }
+
+    /// `REPEAT`の本体が1文だけの場合もパースできること。
+    #[test]
+    fn parses_repeat_until_with_single_statement() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR i: INTEGER; BEGIN i := 0; REPEAT i := i + 1 UNTIL i = 1 END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[1] {
+            Statement::Repeat { body, .. } => {
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected a Repeat statement, got {other:?}"),
+        }
+    }
+
+    /// `CASE`文が複数の分岐（カンマ区切りの複数ラベルを含む）で正しく
+    /// パースされること。
+    #[test]
+    fn parses_case_statement_with_multiple_branches() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR x, y: INTEGER;
+            BEGIN
+                CASE x OF
+                    1, 2: y := 1;
+                    3: y := 2
+                END
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Case { selector, branches, .. } => {
+                assert!(matches!(selector, Expr::Identifier(id) if id.name == "x"));
+                assert_eq!(branches.len(), 2);
+                assert_eq!(branches[0].labels.len(), 2);
+                match &branches[0].labels[0] {
+                    Literal::Int(v, _) => assert_eq!(*v, 1),
+                    other => panic!("expected an Int literal, got {other:?}"),
+                }
+                match &branches[0].labels[1] {
+                    Literal::Int(v, _) => assert_eq!(*v, 2),
+                    other => panic!("expected an Int literal, got {other:?}"),
+                }
+                assert_eq!(branches[1].labels.len(), 1);
+                assert!(matches!(branches[0].body, Statement::Assignment { .. }));
+            }
+            other => panic!("expected a Case statement, got {other:?}"),
+        }
+    }
+
+    /// 末尾のセミコロン（最後の分岐の後の`;`）を許容すること。
+    #[test]
+    fn parses_case_statement_with_trailing_semicolon() {
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1; END END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Case { branches, .. } => {
+                assert_eq!(branches.len(), 1);
+            }
+            other => panic!("expected a Case statement, got {other:?}"),
         }
     }
 
@@ -1149,5 +1627,140 @@ mod tests {
             }
             other => panic!("expected an argument-less ProcCall, got {other:?}"),
         }
+    }
+
+    /// `PROCEDURE`宣言（`VAR`引数を含む）が正しくパースされること。
+    #[test]
+    fn parses_procedure_decl_with_var_param() {
+        let src = r#"
+            PROGRAM Foo;
+            PROCEDURE Swap(VAR a, b: INTEGER; c: BOOLEAN);
+            VAR tmp: INTEGER;
+            BEGIN
+                tmp := a;
+                a := b;
+                b := tmp
+            END;
+            BEGIN
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        assert_eq!(program.proc_decls.len(), 1);
+        let proc = &program.proc_decls[0];
+        assert_eq!(proc.name.name, "Swap");
+        assert_eq!(proc.params.len(), 3);
+        assert_eq!(proc.params[0].name.name, "a");
+        assert!(proc.params[0].by_ref);
+        assert!(matches!(proc.params[0].ty, TypeExpr::Integer(_)));
+        assert_eq!(proc.params[1].name.name, "b");
+        assert!(proc.params[1].by_ref);
+        assert_eq!(proc.params[2].name.name, "c");
+        assert!(!proc.params[2].by_ref);
+        assert!(matches!(proc.params[2].ty, TypeExpr::Boolean(_)));
+        assert_eq!(proc.var_decls.len(), 1);
+        assert_eq!(proc.body.statements.len(), 3);
+    }
+
+    /// `FUNCTION`宣言（戻り値の型と、伝統的な`FunctionName := value`による
+    /// 戻り値設定）が正しくパースされること。戻り値設定はAST上では
+    /// 通常の`Statement::Assignment`としてパースされる（意味解析側で
+    /// 「関数名への代入」として解釈する方針のため）。
+    #[test]
+    fn parses_function_decl_with_return_type_and_self_assignment() {
+        let src = r#"
+            PROGRAM Foo;
+            FUNCTION Square(x: INTEGER): INTEGER;
+            BEGIN
+                Square := x * x
+            END;
+            BEGIN
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        assert_eq!(program.func_decls.len(), 1);
+        let func = &program.func_decls[0];
+        assert_eq!(func.name.name, "Square");
+        assert_eq!(func.params.len(), 1);
+        assert_eq!(func.params[0].name.name, "x");
+        assert!(matches!(func.return_type, TypeExpr::Integer(_)));
+        assert_eq!(func.body.statements.len(), 1);
+        match &func.body.statements[0] {
+            Statement::Assignment { target, value, .. } => {
+                assert_eq!(target.name, "Square");
+                assert!(matches!(
+                    value,
+                    Expr::BinaryOp {
+                        op: BinOp::Mul,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// 関数呼び出し式`Foo(1, 2)`が`Expr::FuncCall`としてパースされること。
+    #[test]
+    fn parses_function_call_expression() {
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR x: INTEGER; BEGIN x := Add(1, 2) END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Assignment { value, .. } => match value {
+                Expr::FuncCall { name, args, .. } => {
+                    assert_eq!(name.name, "Add");
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected a FuncCall, got {other:?}"),
+            },
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// 引数なしの関数呼び出し（括弧省略）は`Expr::Identifier`としてパースされ、
+    /// 意味解析側での解決に委ねられること。
+    #[test]
+    fn niladic_function_call_without_parens_parses_as_identifier() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := GetAnswer END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Assignment { value, .. } => {
+                assert!(matches!(value, Expr::Identifier(id) if id.name == "GetAnswer"));
+            }
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// 再帰呼び出し（関数本体内での自分自身の呼び出し）が構文上パースできること。
+    #[test]
+    fn parses_recursive_function_call_in_body() {
+        let src = r#"
+            PROGRAM Foo;
+            FUNCTION Fact(n: INTEGER): INTEGER;
+            BEGIN
+                IF n <= 1 THEN
+                    Fact := 1
+                ELSE
+                    Fact := n * Fact(n - 1)
+            END;
+            BEGIN
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+        assert_eq!(program.func_decls.len(), 1);
     }
 }

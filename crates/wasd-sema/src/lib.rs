@@ -10,6 +10,6 @@ pub mod symbol_table;
 pub mod typeck;
 pub mod types;
 
-pub use symbol_table::{SymbolInfo, SymbolKind, SymbolTable};
+pub use symbol_table::{ParamSignature, SymbolInfo, SymbolKind, SymbolTable};
 pub use typeck::SemaContext;
 pub use types::Type;

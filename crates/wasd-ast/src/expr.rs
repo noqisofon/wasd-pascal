@@ -33,6 +33,20 @@ pub enum Expr {
         span: Span,
     },
     Paren(Box<Expr>, Span),
+    /// 関数呼び出し式（`FUNCTION`の呼び出し。戻り値を持つ式として評価される）。
+    ///
+    /// 式中に`identifier(args)`の形で現れた場合はパーサーがこのバリアントに
+    /// 組み立てる。ただし引数なしの関数呼び出し（`x := Foo`のように
+    /// 括弧を省略する伝統的な書き方）は、パーサーの時点では単なる
+    /// 変数参照と区別が付かないため`Expr::Identifier`としてパースし、
+    /// 意味解析側で「識別子がFUNCTIONシンボルに解決される場合は
+    /// 引数なしの呼び出しとして扱う」という形で解決する
+    /// （`wasd-sema`のドキュメント参照）。
+    FuncCall {
+        name: Identifier,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -46,6 +60,7 @@ impl Expr {
             Expr::BinaryOp { span, .. } => *span,
             Expr::UnaryOp { span, .. } => *span,
             Expr::Paren(_, span) => *span,
+            Expr::FuncCall { span, .. } => *span,
         }
     }
 }
@@ -139,6 +154,13 @@ mod tests {
             span: s,
         };
         assert_eq!(un.span(), s);
+
+        let call = Expr::FuncCall {
+            name: Identifier::new("Foo", s),
+            args: vec![Expr::IntLiteral(1, s)],
+            span: s,
+        };
+        assert_eq!(call.span(), s);
     }
 
     #[test]
