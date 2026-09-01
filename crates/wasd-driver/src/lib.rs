@@ -5,5 +5,8 @@
 
 pub mod compile;
 pub mod session;
+pub mod source_loc;
 
+pub use compile::{compile, CompileOptions, CompileResult};
+pub use source_loc::{locate, LineCol, SourceLocation};
 pub use wasd_ast::{Diagnostic, Dialect, Severity, Span};
