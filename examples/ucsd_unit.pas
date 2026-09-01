@@ -1,0 +1,14 @@
+UNIT MathUtils;
+
+INTERFACE
+
+FUNCTION Square(n: INTEGER): INTEGER;
+
+IMPLEMENTATION
+
+FUNCTION Square(n: INTEGER): INTEGER;
+BEGIN
+    Square := n * n
+END;
+
+END.

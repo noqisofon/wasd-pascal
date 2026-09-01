@@ -57,6 +57,27 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## `wasdc` の使い方
+
+`wasd-cli`クレートが提供するコマンドラインコンパイラ`wasdc`で、`examples/`
+以下のサンプルを実際にチェックできる。まだp-code生成（`wasd-pcode`）が
+無いため、`check`/`parse`（構文・意味解析のチェックとAST確認）のみを提供する。
+
+```sh
+# レキサ〜semaまで実行し、診断を表示する。
+cargo run -p wasd-cli -- check examples/hello.pas
+
+# UCSD dialectを有効化しないとUNIT宣言はdialectエラーになる。
+cargo run -p wasd-cli -- check examples/ucsd_unit.pas
+cargo run -p wasd-cli -- check examples/ucsd_unit.pas --std=ucsd
+
+# ASTをデバッグ出力する。
+cargo run -p wasd-cli -- parse examples/procedures.pas --emit-ast
+```
+
+診断にエラー（`error:`）が1件でもあれば終了コードは`1`、警告のみ・
+エラーなしであれば`0`、ファイルが存在しない等のI/Oエラーは`2`になる。
+
 ## 次のステップ
 
 - `wasd-lexer`: UCSD Pascal の字句仕様の実装（一次資料に基づく）
