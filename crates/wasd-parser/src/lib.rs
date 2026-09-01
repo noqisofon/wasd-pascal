@@ -9,3 +9,5 @@
 //! ドキュメントを参照。
 
 pub mod parser;
+
+pub use parser::Parser;
