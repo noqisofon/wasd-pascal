@@ -34,10 +34,10 @@
 //! 想定した設計。
 
 use wasd_ast::{
-    BinOp, Block, CaseBranch, CompilationUnit, ConstDecl, Diagnostic, Expr, ForDirection,
-    FuncDecl, FuncSignature, Identifier, ImplementationSection, InterfaceSection, Literal,
-    ParamDecl, ProcDecl, ProcSignature, Program, Severity, Span, Statement, TypeExpr, Unit, UnOp,
-    VarDecl,
+    BinOp, Block, CaseBranch, CompilationUnit, ConstDecl, Diagnostic, Expr, FieldDecl,
+    ForDirection, FuncDecl, FuncSignature, Identifier, ImplementationSection, InterfaceSection,
+    Literal, ParamDecl, ProcDecl, ProcSignature, Program, Severity, Span, Statement, TypeDecl,
+    TypeExpr, Unit, UnOp, VarDecl,
 };
 use wasd_lexer::{Token, TokenKind};
 
@@ -94,6 +94,7 @@ impl Parser {
 
         let mut uses = Vec::new();
         let mut const_decls = Vec::new();
+        let mut type_decls = Vec::new();
         let mut var_decls = Vec::new();
         let mut proc_decls = Vec::new();
         let mut func_decls = Vec::new();
@@ -106,10 +107,11 @@ impl Parser {
                 // レベルでは位置に関する制約も設けない）。
                 TokenKind::Uses => uses.extend(self.parse_uses_clause()),
                 TokenKind::Const => const_decls.extend(self.parse_const_section()),
+                TokenKind::Type => type_decls.extend(self.parse_type_section()),
                 TokenKind::Var => var_decls.extend(self.parse_var_section()),
                 TokenKind::Procedure => proc_decls.push(self.parse_proc_decl()),
                 TokenKind::Function => func_decls.push(self.parse_func_decl()),
-                TokenKind::Type | TokenKind::Label | TokenKind::Unit => {
+                TokenKind::Label | TokenKind::Unit => {
                     let kind = self.peek().clone();
                     let span = self.peek_span();
                     self.error(
@@ -134,6 +136,7 @@ impl Parser {
             name,
             uses,
             const_decls,
+            type_decls,
             var_decls,
             proc_decls,
             func_decls,
@@ -191,6 +194,7 @@ impl Parser {
 
         let mut uses = Vec::new();
         let mut const_decls = Vec::new();
+        let mut type_decls = Vec::new();
         let mut var_decls = Vec::new();
         let mut proc_signatures = Vec::new();
         let mut func_signatures = Vec::new();
@@ -199,6 +203,7 @@ impl Parser {
             match self.peek() {
                 TokenKind::Uses => uses.extend(self.parse_uses_clause()),
                 TokenKind::Const => const_decls.extend(self.parse_const_section()),
+                TokenKind::Type => type_decls.extend(self.parse_type_section()),
                 TokenKind::Var => var_decls.extend(self.parse_var_section()),
                 TokenKind::Procedure => proc_signatures.push(self.parse_proc_signature()),
                 TokenKind::Function => func_signatures.push(self.parse_func_signature()),
@@ -210,6 +215,7 @@ impl Parser {
         InterfaceSection {
             uses,
             const_decls,
+            type_decls,
             var_decls,
             proc_signatures,
             func_signatures,
@@ -405,9 +411,43 @@ impl Parser {
         decls
     }
 
+    /// `TYPE name1 = TypeExpr; name2 = TypeExpr; ...`
+    ///
+    /// 宣言順序は`wasd_ast::decl::Program::type_decls`のドキュメント通り
+    /// 意味を持つ（`wasd-sema`によるポインタの前方参照解決のため）ため、
+    /// ソース上の並び順をそのまま保持する。
+    fn parse_type_section(&mut self) -> Vec<TypeDecl> {
+        self.advance(); // TYPE
+        let mut decls = Vec::new();
+        while matches!(self.peek(), TokenKind::Identifier(_)) {
+            let name = self.parse_identifier("type name");
+            self.expect(&TokenKind::Eq, "'='");
+            let ty = self.parse_type();
+            self.expect(&TokenKind::Semicolon, "';'");
+            let span = Span::new(name.span.start, ty.span().end);
+            decls.push(TypeDecl { name, ty, span });
+        }
+        decls
+    }
+
+    /// 型注釈のパース。組み込み型・`STRING[n]`・配列・レコード・ポインタ型に
+    /// 加え、まだ組み込み型として認識できない識別子は`TYPE`セクションで
+    /// 宣言された（あるいはこれから宣言される）型名への参照
+    /// (`TypeExpr::Named`) として受理する。実際にその名前が存在するかどうかの
+    /// 検査は構文解析の範囲外であり、`wasd-sema`が行う
+    /// （`wasd_ast::decl::TypeExpr::Named`のドキュメント参照）。
     fn parse_type(&mut self) -> TypeExpr {
+        let packed = self.check(&TokenKind::Packed);
+        let packed_span = self.peek_span();
+        if packed {
+            self.advance();
+        }
+
         let span = self.peek_span();
-        match self.peek().clone() {
+        let ty = match self.peek().clone() {
+            TokenKind::Array => self.parse_array_type(if packed { packed_span } else { span }, packed),
+            TokenKind::Record => self.parse_record_type(if packed { packed_span } else { span }, packed),
+            TokenKind::Caret => self.parse_pointer_type(span),
             TokenKind::Identifier(name) => {
                 self.advance();
                 match name.to_ascii_lowercase().as_str() {
@@ -416,22 +456,14 @@ impl Parser {
                     "boolean" => TypeExpr::Boolean(span),
                     "char" => TypeExpr::Char(span),
                     "string" => self.parse_string_n_type(span),
-                    _ => {
-                        self.error(
-                            span,
-                            format!(
-                                "unknown type '{name}' (only INTEGER/REAL/BOOLEAN/CHAR/STRING[n] are supported by this parser)"
-                            ),
-                        );
-                        TypeExpr::Integer(span)
-                    }
+                    _ => TypeExpr::Named(Identifier::new(name, span)),
                 }
             }
             other => {
                 self.error(
                     span,
                     format!(
-                        "expected a type name (INTEGER/REAL/BOOLEAN/CHAR/STRING[n]), found {}",
+                        "expected a type (INTEGER/REAL/BOOLEAN/CHAR/STRING[n]/ARRAY/RECORD/^type/a type name), found {}",
                         describe(&other)
                     ),
                 );
@@ -440,7 +472,111 @@ impl Parser {
                 }
                 TypeExpr::Integer(span)
             }
+        };
+
+        if packed && !matches!(ty, TypeExpr::Array { .. } | TypeExpr::Record { .. }) {
+            self.error(packed_span, "'PACKED' can only be applied to ARRAY or RECORD types");
         }
+        ty
+    }
+
+    /// `ARRAY [index_type_list] OF element_type`。呼び出し元は`PACKED`の
+    /// 有無を判定済みで、`self.peek()`が`TokenKind::Array`であることが前提。
+    ///
+    /// # 設計判断: 多次元配列はネストした`Array`に展開する
+    ///
+    /// `ARRAY [1..10, 1..20] OF INTEGER`は`ARRAY [1..10] OF ARRAY [1..20] OF
+    /// INTEGER`の糖衣構文として扱う（`wasd_ast::decl::TypeExpr`の
+    /// ドキュメント参照）。`index_type_list`を右から畳み込み、最も内側の
+    /// 次元が`element_type`に最も近い`Array`になるようにする。
+    fn parse_array_type(&mut self, start: Span, packed: bool) -> TypeExpr {
+        self.advance(); // ARRAY
+        self.expect(&TokenKind::LBracket, "'['");
+
+        let mut index_types = vec![self.parse_subrange_index()];
+        while self.check(&TokenKind::Comma) {
+            self.advance();
+            index_types.push(self.parse_subrange_index());
+        }
+        self.expect(&TokenKind::RBracket, "']'");
+        self.expect(&TokenKind::Of, "'OF'");
+        let element_type = self.parse_type();
+        let end = element_type.span().end.max(start.end);
+
+        let mut result = element_type;
+        for index_type in index_types.into_iter().rev() {
+            result = TypeExpr::Array {
+                index_type: Box::new(index_type),
+                element_type: Box::new(result),
+                packed,
+                span: Span::new(start.start, end),
+            };
+        }
+        result
+    }
+
+    /// 配列添字の1次元分、`low..high`（今回は`INTEGER`のリテラルのみ対応。
+    /// `wasd_ast::decl::TypeExpr::Subrange`のドキュメント参照）。
+    fn parse_subrange_index(&mut self) -> TypeExpr {
+        let low = self.parse_const_literal();
+        self.expect(&TokenKind::DotDot, "'..'");
+        let high = self.parse_const_literal();
+        let span = Span::new(low.span().start, high.span().end);
+        TypeExpr::Subrange { low, high, span }
+    }
+
+    /// `RECORD field1, field2: T1; field3: T2; ... END`。呼び出し元は
+    /// `PACKED`の有無を判定済みで、`self.peek()`が`TokenKind::Record`で
+    /// あることが前提。
+    fn parse_record_type(&mut self, start: Span, packed: bool) -> TypeExpr {
+        self.advance(); // RECORD
+        let fields = self.parse_field_list();
+        let end_span = self.expect_and_span(&TokenKind::End, "'END'");
+        TypeExpr::Record {
+            fields,
+            packed,
+            span: Span::new(start.start, end_span.end.max(start.end)),
+        }
+    }
+
+    /// `RECORD`本体のフィールド並び。`parse_var_section`と同じ形
+    /// （`names: T;`の繰り返し）だが、終端が`END`である点が異なる
+    /// （呼び出し元が`END`を消費する）。
+    fn parse_field_list(&mut self) -> Vec<FieldDecl> {
+        let mut fields = Vec::new();
+        while matches!(self.peek(), TokenKind::Identifier(_)) {
+            let start = self.peek_span();
+            let mut names = vec![self.parse_identifier("field name")];
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                names.push(self.parse_identifier("field name"));
+            }
+            self.expect(&TokenKind::Colon, "':'");
+            let ty = self.parse_type();
+            let span = Span::new(start.start, ty.span().end);
+            fields.push(FieldDecl { names, ty, span });
+
+            if self.check(&TokenKind::Semicolon) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        fields
+    }
+
+    /// `^T`（ポインタ型）。呼び出し元は`self.peek()`が`TokenKind::Caret`で
+    /// あることが前提。
+    ///
+    /// `T`は`Node`のようにまだ`TYPE`宣言されていない可能性がある
+    /// （前方参照）。パーサー自身は構文的に受理するだけで、名前解決
+    /// （同じ`TYPE`セクション内でのレコード型への前方参照を含む）は
+    /// `wasd-sema`が行う。
+    fn parse_pointer_type(&mut self, caret_span: Span) -> TypeExpr {
+        self.advance(); // ^
+        let inner = self.parse_type();
+        let span = Span::new(caret_span.start, inner.span().end.max(caret_span.end));
+        TypeExpr::Pointer(Box::new(inner), span)
     }
 
     /// UCSD拡張: `STRING[n]`型。呼び出し元は`STRING`識別子を消費済みで、
@@ -572,7 +708,7 @@ impl Parser {
                 let span = Span::new(name.span.start, ty.span().end);
                 params.push(ParamDecl {
                     name,
-                    ty,
+                    ty: ty.clone(),
                     by_ref,
                     span,
                 });
@@ -969,26 +1105,46 @@ impl Parser {
         })
     }
 
-    /// 代入文 `identifier := expr` と手続き呼び出し文
+    /// 代入文 `designator := expr` と手続き呼び出し文
     /// `identifier(expr, ...)` / `identifier` は共に識別子から始まるため、
     /// ここでまとめて先読み分岐する。
+    ///
+    /// 代入文の左辺（`designator`）は単純な識別子とは限らず、配列添字
+    /// アクセス・レコードフィールドアクセス・ポインタデリファレンスの
+    /// 組み合わせ（`arr[i].field^`など）にもなり得る。手続き呼び出しの
+    /// 括弧`(args)`は識別子に直接続く場合のみを認識する（`arr[i](x)`の
+    /// ような構文はこの言語のサブセットには存在しない）ため、まず
+    /// `(`の有無を確認し、なければ識別子を起点に後置演算子チェーン
+    /// （[`Self::parse_postfix_chain`]）を読み取ってから`:=`の有無を見る。
     fn parse_assignment_or_call(&mut self) -> Option<Statement> {
         let name = self.parse_identifier("identifier");
 
-        if self.check(&TokenKind::Assign) {
-            self.advance();
-            let value = self.parse_expr();
-            let span = Span::new(name.span.start, value.span().end);
-            Some(Statement::Assignment { target: name, value, span })
-        } else if self.check(&TokenKind::LParen) {
+        if self.check(&TokenKind::LParen) {
             self.advance();
             let args = self.parse_call_args();
             let close = self.expect_and_span(&TokenKind::RParen, "')'");
             let span = Span::new(name.span.start, close.end.max(name.span.end));
-            Some(Statement::ProcCall { name, args, span })
-        } else {
+            return Some(Statement::ProcCall { name, args, span });
+        }
+
+        let designator = self.parse_postfix_chain(Expr::Identifier(name.clone()));
+
+        if self.check(&TokenKind::Assign) {
+            self.advance();
+            let value = self.parse_expr();
+            let span = Span::new(designator.span().start, value.span().end);
+            Some(Statement::Assignment { target: designator, value, span })
+        } else if matches!(designator, Expr::Identifier(_)) {
             let span = name.span;
             Some(Statement::ProcCall { name, args: vec![], span })
+        } else {
+            let span = self.peek_span();
+            let found = describe(self.peek());
+            self.error(
+                span,
+                format!("expected ':=' after array/record/pointer designator, found {found}"),
+            );
+            None
         }
     }
 
@@ -1144,8 +1300,72 @@ impl Parser {
                 self.advance();
                 self.parse_unary()
             }
-            _ => self.parse_primary(),
+            _ => self.parse_postfix(),
         }
+    }
+
+    /// `parse_primary`が返した式に対し、後置演算子（配列添字`[..]`、
+    /// レコードフィールドアクセス`.field`、ポインタデリファレンス`^`）の
+    /// 並びを可能な限り貪欲に読み取る。`x[i].field^[j]`のような組み合わせも
+    /// 許可する。
+    fn parse_postfix(&mut self) -> Expr {
+        let expr = self.parse_primary();
+        self.parse_postfix_chain(expr)
+    }
+
+    /// [`Self::parse_postfix`]の本体。代入文の左辺（`parse_assignment_or_call`）
+    /// でも、既に読み終えた識別子を起点に同じ後置演算子チェーンを組み立てる
+    /// ために共有する。
+    fn parse_postfix_chain(&mut self, mut expr: Expr) -> Expr {
+        loop {
+            match self.peek() {
+                TokenKind::LBracket => {
+                    self.advance();
+                    // `arr[i, j]`は`arr[i][j]`と同じ意味の糖衣構文として、
+                    // 左結合的にネストした`IndexAccess`に展開する
+                    // （`wasd_ast::expr::Expr::IndexAccess`のドキュメント参照）。
+                    loop {
+                        let index = self.parse_expr();
+                        let span = Span::new(expr.span().start, index.span().end);
+                        expr = Expr::IndexAccess {
+                            array: Box::new(expr),
+                            index: Box::new(index),
+                            span,
+                        };
+                        if self.check(&TokenKind::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    let close = self.expect_and_span(&TokenKind::RBracket, "']'");
+                    if let Expr::IndexAccess { span, .. } = &mut expr {
+                        *span = Span::new(span.start, close.end.max(span.end));
+                    }
+                }
+                TokenKind::Dot => {
+                    self.advance();
+                    let field = self.parse_identifier("field name");
+                    let span = Span::new(expr.span().start, field.span.end);
+                    expr = Expr::FieldAccess {
+                        record: Box::new(expr),
+                        field,
+                        span,
+                    };
+                }
+                TokenKind::Caret => {
+                    let caret_span = self.peek_span();
+                    self.advance();
+                    let span = Span::new(expr.span().start, caret_span.end);
+                    expr = Expr::Deref {
+                        pointer: Box::new(expr),
+                        span,
+                    };
+                }
+                _ => break,
+            }
+        }
+        expr
     }
 
     fn parse_primary(&mut self) -> Expr {
@@ -1154,6 +1374,10 @@ impl Parser {
             TokenKind::IntegerLiteral(v) => {
                 self.advance();
                 Expr::IntLiteral(v, span)
+            }
+            TokenKind::Nil => {
+                self.advance();
+                Expr::NilLiteral(span)
             }
             // UCSD拡張: 16進数リテラル `$FF`。`Expr::IntLiteral`とは別の
             // `Expr::HexIntLiteral`として組み立てる（dialectチェックを
@@ -1961,7 +2185,7 @@ mod tests {
         assert_eq!(func.body.statements.len(), 1);
         match &func.body.statements[0] {
             Statement::Assignment { target, value, .. } => {
-                assert_eq!(target.name, "Square");
+                assert!(matches!(target, Expr::Identifier(id) if id.name == "Square"));
                 assert!(matches!(
                     value,
                     Expr::BinaryOp {
@@ -2143,7 +2367,7 @@ mod tests {
                 assert_eq!(branches.len(), 1);
                 match otherwise.as_deref() {
                     Some(Statement::Assignment { target, .. }) => {
-                        assert_eq!(target.name, "y");
+                        assert!(matches!(target, Expr::Identifier(id) if id.name == "y"));
                     }
                     other => panic!("expected an OTHERWISE assignment, got {other:?}"),
                 }
@@ -2212,6 +2436,263 @@ mod tests {
                 assert_eq!(args, "foo.pas");
             }
             other => panic!("expected a CompilerDirective statement, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 配列・レコード・ポインタ型（Step 9）
+    // ------------------------------------------------------------------
+
+    /// `ARRAY [1..10] OF INTEGER`が`TypeExpr::Array`としてパースされること。
+    #[test]
+    fn parses_array_type() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.var_decls[0].ty {
+            TypeExpr::Array {
+                index_type,
+                element_type,
+                packed,
+                ..
+            } => {
+                assert!(!packed);
+                assert!(matches!(
+                    index_type.as_ref(),
+                    TypeExpr::Subrange {
+                        low: Literal::Int(1, _),
+                        high: Literal::Int(10, _),
+                        ..
+                    }
+                ));
+                assert!(matches!(element_type.as_ref(), TypeExpr::Integer(_)));
+            }
+            other => panic!("expected an Array type, got {other:?}"),
+        }
+    }
+
+    /// `PACKED ARRAY [0..255] OF CHAR`が`packed: true`でパースされること。
+    #[test]
+    fn parses_packed_array_type() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR a: PACKED ARRAY [0..255] OF CHAR; BEGIN END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.var_decls[0].ty {
+            TypeExpr::Array { packed, .. } => assert!(*packed),
+            other => panic!("expected an Array type, got {other:?}"),
+        }
+    }
+
+    /// `ARRAY [1..10, 1..20] OF INTEGER`が`ARRAY [1..10] OF ARRAY [1..20] OF
+    /// INTEGER`と同じネストした`Array`に展開されること。
+    #[test]
+    fn multi_dimensional_array_desugars_to_nested_array() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR a: ARRAY [1..10, 1..20] OF INTEGER; BEGIN END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.var_decls[0].ty {
+            TypeExpr::Array {
+                index_type,
+                element_type,
+                ..
+            } => {
+                assert!(matches!(
+                    index_type.as_ref(),
+                    TypeExpr::Subrange {
+                        low: Literal::Int(1, _),
+                        high: Literal::Int(10, _),
+                        ..
+                    }
+                ));
+                match element_type.as_ref() {
+                    TypeExpr::Array {
+                        index_type,
+                        element_type,
+                        ..
+                    } => {
+                        assert!(matches!(
+                            index_type.as_ref(),
+                            TypeExpr::Subrange {
+                                low: Literal::Int(1, _),
+                                high: Literal::Int(20, _),
+                                ..
+                            }
+                        ));
+                        assert!(matches!(element_type.as_ref(), TypeExpr::Integer(_)));
+                    }
+                    other => panic!("expected a nested Array type, got {other:?}"),
+                }
+            }
+            other => panic!("expected an Array type, got {other:?}"),
+        }
+    }
+
+    /// `arr[i]`が`Expr::IndexAccess`としてパースされ、`arr[i, j]`が
+    /// `arr[i][j]`と同じネストした`IndexAccess`に展開されること。
+    #[test]
+    fn parses_index_access_expression_and_multi_index() {
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR a: ARRAY [1..10, 1..10] OF INTEGER; x: INTEGER; BEGIN x := a[1, 2] END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Assignment { value, .. } => match value {
+                Expr::IndexAccess { array, index, .. } => {
+                    assert!(matches!(index.as_ref(), Expr::IntLiteral(2, _)));
+                    match array.as_ref() {
+                        Expr::IndexAccess { array, index, .. } => {
+                            assert!(matches!(index.as_ref(), Expr::IntLiteral(1, _)));
+                            assert!(matches!(array.as_ref(), Expr::Identifier(id) if id.name == "a"));
+                        }
+                        other => panic!("expected a nested IndexAccess, got {other:?}"),
+                    }
+                }
+                other => panic!("expected an IndexAccess, got {other:?}"),
+            },
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// `arr[i] := expr`が`target`に`Expr::IndexAccess`を持つ`Assignment`として
+    /// パースされること。
+    #[test]
+    fn parses_assignment_to_array_element() {
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[1] := 42 END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Assignment { target, value, .. } => {
+                assert!(matches!(target, Expr::IndexAccess { .. }));
+                assert!(matches!(value, Expr::IntLiteral(42, _)));
+            }
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// `RECORD ... END`型宣言が`TypeExpr::Record`としてパースされ、
+    /// `rec.field`が`Expr::FieldAccess`としてパースされること。
+    #[test]
+    fn parses_record_type_and_field_access() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Point = RECORD x, y: INTEGER END;
+            VAR
+                p: Point;
+                n: INTEGER;
+            BEGIN
+                p.x := 1;
+                n := p.y
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        assert_eq!(program.type_decls.len(), 1);
+        assert_eq!(program.type_decls[0].name.name, "Point");
+        match &program.type_decls[0].ty {
+            TypeExpr::Record { fields, packed, .. } => {
+                assert!(!packed);
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].names.len(), 2);
+            }
+            other => panic!("expected a Record type, got {other:?}"),
+        }
+
+        match &program.body.statements[0] {
+            Statement::Assignment { target, .. } => match target {
+                Expr::FieldAccess { record, field, .. } => {
+                    assert_eq!(field.name, "x");
+                    assert!(matches!(record.as_ref(), Expr::Identifier(id) if id.name == "p"));
+                }
+                other => panic!("expected a FieldAccess, got {other:?}"),
+            },
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// ポインタ型`^Node`と、`TYPE`セクション内での前方参照
+    /// （`PNode = ^Node;`が`Node`の宣言より前に現れる）が構文的に
+    /// 受理されること。名前解決自体は`wasd-sema`の責務なので、ここでは
+    /// パーサーが`TypeExpr::Pointer(TypeExpr::Named("Node"))`を構築する
+    /// ことだけを確認する。
+    #[test]
+    fn parses_pointer_type_with_forward_reference() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                PNode = ^Node;
+                Node = RECORD
+                    value: INTEGER;
+                    next: PNode
+                END;
+            VAR
+                head: PNode;
+            BEGIN
+                head := NIL
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        assert_eq!(program.type_decls.len(), 2);
+        match &program.type_decls[0].ty {
+            TypeExpr::Pointer(inner, _) => {
+                assert!(matches!(inner.as_ref(), TypeExpr::Named(id) if id.name == "Node"));
+            }
+            other => panic!("expected a Pointer type, got {other:?}"),
+        }
+
+        match &program.body.statements[0] {
+            Statement::Assignment { value, .. } => {
+                assert!(matches!(value, Expr::NilLiteral(_)));
+            }
+            other => panic!("expected an Assignment, got {other:?}"),
+        }
+    }
+
+    /// `p^`が`Expr::Deref`としてパースされ、`p^.field`のように
+    /// デリファレンス後のフィールドアクセスも組み合わせられること。
+    #[test]
+    fn parses_deref_and_deref_field_access() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Node = RECORD value: INTEGER END;
+                PNode = ^Node;
+            VAR
+                p: PNode;
+                n: INTEGER;
+            BEGIN
+                p^.value := 1;
+                n := p^.value
+            END.
+        "#;
+        let (program, diags) = parse_source(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let program = program.expect("should parse a Program");
+
+        match &program.body.statements[0] {
+            Statement::Assignment { target, .. } => match target {
+                Expr::FieldAccess { record, field, .. } => {
+                    assert_eq!(field.name, "value");
+                    assert!(matches!(record.as_ref(), Expr::Deref { .. }));
+                }
+                other => panic!("expected a FieldAccess over a Deref, got {other:?}"),
+            },
+            other => panic!("expected an Assignment, got {other:?}"),
         }
     }
 }

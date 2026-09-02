@@ -1,10 +1,13 @@
-//! 宣言（`PROGRAM`/`VAR`/`CONST`/`PROCEDURE`/`FUNCTION`など）のASTノード。
+//! 宣言（`PROGRAM`/`VAR`/`CONST`/`TYPE`/`PROCEDURE`/`FUNCTION`など）のASTノード。
 //!
 //! 今回のスコープ: `PROGRAM`ヘッダ、単一の`BEGIN...END.`ブロック、
-//! `VAR`セクション（組み込み型 + UCSD拡張の`STRING[n]`）、`CONST`セクション
-//! （リテラル値のみ）、`PROCEDURE`/`FUNCTION`宣言（ローカル`VAR`宣言を含む）、
+//! `VAR`セクション（組み込み型 + UCSD拡張の`STRING[n]` + 配列・レコード・
+//! ポインタ型）、`CONST`セクション（リテラル値のみ）、`TYPE`セクション
+//! （配列・レコード・ポインタ型を含む型宣言。`PROGRAM`直下と`UNIT`の
+//! `INTERFACE`部のみに対応し、`PROCEDURE`/`FUNCTION`本体内のローカル
+//! `TYPE`宣言は今回もまだ未対応。既存の`CONST`のローカル宣言と同様の
+//! スコープ制限）、`PROCEDURE`/`FUNCTION`宣言（ローカル`VAR`宣言を含む）、
 //! UCSD拡張の`UNIT`/`INTERFACE`/`IMPLEMENTATION`/`USES`。
-//! `TYPE`セクション（配列・レコード・ポインタ型を含む）は今回は含めない。
 //!
 //! `Program`と`Unit`はいずれも「コンパイル単位」であり、[`CompilationUnit`]
 //! でまとめて扱える。`wasd-parser`のエントリポイントは先頭トークンが
@@ -34,6 +37,12 @@ pub struct Program {
     /// 参照）。ここでは構文的に参照名の並びを保持するだけで、名前解決は行わない。
     pub uses: Vec<Identifier>,
     pub const_decls: Vec<ConstDecl>,
+    /// `TYPE`セクション。配列・レコード・ポインタ型の宣言（`TYPE Name = ...;`）
+    /// を持つ。宣言順序が意味を持つ点に注意: `wasd-sema`はポインタ型の指す先
+    /// レコードだけを対象とした前方参照（同じ`TYPE`セクション内で後から
+    /// 宣言されるレコード型をポインタが指すこと）を許可するため、宣言順に
+    /// 依存した解決を行う（`wasd-sema`の型解決ロジックのドキュメント参照）。
+    pub type_decls: Vec<TypeDecl>,
     pub var_decls: Vec<VarDecl>,
     pub proc_decls: Vec<ProcDecl>,
     pub func_decls: Vec<FuncDecl>,
@@ -111,6 +120,7 @@ pub struct Unit {
 pub struct InterfaceSection {
     pub uses: Vec<Identifier>,
     pub const_decls: Vec<ConstDecl>,
+    pub type_decls: Vec<TypeDecl>,
     pub var_decls: Vec<VarDecl>,
     /// 本体を持たない`PROCEDURE`シグネチャのみ。
     pub proc_signatures: Vec<ProcSignature>,
@@ -163,6 +173,23 @@ pub struct ConstDecl {
     pub span: Span,
 }
 
+/// `TYPE`セクション中の1宣言（`Name = TypeExpr;`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDecl {
+    pub name: Identifier,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// `RECORD`型中の1フィールドグループ（`field1, field2: INTEGER;`のような
+/// 識別子リストと型の組。`VarDecl`と同じ形）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDecl {
+    pub names: Vec<Identifier>,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
 /// `PROCEDURE name(params); [VAR ...] BEGIN ... END;` 宣言。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcDecl {
@@ -201,14 +228,36 @@ pub struct ParamDecl {
     pub span: Span,
 }
 
-/// 型。組み込み型に加え、UCSD拡張の`STRING[n]`型を持つ。
+/// 型。組み込み型に加え、UCSD拡張の`STRING[n]`型、配列・レコード・ポインタ型、
+/// および`TYPE`セクションで宣言された型名への参照を持つ。
 ///
 /// `Expr`のリテラルバリアントと同様、型を書いたソース上の位置を
 /// バリアントごとに`Span`として保持する（型名の綴りに対する診断のため）。
 ///
-/// `#[non_exhaustive]`: 将来`Array`/`Record`/`Pointer`などを
-/// 追加する際に、既存の`match`をワイルドカードなしで壊さないようにするため。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # 設計判断: 多次元配列は`Array`のネストとして表現する
+///
+/// `ARRAY [1..10, 1..20] OF INTEGER`は`ARRAY [1..10] OF ARRAY [1..20] OF
+/// INTEGER`の糖衣構文として扱い、パーサーがASTレベルでネストした`Array`
+/// （`element_type`が`Array`自身であるような入れ子構造）に展開する。
+/// 複数次元を1つの`Array`バリアントに直接持たせる（`index_types: Vec<...>`
+/// のような設計）よりも実装がシンプルであり、`wasd-sema`側の型検査
+/// （添字1つに対して1回`Array`を剥がす）も再帰で自然に書けるため、この方針を
+/// 採用した。
+///
+/// # 設計判断: `Named`（型名参照）を追加した理由
+///
+/// タスク仕様の`TypeExpr`草案には現れないが、`TYPE`セクションの導入に伴い、
+/// 「まだ組み込み型として認識できない識別子」を型の位置に書けるようにする
+/// 必要がある（`TYPE MyRecord = RECORD ... END; VAR x: MyRecord;`の
+/// `MyRecord`、`TYPE PNode = ^Node;`の`Node`など）。パーサーは`Named`として
+/// 構文的に受理するだけで、実際にその名前が`TYPE`宣言に存在するかどうかの
+/// 解決は`wasd-sema`が行う（ポインタの指す先レコードに限り、同じ`TYPE`
+/// セクション内での前方参照を許可する。`wasd-sema`の型解決ロジックの
+/// ドキュメント参照）。
+///
+/// `#[non_exhaustive]`: 将来さらにバリアント（集合型など）を追加する際に、
+/// 既存の`match`をワイルドカードなしで壊さないようにするため。
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum TypeExpr {
     Integer(Span),
@@ -217,6 +266,34 @@ pub enum TypeExpr {
     Char(Span),
     /// UCSD拡張: `STRING[n]`（`n`は最大長）。
     StringN(usize, Span),
+    /// `TYPE`セクションで宣言された型名への参照（未解決）。
+    Named(Identifier),
+    /// `ARRAY [low..high] OF element`（`PACKED`修飾を含む）。
+    Array {
+        index_type: Box<TypeExpr>,
+        element_type: Box<TypeExpr>,
+        packed: bool,
+        span: Span,
+    },
+    /// 添字の範囲を表現するサブレンジ型（`low..high`）。今回のスコープでは
+    /// `Array::index_type`としてのみ現れ、かつ`low`/`high`はいずれも
+    /// `Literal::Int`のみをサポートする（`wasd-sema`のドキュメント参照）。
+    Subrange {
+        low: Literal,
+        high: Literal,
+        span: Span,
+    },
+    /// `RECORD field1, field2: T1; ... END`（`PACKED`修飾を含む）。
+    ///
+    /// `CASE tag OF ... END`形式のvariant partは今回のスコープ外
+    /// （タスク文書参照）。
+    Record {
+        fields: Vec<FieldDecl>,
+        packed: bool,
+        span: Span,
+    },
+    /// `^T`（ポインタ型）。
+    Pointer(Box<TypeExpr>, Span),
 }
 
 impl TypeExpr {
@@ -227,6 +304,11 @@ impl TypeExpr {
             | TypeExpr::Boolean(span)
             | TypeExpr::Char(span)
             | TypeExpr::StringN(_, span) => *span,
+            TypeExpr::Named(ident) => ident.span,
+            TypeExpr::Array { span, .. } => *span,
+            TypeExpr::Subrange { span, .. } => *span,
+            TypeExpr::Record { span, .. } => *span,
+            TypeExpr::Pointer(_, span) => *span,
         }
     }
 }
@@ -253,6 +335,7 @@ mod tests {
             name: ident("Foo", name_span),
             uses: vec![],
             const_decls: vec![],
+            type_decls: vec![],
             var_decls: vec![],
             proc_decls: vec![],
             func_decls: vec![],
@@ -291,6 +374,7 @@ mod tests {
             name: ident("Foo", s),
             uses: vec![],
             const_decls: vec![const_decl.clone()],
+            type_decls: vec![],
             var_decls: vec![var_decl.clone()],
             proc_decls: vec![],
             func_decls: vec![],

@@ -23,8 +23,22 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Statement {
+    /// 代入文 `target := value`。
+    ///
+    /// # 設計判断: `target`は`Identifier`ではなく`Expr`
+    ///
+    /// 配列型・レコード型・ポインタ型の導入により、代入の左辺（lvalue）は
+    /// 単純な識別子だけでなく`arr[i]`（`Expr::IndexAccess`）、
+    /// `rec.field`（`Expr::FieldAccess`）、`p^`（`Expr::Deref`）、
+    /// およびこれらの組み合わせ（`rec.arr[i].field^`など）にもなり得る。
+    /// 専用の`LValue`enumを新設する案もあったが、`Expr`側に必要な
+    /// バリアント（`IndexAccess`/`FieldAccess`/`Deref`）が式としても
+    /// （右辺値としても）そのまま使えるため、`Expr`を再利用する方が
+    /// 型の重複や変換コードを避けられる。「どんな`Expr`でも構文的には
+    /// `target`に置ける」という緩さが生じるが、実際に代入可能かどうか
+    /// （左辺値かどうか）の判定は`wasd-sema`の責務とする。
     Assignment {
-        target: Identifier,
+        target: Expr,
         value: Expr,
         span: Span,
     },
@@ -147,7 +161,7 @@ mod tests {
         let s = Span::new(0, 1);
 
         let inner_assign = Statement::Assignment {
-            target: ident("x", s),
+            target: Expr::Identifier(ident("x", s)),
             value: Expr::IntLiteral(1, s),
             span: s,
         };
