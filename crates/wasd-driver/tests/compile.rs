@@ -220,3 +220,46 @@ fn recursive_functions_and_local_procedures_type_check_cleanly() {
         result.diagnostics
     );
 }
+
+/// Step 18のゴール: タスク依頼の動作確認用サンプルそのもの
+/// （`FUNCTION`の`INTEGER`値仮引数+戻り値、`PROCEDURE`の`STRING[n]`値
+/// 仮引数）が、レキサ→パーサー→意味解析→p-code生成のパイプライン全体を
+/// 診断なしで通過すること。`STRING[n]`はUCSD拡張なので`Dialect::Ucsd`を
+/// 指定する。
+#[test]
+fn compile_to_pcode_generates_a_module_for_the_step18_function_and_string_parameter_sample() {
+    let source = r#"
+        PROGRAM FuncTest;
+
+        FUNCTION Double(x: INTEGER): INTEGER;
+        BEGIN
+            Double := x * 2;
+        END;
+
+        PROCEDURE PrintGreeting(name: STRING[40]);
+        BEGIN
+            WriteLn(name);
+        END;
+
+        VAR
+            n: INTEGER;
+        BEGIN
+            n := Double(21);
+            WriteLn(n);
+            PrintGreeting('Hello from a parameter!');
+        END.
+    "#;
+
+    let options = CompileOptions::new(Dialect::Ucsd);
+    let result = compile_to_pcode(source, &options);
+
+    assert!(
+        result.diagnostics.is_empty(),
+        "expected no diagnostics, got {:?}",
+        result.diagnostics
+    );
+    let pcode = result.pcode.expect("pcode should have been generated");
+    let text = pcode.to_string();
+    assert!(text.contains("CPG"), "expected a CPG call, got:\n{text}");
+    assert!(text.contains("RPU"), "expected an RPU return, got:\n{text}");
+}

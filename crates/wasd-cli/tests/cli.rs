@@ -265,6 +265,23 @@ fn run_executes_the_same_argument_less_procedure_repeatedly() {
         .stdout(predicate::str::contains("OK: program ran to completion"));
 }
 
+/// Step 18のゴール: `wasdc run --std=ucsd examples/func_test.pas`が実際に
+/// `FUNCTION`の`INTEGER`値仮引数+戻り値（`Double(21) = 42`）と、
+/// `PROCEDURE`の`STRING[n]`値仮引数（`PrintGreeting('Hello from a
+/// parameter!')`）の両方を正しく実行すること。`STRING[n]`はUCSD拡張なので
+/// `--std=ucsd`が必要（`string_test.pas`と同じ理由）。
+#[test]
+fn run_executes_function_and_string_parameter_sample() {
+    wasdc()
+        .arg("run")
+        .arg(example("func_test.pas"))
+        .arg("--std=ucsd")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("42\nHello from a parameter!\n"))
+        .stdout(predicate::str::contains("OK: program ran to completion"));
+}
+
 #[test]
 fn missing_file_exits_with_io_error_code() {
     wasdc()

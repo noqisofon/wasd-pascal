@@ -5,12 +5,16 @@
 //! `INTEGER`/`BOOLEAN`型の変数・定数、算術演算（`+ - * DIV MOD`）、比較演算、
 //! 論理演算（`AND OR NOT`）、代入文、`IF`/`WHILE`/`REPEAT UNTIL`/`FOR`に
 //! よる制御構造、`BEGIN...END`の複合文、`PROGRAM ... BEGIN ... END.`
-//! 全体構造、`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の呼び出し、
-//! および組み込み手続き`WriteLn`（引数0個または1個。`INTEGER`/`BOOLEAN`
-//! に加え、Step 15から文字列リテラルの直接渡し（`WriteLn('...')`）も
-//! サポート。[`CodeGenerator::gen_writeln_call`]参照）を扱う。文字列リテラルは
-//! `WriteLn`への直接渡し以外の文脈では引き続きスコープ外（意味解析
-//! （`wasd-sema`）の段階で型エラーになるため、本クレートまで到達しない）。
+//! 全体構造、`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の呼び出し
+//! （単一の値仮引数または`VAR`仮引数。`INTEGER`/`BOOLEAN`/`STRING[n]`。
+//! Step 18から`FUNCTION`の戻り値も含む）、および組み込み手続き`WriteLn`
+//! （引数0個または1個。`INTEGER`/`BOOLEAN`に加え、Step 15から文字列
+//! リテラルの直接渡し（`WriteLn('...')`）も、Step 16から`STRING[n]`変数も
+//! サポート。[`CodeGenerator::gen_writeln_call`]参照）を扱う。文字列
+//! リテラルは`WriteLn`への直接渡し、および`STRING[n]`値引数として渡す
+//! 場合（Step 18。[`CodeGenerator::gen_string_value_arg`]参照）以外の
+//! 文脈では引き続きスコープ外（意味解析（`wasd-sema`）の段階で型エラーに
+//! なるため、本クレートまで到達しない）。
 //!
 //! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、`WriteLn`
 //! 以外の組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数
@@ -47,8 +51,11 @@
 //!    `5..5+DATASIZE`
 //! 3. パラメータ領域: オフセット`5+DATASIZE..5+DATASIZE+P`
 //!    （`P`は仮引数のワード数。`VAR`仮引数はアドレスを1ワードで格納し、
-//!    それ以外の値仮引数（本クレートのスコープでは`INTEGER`/`BOOLEAN`の
-//!    み）は値そのものを1ワードで格納する）
+//!    それ以外の値仮引数のうち`INTEGER`/`BOOLEAN`は値そのものを1ワードで
+//!    格納する。`STRING[n]`の値仮引数（Step 18）は、レコード・配列の値
+//!    パラメータに関するStep 12のCONFIRMED済みの規則からの類推
+//!    （[`CodeGenerator::gen_string_value_arg`]のドキュメント参照、
+//!    UNCONFIRMED）により、`VAR`仮引数と同様にアドレスを1ワードで格納する）
 //! 4. 関数の戻り値領域（`FUNCTION`のみ、1ワード）: オフセット
 //!    `5+DATASIZE+P`
 //!
@@ -194,23 +201,35 @@ impl ConstValue {
 }
 
 /// 活性化レコード内の1スロット（ローカル変数または仮引数）の情報。
-/// `by_ref`が真の場合、そのスロットに格納されているのは値ではなく
-/// 呼び出し元の変数のアドレスである（`VAR`仮引数）。
+///
+/// `by_ref`と`indirect`は別の概念である点に注意:
+/// - `by_ref`: 仮引数が`VAR`として宣言されたか（呼び出し元の変数への
+///   参照渡しかどうか）。[`CodeGenerator::gen_call_args`]が呼び出し側の
+///   引数の積み方（値を評価するか、アドレスを積むか）を選ぶために使う。
+/// - `indirect`: このスロットに物理的に格納されているのが値そのものでは
+///   なく**アドレス**であるかどうか。`by_ref`な仮引数（型を問わず）に加え、
+///   `STRING[n]`の値仮引数（Step 18。`by_ref`は偽）でも真になる
+///   （[`CodeGenerator::gen_string_value_arg`]のドキュメント参照:
+///   レコード・配列の値パラメータに関するStep 12のCONFIRMED済みの規則
+///   からの類推、UNCONFIRMED）。ロード/ストア/アドレス取得
+///   （[`CodeGenerator::gen_load_resolved`]等）はこの`indirect`だけを見る。
 #[derive(Debug, Clone, Copy)]
 struct FrameSlot {
     address: Address,
     by_ref: bool,
+    indirect: bool,
     kind: ValueKind,
 }
 
 /// 識別子1つの参照先が解決した結果。ロード/ストア/アドレス取得の
-/// いずれの操作にも必要な情報（レベル差・アドレス・`VAR`仮引数かどうか）
-/// をまとめて持つ。
+/// いずれの操作にも必要な情報（レベル差・アドレス・スロットがアドレスを
+/// 格納しているかどうか）をまとめて持つ。
 #[derive(Debug, Clone, Copy)]
 struct ResolvedVar {
     level: Level,
     address: Address,
-    by_ref: bool,
+    /// [`FrameSlot::indirect`]参照。
+    indirect: bool,
 }
 
 /// `PROCEDURE`/`FUNCTION`1件のメタデータ。宣言（呼び出し元から見える形の
@@ -433,6 +452,14 @@ impl CodeGenerator {
     /// 型がサポート外の仮引数は診断のみ積んでスロットを割り当てない
     /// （[`Self::declare_vars`]と同じ方針。この宣言全体はどのみち
     /// `Err`を返すことになるため、以降のオフセットのズレは問題にならない）。
+    ///
+    /// `STRING[n]`の仮引数（Step 18から。値仮引数・`VAR`仮引数のいずれも）は
+    /// スロットにアドレスを格納する（`indirect = true`）ため、
+    /// 活性化レコード内では他の仮引数と同じ1ワードで済む
+    /// （`FrameSlot`/`Self::gen_string_value_arg`のドキュメント参照）。
+    /// `STRING[n]`のローカル変数（`PROCEDURE`/`FUNCTION`本体内の`VAR`宣言）は
+    /// 依然としてスコープ外（[`Self::build_locals`]参照）だが、仮引数は
+    /// データそのものではなくアドレスしか持たないため、この制約に抵触しない。
     fn build_params(&mut self, params: &[ParamDecl], param_base: u16) -> Vec<(String, FrameSlot)> {
         let mut result = Vec::new();
         for p in params {
@@ -441,29 +468,17 @@ impl CodeGenerator {
                     p.ty.span(),
                     format!(
                         "parameter type '{}' is out of scope for this step's minimal codegen \
-                         (only INTEGER/BOOLEAN are supported)",
+                         (only INTEGER/BOOLEAN/STRING[n] are supported)",
                         describe_type(&p.ty)
                     ),
                 );
                 continue;
             };
-            // Step 16: `STRING[n]`はPROGRAM直下のグローバル`VAR`のみサポート
-            // する（`crate::builtin::BUILTIN_WRITELN_STRVAR`のドキュメント、
-            // `crate`モジュールドキュメント参照）。仮引数は活性化レコード
-            // 内に1ワードのスロットしか持たない前提（`FrameSlot`のドキュメント
-            // 参照）のため、複数ワードを占める`STRING[n]`はここではまだ
-            // 扱えない。
-            if matches!(kind, ValueKind::StringN(_)) {
-                self.error(
-                    p.ty.span(),
-                    "STRING[n] parameters are out of scope for this step's minimal codegen \
-                     (only PROGRAM-level global STRING[n] variables are supported)",
-                );
-                continue;
-            }
+            let indirect = p.by_ref || matches!(kind, ValueKind::StringN(_));
             let slot = FrameSlot {
                 address: Address(param_base + result.len() as u16),
                 by_ref: p.by_ref,
+                indirect,
                 kind,
             };
             result.push((normalize(&p.name.name), slot));
@@ -507,6 +522,7 @@ impl CodeGenerator {
                 let slot = FrameSlot {
                     address: Address(5 + count),
                     by_ref: false,
+                    indirect: false,
                     kind,
                 };
                 locals.insert(normalize(&name.name), slot);
@@ -677,7 +693,7 @@ impl CodeGenerator {
                 return Some(ResolvedVar {
                     level: Level(0),
                     address: slot.address,
-                    by_ref: slot.by_ref,
+                    indirect: slot.indirect,
                 });
             }
         }
@@ -690,7 +706,7 @@ impl CodeGenerator {
             return Some(ResolvedVar {
                 level,
                 address: slot.address,
-                by_ref: false,
+                indirect: false,
             });
         }
         None
@@ -707,14 +723,14 @@ impl CodeGenerator {
             ResolvedVar {
                 level: Level(0),
                 address,
-                by_ref: false,
+                indirect: false,
             }
         } else {
             let address = self.alloc_slot();
             ResolvedVar {
                 level: Level(0),
                 address,
-                by_ref: false,
+                indirect: false,
             }
         }
     }
@@ -728,7 +744,7 @@ impl CodeGenerator {
             UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
             span,
         );
-        if resolved.by_ref {
+        if resolved.indirect {
             self.emit(UnconfirmedOp::Ind.into(), span);
         }
     }
@@ -744,7 +760,7 @@ impl CodeGenerator {
         span: Span,
         gen_value: impl FnOnce(&mut Self),
     ) {
-        if resolved.by_ref {
+        if resolved.indirect {
             self.emit(
                 UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
                 span,
@@ -767,7 +783,7 @@ impl CodeGenerator {
     /// `VAR`引数として渡す」場合の意味論）。それ以外は
     /// [`UnconfirmedOp::Lda`]で新たにアドレスを計算する。
     fn gen_address_of_resolved(&mut self, resolved: ResolvedVar, span: Span) {
-        if resolved.by_ref {
+        if resolved.indirect {
             self.emit(
                 UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
                 span,
@@ -983,11 +999,11 @@ impl CodeGenerator {
         value: &Expr,
         span: Span,
     ) {
-        if resolved.by_ref {
+        if resolved.indirect {
             self.error(
                 span,
-                "assigning to a STRING[n] VAR parameter is out of scope for this step's \
-                 minimal codegen",
+                "assigning to a STRING[n] parameter (VAR or value) is out of scope for this \
+                 step's minimal codegen",
             );
             return;
         }
@@ -1000,31 +1016,80 @@ impl CodeGenerator {
             return;
         };
 
+        self.emit_string_literal_words(
+            resolved.level,
+            resolved.address,
+            max_len,
+            text,
+            *lit_span,
+            span,
+        );
+    }
+
+    /// 文字列リテラルの内容を、宛先（`dest_level`/`dest`が指す先頭ワード）へ
+    /// 書き込む命令列を発行する（「長さ1ワード＋文字ごとに1ワード」という
+    /// 単純化されたレイアウト。[`crate::builtin::BUILTIN_WRITELN_STRVAR`]の
+    /// ドキュメント「メモリレイアウト」参照）。[`Self::gen_string_literal_assignment`]
+    /// （`s := 'literal';`）と[`Self::gen_string_value_arg`]（`STRING[n]`値
+    /// 引数として渡す文字列リテラルを一時領域へ書き込む、Step 18）の両方が
+    /// この共通実装を使う。宣言長を超える場合は診断のみ積んで`false`を返す。
+    fn emit_string_literal_words(
+        &mut self,
+        dest_level: Level,
+        dest: Address,
+        max_len: u8,
+        text: &str,
+        lit_span: Span,
+        span: Span,
+    ) -> bool {
         let chars: Vec<char> = text.chars().collect();
         if chars.len() > max_len as usize {
             self.error(
-                *lit_span,
+                lit_span,
                 format!(
                     "string literal of length {} does not fit in STRING[{max_len}]",
                     chars.len()
                 ),
             );
-            return;
+            return false;
         }
 
-        self.emit(UnconfirmedOp::Ldc(chars.len() as i16).into(), *lit_span);
-        self.emit(
-            UnconfirmedOp::Str(resolved.level, resolved.address).into(),
-            span,
-        );
+        self.emit(UnconfirmedOp::Ldc(chars.len() as i16).into(), lit_span);
+        self.emit(UnconfirmedOp::Str(dest_level, dest).into(), span);
         for (i, ch) in chars.iter().enumerate() {
             // UNCONFIRMED: ASCII範囲（0..=127）のみ想定。それを超える文字
             // コードのp-machine上での扱いは一次資料未確認（このクレートの
             // 他の箇所と同様、本ステップのスコープ外）。
-            self.emit(UnconfirmedOp::Ldc(*ch as i16).into(), *lit_span);
-            let char_address = Address(resolved.address.0 + 1 + i as u16);
+            self.emit(UnconfirmedOp::Ldc(*ch as i16).into(), lit_span);
+            let char_address = Address(dest.0 + 1 + i as u16);
+            self.emit(UnconfirmedOp::Str(dest_level, char_address).into(), span);
+        }
+        true
+    }
+
+    /// 直接記憶方式（`indirect`でない）の`STRING[n]`変数の中身を、宛先
+    /// （`dest_level`/`dest`が指す先頭ワード）へ1ワードずつコピーする
+    /// 命令列を発行する（[`Self::gen_string_value_arg`]が、`STRING[n]`変数を
+    /// そのまま別の`STRING[n]`値引数として渡す場合に使う。Step 18）。
+    fn emit_string_copy_words(
+        &mut self,
+        dest_level: Level,
+        dest: Address,
+        src: ResolvedVar,
+        max_len: u8,
+        span: Span,
+    ) {
+        debug_assert!(
+            !src.indirect,
+            "emit_string_copy_words requires a directly-stored STRING[n] source"
+        );
+        for i in 0..=(max_len as u16) {
             self.emit(
-                UnconfirmedOp::Str(resolved.level, char_address).into(),
+                UnconfirmedOp::Lod(src.level, Address(src.address.0 + i)).into(),
+                span,
+            );
+            self.emit(
+                UnconfirmedOp::Str(dest_level, Address(dest.0 + i)).into(),
                 span,
             );
         }
@@ -1270,9 +1335,14 @@ impl CodeGenerator {
     /// （[`crate::builtin::BUILTIN_WRITELN_STRVAR`]のドキュメント参照）。
     ///
     /// スコープ: 単純な変数参照のみ（[`Self::gen_var_arg`]と同じ制限）。
-    /// `VAR`仮引数（`by_ref`）は`STRING[n]`仮引数自体が今回のスコープ外
-    /// （[`Self::build_params`]参照）なので到達しないはずだが、念のため
-    /// 防御的にエラー報告する。
+    ///
+    /// `s`が`STRING[n]`仮引数（値仮引数・`VAR`仮引数のいずれも。Step 18から
+    /// サポート）である場合、そのスロットに格納されているのは既に文字列
+    /// データ自身の**アドレス**なので、[`Self::gen_address_of_resolved`]が
+    /// （`indirect`を見て）`LOD`だけを発行し、正しくそのアドレスを取り出す
+    /// （`s`が直接記憶方式のグローバル`STRING[n]`変数であれば、代わりに
+    /// `LDA`でアドレスを計算する）。いずれの場合も呼び出し側で`indirect`を
+    /// 区別する必要はない。
     fn gen_writeln_string_var(&mut self, arg: &Expr, span: Span) {
         let Expr::Identifier(ident) = arg else {
             self.error(
@@ -1284,18 +1354,11 @@ impl CodeGenerator {
         };
         let key = normalize(&ident.name);
         match self.resolve_var(&key) {
-            Some(resolved) if !resolved.by_ref => {
+            Some(resolved) => {
                 self.gen_address_of_resolved(resolved, span);
                 self.emit(
                     ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRVAR).into(),
                     span,
-                );
-            }
-            Some(_) => {
-                self.error(
-                    ident.span,
-                    "WriteLn(STRING[n]) for a VAR parameter is out of scope for this step's \
-                     minimal codegen",
                 );
             }
             None => {
@@ -1414,7 +1477,9 @@ impl CodeGenerator {
 
     /// 呼び出し引数を評価してスタックへ積む。`VAR`仮引数（`by_ref`）には
     /// アドレスを（[`Self::gen_address_of_resolved`]、単純な変数参照のみ
-    /// サポート）、それ以外には値を（[`Self::gen_expr`]）積む。
+    /// サポート）、`STRING[n]`の値仮引数には呼び出し元が新規確保した
+    /// 一時領域のアドレスを（[`Self::gen_string_value_arg`]、Step 18）、
+    /// それ以外の値仮引数には値を（[`Self::gen_expr`]）積む。
     fn gen_call_args(
         &mut self,
         params: &[FrameSlot],
@@ -1441,10 +1506,91 @@ impl CodeGenerator {
         for (arg, param) in args.iter().zip(params.iter()) {
             if param.by_ref {
                 self.gen_var_arg(arg, span);
+            } else if let ValueKind::StringN(max_len) = param.kind {
+                self.gen_string_value_arg(arg, max_len, span);
             } else {
                 self.gen_expr(arg);
             }
         }
+    }
+
+    /// `STRING[n]`値仮引数への実引数のコード生成（Step 18）。
+    ///
+    /// # タスク0: STRING[n]の値渡しはアドレスを積む（UNCONFIRMED、類推による判断）
+    ///
+    /// 一次資料（SofTech Microsystems, *UCSD p-System and UCSD Pascal
+    /// Version IV: Internal Architecture Guide*）への直接アクセスは本
+    /// セッションでも引き続きネットワークegressプロキシにブロックされており
+    /// （`docs/research/ucsd-pascal-primary-sources.md`「Step 18セッション」
+    /// 節参照）、`STRING[n]`の値渡しの正確な扱いは**UNCONFIRMED**のまま。
+    ///
+    /// ただし、Step 12で一次資料からCONFIRMED済みの規則
+    /// 「VARパラメータおよびレコード・配列値パラメータはアドレスを格納する」
+    /// （`crate`モジュールドキュメントの「活性化レコードのレイアウト」、
+    /// [`crate::opcode::ConfirmedOp::Rpu`]付近のドキュメント参照）に対し、
+    /// `STRING[n]`は（レコード・配列と同様）固定の1ワードに収まらない
+    /// 可変長データであるという類推から、本実装は「レコード・配列と同じ
+    /// 扱い」を採用する: 値仮引数であってもパラメータ領域には**アドレス**を
+    /// 格納する（推測ではなく、この一次資料由来の類推規則に基づく判断で
+    /// あることを明記する）。
+    ///
+    /// 値渡しとしての意味論（呼び出し元の実引数から独立したコピーである
+    /// こと）を保つため、渡す値は呼び出し元が新規に確保した一時領域
+    /// （グローバルデータ領域の末尾に`1 + max_len`ワード確保。
+    /// [`Self::alloc_words`]）へコピーし、その一時領域自身のアドレスを積む
+    /// （呼び出し先が仮に書き込んでも、呼び出し元の元の実引数には影響
+    /// しない）。
+    ///
+    /// # スコープ: 文字列リテラル、または直接記憶方式の`STRING[n]`変数のみ
+    ///
+    /// - 文字列リテラル: [`Self::emit_string_literal_words`]で一時領域へ
+    ///   書き込む。
+    /// - 単純な識別子で、かつ直接記憶方式（`PROGRAM`直下のグローバル
+    ///   `STRING[n]`変数。ローカル`STRING[n]`変数はStep 16から既に
+    ///   スコープ外）の`STRING[n]`変数: [`Self::emit_string_copy_words`]で
+    ///   一時領域へ1ワードずつコピーする。
+    /// - それ以外（既に`STRING[n]`仮引数として受け取った値をさらに別の
+    ///   呼び出しへ中継する等）は今回のスコープ外としてエラー報告する。
+    fn gen_string_value_arg(&mut self, arg: &Expr, max_len: u8, span: Span) {
+        let temp = self.alloc_words(1 + max_len as u16);
+        match arg {
+            Expr::StringLiteral(text, lit_span) => {
+                self.emit_string_literal_words(Level(0), temp, max_len, text, *lit_span, span);
+            }
+            Expr::Identifier(ident) => {
+                let key = normalize(&ident.name);
+                match (self.resolve_var(&key), self.lookup_kind(&key)) {
+                    (Some(resolved), Some(ValueKind::StringN(_))) if !resolved.indirect => {
+                        self.emit_string_copy_words(Level(0), temp, resolved, max_len, span);
+                    }
+                    (Some(_), Some(ValueKind::StringN(_))) => {
+                        self.error(
+                            ident.span,
+                            "passing an already-received STRING[n] parameter onward as another \
+                             STRING[n] value argument is out of scope for this step's minimal \
+                             codegen",
+                        );
+                    }
+                    _ => {
+                        self.error(
+                            ident.span,
+                            format!(
+                                "'{}' is not a known STRING[n] variable in this scope",
+                                ident.name
+                            ),
+                        );
+                    }
+                }
+            }
+            _ => {
+                self.error(
+                    arg.span(),
+                    "STRING[n] value arguments only support a string literal or a simple \
+                     STRING[n] variable reference in this step's minimal codegen",
+                );
+            }
+        }
+        self.emit(UnconfirmedOp::Lda(Level(0), temp).into(), span);
     }
 
     fn gen_var_arg(&mut self, arg: &Expr, span: Span) {

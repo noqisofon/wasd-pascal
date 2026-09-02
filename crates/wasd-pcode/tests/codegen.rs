@@ -1003,3 +1003,162 @@ fn string_n_local_variable_is_reported_as_an_error_without_panicking() {
         "diagnostics: {diagnostics:?}"
     );
 }
+
+// ---- Step 18: FUNCTION + 引数（値渡し、単一引数）----
+
+/// `PROCEDURE`が`STRING[n]`の値仮引数を1つ受け取り、文字列リテラルの
+/// 実引数を渡して呼び出す場合の完全な命令列。
+///
+/// タスク0のUNCONFIRMED判断（`CodeGenerator::gen_string_value_arg`の
+/// ドキュメント参照: レコード・配列の値パラメータと同様、パラメータ
+/// 領域にはアドレスを格納する）に従い、呼び出し元は:
+/// 1. 新規の一時領域（グローバルデータ領域、`Address(0)`から
+///    `1 + max_len`ワード）へ文字列リテラルの内容を書き込み、
+/// 2. その一時領域自身のアドレスを`LDA`で積んでから`CPG`を発行する。
+///
+/// 呼び出し先（`Greet`）は仮引数スロット（`Address(5)`、
+/// `indirect = true`）から`LOD`だけでそのアドレスを取り出し、
+/// `BUILTIN_WRITELN_STRVAR`へそのまま渡す（`VAR`仮引数と同じ
+/// アドレッシング。`FrameSlot`のドキュメント参照）。
+#[test]
+fn procedure_with_string_n_value_parameter_materializes_literal_argument() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Greet(name: STRING[2]);
+        BEGIN
+            WriteLn(name)
+        END;
+        BEGIN
+            Greet('Hi')
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Greet's body (entry = 0): WriteLn(name)
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // name (stores an address)
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRVAR)),
+            cop(ConfirmedOp::Rpu(1)), // data_size(0) + 1 param word
+            // Greet('Hi'): materialize the literal into a fresh temp, then call.
+            op(UnconfirmedOp::Ldc(2)), // length of "Hi"
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
+            op(UnconfirmedOp::Ldc('H' as i16)),
+            op(UnconfirmedOp::Str(Level(0), Address(1))),
+            op(UnconfirmedOp::Ldc('i' as i16)),
+            op(UnconfirmedOp::Str(Level(0), Address(2))),
+            op(UnconfirmedOp::Lda(Level(0), Address(0))), // address of the temp
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+    // The temp (3 words: 1 length + 2 chars) must be counted in the global
+    // data area's size even though it's never a user-declared VAR.
+    assert_eq!(module.global_data_words, 3);
+}
+
+/// `STRING[n]`の値仮引数に、リテラルではなく別の`STRING[n]`変数（直接
+/// 記憶方式のグローバル`VAR`）を渡す場合、`emit_string_copy_words`が
+/// ワード単位でコピーする命令列を発行すること。
+#[test]
+fn string_n_value_parameter_accepts_a_direct_variable_argument() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR greeting: STRING[3];
+        PROCEDURE Announce(msg: STRING[3]);
+        BEGIN
+        END;
+        BEGIN
+            Announce(greeting)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // `greeting` occupies Address(0..=3) (1 + 3 words); the fresh temp for
+    // the call comes right after it, at Address(4..=7).
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Announce's body (entry = 0): empty.
+            cop(ConfirmedOp::Rpu(1)),
+            // Announce(greeting): copy greeting's 4 words into a fresh temp.
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(4))),
+            op(UnconfirmedOp::Lod(Level(0), Address(1))),
+            op(UnconfirmedOp::Str(Level(0), Address(5))),
+            op(UnconfirmedOp::Lod(Level(0), Address(2))),
+            op(UnconfirmedOp::Str(Level(0), Address(6))),
+            op(UnconfirmedOp::Lod(Level(0), Address(3))),
+            op(UnconfirmedOp::Str(Level(0), Address(7))),
+            op(UnconfirmedOp::Lda(Level(0), Address(4))),
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+    assert_eq!(module.global_data_words, 8);
+}
+
+/// 既に`STRING[n]`仮引数として受け取った値を、さらに別の呼び出しへ
+/// `STRING[n]`値引数として中継することは今回のスコープ外として
+/// エラー報告されること（`CodeGenerator::gen_string_value_arg`参照）。
+#[test]
+fn relaying_a_received_string_n_parameter_as_another_value_argument_is_an_error() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Inner(s: STRING[5]);
+        BEGIN
+        END;
+        PROCEDURE Outer(s: STRING[5]);
+        BEGIN
+            Inner(s)
+        END;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("relaying a received STRING[n] parameter must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("out of scope")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `FUNCTION`/`PROCEDURE`の`STRING[n]`型の仮引数自体は、もはやスコープ外
+/// ではない（Step 16まではエラーだったが、Step 18でサポートした）ことの
+/// 回帰確認。
+#[test]
+fn string_n_parameter_is_no_longer_out_of_scope() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Greet(name: STRING[10]);
+        BEGIN
+        END;
+        BEGIN
+            Greet('Hi')
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    assert!(
+        result.is_ok(),
+        "STRING[n] parameters should be supported from Step 18 onward: {result:?}"
+    );
+}
