@@ -235,6 +235,36 @@ fn run_executes_string_test_and_prints_hello_world() {
         .stdout(predicate::str::contains("OK: program ran to completion"));
 }
 
+/// Step 17: 引数なし`PROCEDURE`呼び出しの最小スコープ動作確認。
+/// `Greet;`という文で呼び出された`PROCEDURE Greet`が実際に
+/// `WriteLn('Hello from a procedure!')`を実行し、制御が呼び出し元へ
+/// 正しく戻って`WriteLn('Back in main.')`も実行されること。
+#[test]
+fn run_executes_argument_less_procedure_call() {
+    wasdc()
+        .arg("run")
+        .arg(example("procedure_call_minimal.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Hello from a procedure!\nBack in main.\n",
+        ))
+        .stdout(predicate::str::contains("OK: program ran to completion"));
+}
+
+/// Step 17: 同じ引数なし`PROCEDURE`を複数回呼び出しても、呼び出しごとに
+/// MSCW/スタックが正しく積み直され、都度同じ本体が実行されること。
+#[test]
+fn run_executes_the_same_argument_less_procedure_repeatedly() {
+    wasdc()
+        .arg("run")
+        .arg(example("procedure_call_repeated.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hi!\nHi!\nHi!\n"))
+        .stdout(predicate::str::contains("OK: program ran to completion"));
+}
+
 #[test]
 fn missing_file_exits_with_io_error_code() {
     wasdc()
