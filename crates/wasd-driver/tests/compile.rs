@@ -52,6 +52,52 @@ fn compile_to_pcode_generates_a_module_for_a_minimal_scope_program() {
     assert!(!pcode.instructions.is_empty());
 }
 
+/// Step 12: `PROCEDURE`/`FUNCTION`呼び出しを含むプログラムでも
+/// `compile_to_pcode`がp-codeを生成できること（`WriteLn`のような組み込み
+/// 手続きを使わない限り）。
+#[test]
+fn compile_to_pcode_generates_a_module_for_a_program_with_procedures_and_functions() {
+    let source = r#"
+        PROGRAM Procedures;
+        VAR
+            result: INTEGER;
+
+        FUNCTION Factorial(n: INTEGER): INTEGER;
+        BEGIN
+            IF n <= 1 THEN
+                Factorial := 1
+            ELSE
+                Factorial := n * Factorial(n - 1)
+        END;
+
+        PROCEDURE Increment(VAR value: INTEGER);
+        BEGIN
+            value := value + 1
+        END;
+
+        BEGIN
+            result := Factorial(5);
+            Increment(result)
+        END.
+    "#;
+
+    let result = compile_to_pcode(source, &CompileOptions::default());
+
+    assert!(
+        result.diagnostics.is_empty(),
+        "expected no diagnostics, got {:?}",
+        result.diagnostics
+    );
+    let pcode = result.pcode.expect("pcode should have been generated");
+    let text = pcode.to_string();
+    assert!(text.contains("CPG"), "expected a CPG call, got:\n{text}");
+    assert!(text.contains("RPU"), "expected an RPU return, got:\n{text}");
+    assert!(
+        text.contains("LDA"),
+        "expected an LDA (VAR arg address), got:\n{text}"
+    );
+}
+
 #[test]
 fn compile_to_pcode_reports_out_of_scope_constructs_without_generating_pcode() {
     let source = r#"

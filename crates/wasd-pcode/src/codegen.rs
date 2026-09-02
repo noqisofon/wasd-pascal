@@ -4,15 +4,71 @@
 //!
 //! `INTEGER`/`BOOLEAN`型の変数・定数、算術演算（`+ - * DIV MOD`）、比較演算、
 //! 論理演算（`AND OR NOT`）、代入文、`IF`/`WHILE`/`REPEAT UNTIL`/`FOR`に
-//! よる制御構造、`BEGIN...END`の複合文、および最小限の
-//! `PROGRAM ... BEGIN ... END.`全体構造のみを扱う。
+//! よる制御構造、`BEGIN...END`の複合文、`PROGRAM ... BEGIN ... END.`
+//! 全体構造、および`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の
+//! 呼び出しを扱う。
 //!
-//! `PROCEDURE`/`FUNCTION`、`CASE`、`UNIT`、配列・レコード・ポインタ型、
-//! `REAL`/`CHAR`型、組み込み手続きは意味解析を通過済みのASTに含まれ得るが、
-//! 本クレートの責務では**ない**。遭遇した場合はパニックせず、
-//! 「未対応機能」の[`wasd_ast::Diagnostic`]を積んでコード生成のみ諦める
-//! （呼び出し元はレキサ・パーサー・意味解析と同様、`Result::Err`として
-//! 診断の集合を受け取る）。
+//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、組み込み
+//! 手続きは意味解析を通過済みのASTに含まれ得るが、本クレートの責務では
+//! **ない**。遭遇した場合はパニックせず、「未対応機能」の
+//! [`wasd_ast::Diagnostic`]を積んでコード生成のみ諦める（呼び出し元は
+//! レキサ・パーサー・意味解析と同様、`Result::Err`として診断の集合を
+//! 受け取る）。
+//!
+//! # PROCEDURE/FUNCTIONのネストについて
+//!
+//! `wasd_ast::ProcDecl`/`wasd_ast::FuncDecl`はそれ自身の中に
+//! `proc_decls`/`func_decls`を持たない（`PROGRAM`直下にのみ宣言できる）
+//! ため、本クレートが扱うレキシカルネストは常にたかだか2段階
+//! （`PROGRAM`本体 = lexレベル0、その直下の`PROCEDURE`/`FUNCTION`本体 =
+//! lexレベル1）に限られる。呼び出し命令の選択（`CPL`/`CPG`/`CPI`。
+//! [`crate::opcode::ConfirmedOp`]のドキュメント参照）や変数アドレッシング
+//! （[`ResolvedVar`]）は、将来`PROCEDURE`内`PROCEDURE`のようなさらに
+//! 深いネストがASTに追加されることを見越した一般的な形で書いてあるが、
+//! 現状のASTの制約上、実際に使われるのは常にlexレベル1向けの経路
+//! （呼び出しは`CPG`、レベル差は0または1）のみである。
+//!
+//! # 活性化レコードのレイアウト
+//!
+//! `PROCEDURE`/`FUNCTION`ごとの活性化レコードは、Internal Architecture
+//! Guide（Section II.4.2.1.3、p.48-49）に記載の通り、低アドレスから
+//! 高アドレスに向けて次の順で構成される（[`crate::opcode::ConfirmedOp`]
+//! のドキュメント参照）:
+//!
+//! 1. マーク・スタック（5ワード、固定。本クレートはこの5ワード自体を
+//!    直接アドレッシングすることはなく、単に先頭オフセット`5`として
+//!    予約するのみ）
+//! 2. ローカル変数・一時変数領域（`DATASIZE`ワード）: オフセット
+//!    `5..5+DATASIZE`
+//! 3. パラメータ領域: オフセット`5+DATASIZE..5+DATASIZE+P`
+//!    （`P`は仮引数のワード数。`VAR`仮引数はアドレスを1ワードで格納し、
+//!    それ以外の値仮引数（本クレートのスコープでは`INTEGER`/`BOOLEAN`の
+//!    み）は値そのものを1ワードで格納する）
+//! 4. 関数の戻り値領域（`FUNCTION`のみ、1ワード）: オフセット
+//!    `5+DATASIZE+P`
+//!
+//! `DATASIZE`は宣言済みローカル変数の個数に加え、`FOR`文が導入する
+//! 隠しループ終了値の一時変数の個数も含む。後者は本体を実際に生成する
+//! 前に[`count_for_temps`]で数え上げ、パラメータのオフセットを本体生成前
+//! （したがって隠し一時変数がいくつ必要になるか判明する前）に確定できる
+//! ようにしている。
+//!
+//! # 呼び出し規約とRPUのBパラメータ
+//!
+//! 呼び出し側は、呼び出し前に仮引数の並び順で引数を評価してスタックへ
+//! 積む（`VAR`仮引数はアドレス、それ以外は値。[`CodeGenerator::gen_call_args`]
+//! 参照）。呼び出し先本体の末尾では`RPU <b>`（[`crate::opcode::ConfirmedOp::Rpu`]
+//! 参照）を発行し、活性化レコードを片付ける。
+//!
+//! `b`の正確な計算式は一次資料から完全には読み取れなかった
+//! （[`crate::opcode::ConfirmedOp::Rpu`]のドキュメント参照）。本実装は
+//! タスク依頼で示された方針A「`b` = `DATASIZE` + パラメータ領域の
+//! ワード数」を採用する（[`CodeGenerator::emit_rpu`]参照）。これにより、
+//! 呼び出し時に積んだパラメータ領域と本体が使ったローカル変数領域が
+//! ちょうど切り詰められ、関数の戻り値領域（存在する場合）だけが
+//! 呼び出し元に残る、という设計を意図している。ただし`pmachine-core`
+//! （未実装）による実行検証はまだできないため、UNCONFIRMEDのまま
+//! 仮実装であることを明記する。
 //!
 //! # 制御構造とラベル解決
 //!
@@ -25,6 +81,13 @@
 //! 書き換える。後方分岐（`WHILE`/`REPEAT`のループ先頭への戻り）は
 //! ジャンプ先が生成時点で既に確定しているため、仮アドレスもバック
 //! パッチも不要で直接ジャンプ先を書ける。
+//!
+//! 手続き/関数呼び出し（`CPG`等）の呼び出し先アドレスも同じ仕組みで
+//! バックパッチする。相互再帰（`PROCEDURE A`が本体でまだ生成していない
+//! `PROCEDURE B`を呼ぶ等）に対応するため、呼び出し先がまだ生成されて
+//! いない場合は[`CodeGenerator::pending_calls`]に記録しておき、その
+//! 呼び出し先の本体を実際に生成し始める瞬間（[`CodeGenerator::begin_routine_body`]）
+//! に一括でバックパッチする。
 //!
 //! 制御構造の生成は再帰呼び出しで行い、各呼び出しが自分の仮アドレス・
 //! パッチだけを扱う（グローバルなラベル表を持たない）ため、ネストした
@@ -39,15 +102,15 @@
 use std::collections::HashMap;
 
 use wasd_ast::{
-    BinOp, Block, ConstDecl, Diagnostic, Expr, ForDirection, Identifier, Literal, Program,
-    Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
+    BinOp, Block, ConstDecl, Diagnostic, Expr, ForDirection, FuncDecl, Identifier, Literal,
+    ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
 };
 
 use crate::ir::{Instruction, PCodeModule};
-use crate::opcode::{Address, CodeAddress, Opcode, UnconfirmedOp};
+use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};
 
-/// 未確定のジャンプ先を持つ命令のインデックス。[`CodeGenerator::patch_jump`]
-/// に渡してバックパッチする。
+/// 未確定のジャンプ先・呼び出し先を持つ命令のインデックス。
+/// [`CodeGenerator::patch_jump`]に渡してバックパッチする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingJump(usize);
 
@@ -64,6 +127,71 @@ enum ConstValue {
     Bool(bool),
 }
 
+/// 活性化レコード内の1スロット（ローカル変数または仮引数）の情報。
+/// `by_ref`が真の場合、そのスロットに格納されているのは値ではなく
+/// 呼び出し元の変数のアドレスである（`VAR`仮引数）。
+#[derive(Debug, Clone, Copy)]
+struct FrameSlot {
+    address: Address,
+    by_ref: bool,
+}
+
+/// 識別子1つの参照先が解決した結果。ロード/ストア/アドレス取得の
+/// いずれの操作にも必要な情報（レベル差・アドレス・`VAR`仮引数かどうか）
+/// をまとめて持つ。
+#[derive(Debug, Clone, Copy)]
+struct ResolvedVar {
+    level: Level,
+    address: Address,
+    by_ref: bool,
+}
+
+/// `PROCEDURE`/`FUNCTION`1件のメタデータ。宣言（呼び出し元から見える形の
+/// シグネチャ）と本体生成（呼び出し先自身が使う情報）の両方に使う。
+#[derive(Debug, Clone)]
+struct RoutineInfo {
+    /// 本体の先頭命令のアドレス。まだ本体を生成していない場合は
+    /// `entry_known`が偽で、値は意味を持たない。
+    entry: CodeAddress,
+    entry_known: bool,
+    /// 仮引数（呼び出し元の視点でのシグネチャ: 個数と`by_ref`のみ。
+    /// 本クレートは型検査を行わないため型情報は持たない）。
+    params: Vec<FrameSlot>,
+    is_func: bool,
+    /// `FUNCTION`の場合のみ、戻り値スロットのアドレス。
+    return_address: Option<Address>,
+    /// `RPU`に渡す`b`の計算に使う、ローカル変数・一時変数領域の
+    /// ワード数（[`crate::codegen`]モジュールドキュメントの`emit_rpu`
+    /// 参照）。
+    data_size: u16,
+    /// `data_size`のうち、宣言済みローカル変数（`VAR`セクション）が
+    /// 占めるワード数。残り（`data_size - declared_local_words`）が
+    /// `FOR`文の隠しループ終了値等の一時変数の分。本体生成開始時に
+    /// [`LocalScope::next_temp_address`]の初期値（`5 + declared_local_words`）
+    /// を求めるために持つ。
+    declared_local_words: u16,
+    /// このルーチン自身の本体を生成する際に[`LocalScope::locals`]として
+    /// インストールするマップ（仮引数名・ローカル変数名 → スロット）。
+    locals: HashMap<String, FrameSlot>,
+}
+
+/// `PROCEDURE`/`FUNCTION`本体を生成している間だけ有効なスコープ状態。
+#[derive(Debug, Clone)]
+struct LocalScope {
+    /// `FUNCTION`本体かどうか（`PROCEDURE`なら偽）。
+    is_function: bool,
+    /// 現在生成中のルーチン自身の名前（小文字正規化済み）。
+    /// `FunctionName := value`形式の戻り値代入を検出するために使う。
+    function_name: String,
+    /// `FUNCTION`の場合のみ、戻り値スロットのアドレス。
+    return_address: Option<Address>,
+    /// 仮引数・宣言済みローカル変数のマップ（名前 → スロット）。
+    locals: HashMap<String, FrameSlot>,
+    /// 次に確保する一時変数（`FOR`文の隠しループ終了値等）のアドレス。
+    /// 宣言済みローカル変数の直後から始まる。
+    next_temp_address: u16,
+}
+
 /// ASTからp-codeを生成するコード生成器。1回の[`CodeGenerator::generate`]
 /// 呼び出しごとに内部状態をリセットするため、インスタンスは使い回せる。
 #[derive(Debug, Default)]
@@ -73,6 +201,12 @@ pub struct CodeGenerator {
     vars: HashMap<String, VarSlot>,
     consts: HashMap<String, ConstValue>,
     next_address: u16,
+    routines: HashMap<String, RoutineInfo>,
+    /// まだ本体が生成されていないルーチンへの呼び出し。ルーチン名
+    /// （小文字正規化済み）ごとに、バックパッチが必要な命令の一覧を持つ。
+    pending_calls: HashMap<String, Vec<PendingJump>>,
+    /// `PROCEDURE`/`FUNCTION`本体を生成中の場合のみ`Some`。
+    current_scope: Option<LocalScope>,
 }
 
 fn normalize(name: &str) -> String {
@@ -84,14 +218,17 @@ impl CodeGenerator {
         Self::default()
     }
 
-    /// ASTからp-codeを生成する。今回のスコープ外の構文（`PROCEDURE`等）に
-    /// 遭遇した場合、パニックせずエラーとして報告する。
+    /// ASTからp-codeを生成する。今回のスコープ外の構文に遭遇した場合、
+    /// パニックせずエラーとして報告する。
     pub fn generate(&mut self, program: &Program) -> Result<PCodeModule, Vec<Diagnostic>> {
         self.instructions.clear();
         self.diagnostics.clear();
         self.vars.clear();
         self.consts.clear();
         self.next_address = 0;
+        self.routines.clear();
+        self.pending_calls.clear();
+        self.current_scope = None;
 
         if !program.uses.is_empty() {
             self.error(
@@ -107,16 +244,19 @@ impl CodeGenerator {
                  built-in INTEGER/BOOLEAN variables are supported)",
             );
         }
-        if !program.proc_decls.is_empty() || !program.func_decls.is_empty() {
-            self.error(
-                program.span,
-                "PROCEDURE/FUNCTION code generation is out of scope for this step's minimal \
-                 codegen",
-            );
-        }
 
         self.declare_consts(&program.const_decls);
         self.declare_vars(&program.var_decls);
+
+        self.register_procs(&program.proc_decls);
+        self.register_funcs(&program.func_decls);
+
+        for proc in &program.proc_decls {
+            self.gen_routine_body(&proc.name, &proc.body);
+        }
+        for func in &program.func_decls {
+            self.gen_routine_body(&func.name, &func.body);
+        }
 
         self.gen_block(&program.body);
         self.emit(UnconfirmedOp::Stp.into(), program.span);
@@ -184,6 +324,317 @@ impl CodeGenerator {
         address
     }
 
+    // ---- PROCEDURE/FUNCTION宣言の登録 ----
+
+    /// 仮引数の型を検査し、活性化レコード内のオフセットを割り当てる。
+    /// `param_base`は仮引数領域の先頭オフセット（`5 + data_size`）。
+    /// 型がサポート外の仮引数は診断のみ積んでスロットを割り当てない
+    /// （[`Self::declare_vars`]と同じ方針。この宣言全体はどのみち
+    /// `Err`を返すことになるため、以降のオフセットのズレは問題にならない）。
+    fn build_params(&mut self, params: &[ParamDecl], param_base: u16) -> Vec<(String, FrameSlot)> {
+        let mut result = Vec::new();
+        for p in params {
+            let supported = matches!(p.ty, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
+            if !supported {
+                self.error(
+                    p.ty.span(),
+                    format!(
+                        "parameter type '{}' is out of scope for this step's minimal codegen \
+                         (only INTEGER/BOOLEAN are supported)",
+                        describe_type(&p.ty)
+                    ),
+                );
+                continue;
+            }
+            let slot = FrameSlot {
+                address: Address(param_base + result.len() as u16),
+                by_ref: p.by_ref,
+            };
+            result.push((normalize(&p.name.name), slot));
+        }
+        result
+    }
+
+    /// 宣言済みローカル変数を検査し、活性化レコード内のオフセット
+    /// （`5`起点）を割り当てる。返り値は割り当てた変数の個数
+    /// （宣言済みローカル変数のワード数。隠し一時変数は含まない）。
+    fn build_locals(
+        &mut self,
+        var_decls: &[VarDecl],
+        locals: &mut HashMap<String, FrameSlot>,
+    ) -> u16 {
+        let mut count: u16 = 0;
+        for decl in var_decls {
+            let supported = matches!(decl.ty, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
+            if !supported {
+                self.error(
+                    decl.ty.span(),
+                    format!(
+                        "local VAR type '{}' is out of scope for this step's minimal codegen \
+                         (only INTEGER/BOOLEAN are supported)",
+                        describe_type(&decl.ty)
+                    ),
+                );
+                continue;
+            }
+            for name in &decl.names {
+                let slot = FrameSlot {
+                    address: Address(5 + count),
+                    by_ref: false,
+                };
+                locals.insert(normalize(&name.name), slot);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// 名前を登録する。同名のグローバル`PROCEDURE`/`FUNCTION`が既に
+    /// 登録されている場合は診断のみ積み、最初の宣言を残す（`wasd-sema`の
+    /// 「既に宣言されている」診断と同じ方針）。
+    fn register_routine(
+        &mut self,
+        name: &Identifier,
+        params: &[ParamDecl],
+        var_decls: &[VarDecl],
+        body: &Block,
+        is_func: bool,
+    ) {
+        let key = normalize(&name.name);
+        if self.routines.contains_key(&key) {
+            self.error(name.span, format!("'{}' is already declared", name.name));
+            return;
+        }
+
+        let mut locals = HashMap::new();
+        let declared_local_words = self.build_locals(var_decls, &mut locals);
+        let temp_words = count_for_temps(body);
+        let data_size = declared_local_words + temp_words;
+
+        let param_base = 5 + data_size;
+        let param_pairs = self.build_params(params, param_base);
+        let params: Vec<FrameSlot> = param_pairs.iter().map(|(_, slot)| *slot).collect();
+        for (name, slot) in param_pairs {
+            locals.insert(name, slot);
+        }
+
+        let return_address = if is_func {
+            Some(Address(param_base + params.len() as u16))
+        } else {
+            None
+        };
+
+        self.routines.insert(
+            key,
+            RoutineInfo {
+                entry: CodeAddress(0),
+                entry_known: false,
+                params,
+                is_func,
+                return_address,
+                data_size,
+                declared_local_words,
+                locals,
+            },
+        );
+    }
+
+    fn register_procs(&mut self, procs: &[ProcDecl]) {
+        for p in procs {
+            self.register_routine(&p.name, &p.params, &p.var_decls, &p.body, false);
+        }
+    }
+
+    fn register_funcs(&mut self, funcs: &[FuncDecl]) {
+        for f in funcs {
+            let return_type_supported =
+                matches!(f.return_type, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
+            if !return_type_supported {
+                self.error(
+                    f.return_type.span(),
+                    format!(
+                        "FUNCTION return type '{}' is out of scope for this step's minimal \
+                         codegen (only INTEGER/BOOLEAN are supported)",
+                        describe_type(&f.return_type)
+                    ),
+                );
+            }
+            self.register_routine(&f.name, &f.params, &f.var_decls, &f.body, true);
+        }
+    }
+
+    /// `PROCEDURE`/`FUNCTION`本体を生成する。ルーチン名が
+    /// [`Self::register_routine`]で登録できていない場合（名前衝突等）は
+    /// 何もしない。
+    fn gen_routine_body(&mut self, name: &Identifier, body: &Block) {
+        let key = normalize(&name.name);
+        let Some(info) = self.routines.get(&key).cloned() else {
+            return;
+        };
+
+        self.begin_routine_body(&key);
+
+        let previous_scope = self.current_scope.replace(LocalScope {
+            is_function: info.is_func,
+            function_name: key.clone(),
+            return_address: info.return_address,
+            locals: info.locals.clone(),
+            next_temp_address: 5 + info.declared_local_words,
+        });
+
+        self.gen_block(body);
+        self.emit_rpu(&info, body.span);
+
+        self.current_scope = previous_scope;
+    }
+
+    /// 呼び出し先の本体を生成し始める瞬間に呼ぶ。エントリアドレスを
+    /// 確定させ、それまでに積み残していた呼び出し（[`Self::pending_calls`]）
+    /// を一括でバックパッチする。
+    fn begin_routine_body(&mut self, key: &str) {
+        let entry = self.here();
+        if let Some(info) = self.routines.get_mut(key) {
+            info.entry = entry;
+            info.entry_known = true;
+        }
+        if let Some(pending) = self.pending_calls.remove(key) {
+            for jump in pending {
+                self.patch_jump(jump, entry);
+            }
+        }
+    }
+
+    /// [`crate::opcode::ConfirmedOp::Rpu`]を発行する。
+    ///
+    /// # UNCONFIRMED: `b`の計算式（方針A）
+    ///
+    /// タスク依頼で示された2方針のうち方針A、「`b` = ローカル変数・
+    /// 一時変数領域のワード数(`DATASIZE`) + パラメータ領域のワード数」を
+    /// 採用する。`pmachine-core`（未実装）による実行検証ができないため、
+    /// この計算式が実機の`RPU`の実際の挙動と一致するかは未確認のまま
+    /// 仮実装している（[`crate::opcode::ConfirmedOp::Rpu`]のドキュメント
+    /// 参照）。
+    fn emit_rpu(&mut self, info: &RoutineInfo, span: Span) {
+        let b = info.data_size + info.params.len() as u16;
+        self.emit(ConfirmedOp::Rpu(b).into(), span);
+    }
+
+    // ---- 変数解決 ----
+
+    /// 識別子名（正規化済み）を、現在のスコープに応じてレベル差・
+    /// アドレス・`VAR`仮引数かどうかへ解決する。ローカルスコープ
+    /// （仮引数・ローカル変数）を最初に調べ、シャドーイングを反映する
+    /// （見つからなければグローバル変数を調べる）。定数は対象外
+    /// （[`Self::consts`]は別途扱う）。
+    fn resolve_var(&self, key: &str) -> Option<ResolvedVar> {
+        if let Some(scope) = &self.current_scope {
+            if let Some(slot) = scope.locals.get(key) {
+                return Some(ResolvedVar {
+                    level: Level(0),
+                    address: slot.address,
+                    by_ref: slot.by_ref,
+                });
+            }
+        }
+        if let Some(slot) = self.vars.get(key) {
+            let level = if self.current_scope.is_some() {
+                Level(1)
+            } else {
+                Level(0)
+            };
+            return Some(ResolvedVar {
+                level,
+                address: slot.address,
+                by_ref: false,
+            });
+        }
+        None
+    }
+
+    /// 一時変数（`FOR`文の隠しループ終了値等）を1ワード確保する。
+    /// 現在プロシージャ/関数本体を生成中であれば、そのローカル変数
+    /// 領域から（[`LocalScope::next_temp_address`]）、そうでなければ
+    /// グローバルデータ領域から確保する。
+    fn alloc_temp(&mut self) -> ResolvedVar {
+        if let Some(scope) = &mut self.current_scope {
+            let address = Address(scope.next_temp_address);
+            scope.next_temp_address += 1;
+            ResolvedVar {
+                level: Level(0),
+                address,
+                by_ref: false,
+            }
+        } else {
+            let address = self.alloc_slot();
+            ResolvedVar {
+                level: Level(0),
+                address,
+                by_ref: false,
+            }
+        }
+    }
+
+    /// 解決済みの変数を読み込み、スタックへ値を積む。`VAR`仮引数
+    /// （`by_ref`）の場合は、スロットに格納されているアドレスをまず
+    /// [`UnconfirmedOp::Lod`]で読み、続けて[`UnconfirmedOp::Ind`]で
+    /// 参照先の値をデリファレンスする。
+    fn gen_load_resolved(&mut self, resolved: ResolvedVar, span: Span) {
+        self.emit(
+            UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
+            span,
+        );
+        if resolved.by_ref {
+            self.emit(UnconfirmedOp::Ind.into(), span);
+        }
+    }
+
+    /// 解決済みの変数へ値を格納する。`gen_value`が値を生成するコードを
+    /// 発行するコールバックで、`by_ref`の場合は先にスロットからアドレスを
+    /// 読み出してから値を積み、[`UnconfirmedOp::Sti`]で間接ストアする
+    /// （アドレスが先、値が後というスタック順を仮定している。
+    /// [`UnconfirmedOp::Sti`]のドキュメント参照）。
+    fn gen_store_resolved(
+        &mut self,
+        resolved: ResolvedVar,
+        span: Span,
+        gen_value: impl FnOnce(&mut Self),
+    ) {
+        if resolved.by_ref {
+            self.emit(
+                UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
+                span,
+            );
+            gen_value(self);
+            self.emit(UnconfirmedOp::Sti.into(), span);
+        } else {
+            gen_value(self);
+            self.emit(
+                UnconfirmedOp::Str(resolved.level, resolved.address).into(),
+                span,
+            );
+        }
+    }
+
+    /// `VAR`引数として渡すため、解決済みの変数の**アドレス**をスタックへ
+    /// 積む。対象自身が`VAR`仮引数（既に参照）である場合は、そのスロットに
+    /// 格納されているアドレスをそのまま読み出して転送する（二重の
+    /// アドレス取得を避ける。伝統的なPascalの「`VAR`引数をさらに別の
+    /// `VAR`引数として渡す」場合の意味論）。それ以外は
+    /// [`UnconfirmedOp::Lda`]で新たにアドレスを計算する。
+    fn gen_address_of_resolved(&mut self, resolved: ResolvedVar, span: Span) {
+        if resolved.by_ref {
+            self.emit(
+                UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
+                span,
+            );
+        } else {
+            self.emit(
+                UnconfirmedOp::Lda(resolved.level, resolved.address).into(),
+                span,
+            );
+        }
+    }
+
     fn emit(&mut self, opcode: Opcode, span: Span) -> usize {
         self.instructions.push(Instruction { opcode, span });
         self.instructions.len() - 1
@@ -204,13 +655,42 @@ impl CodeGenerator {
         PendingJump(idx)
     }
 
-    /// [`Self::emit_pending_jump`]で発行した分岐命令のジャンプ先を
+    /// [`Self::emit_pending_jump`]で発行した分岐命令、または
+    /// [`Self::emit_call`]で発行した呼び出し命令のジャンプ先/呼び出し先を
     /// 確定させる（バックパッチ）。
     fn patch_jump(&mut self, jump: PendingJump, target: CodeAddress) {
         let opcode = &mut self.instructions[jump.0].opcode;
         *opcode
             .jump_target_mut()
-            .expect("PendingJump must always point at a UJP/FJP instruction") = target;
+            .expect("PendingJump must always point at a backpatchable instruction") = target;
+    }
+
+    /// 呼び出し命令を発行する。呼び出し先の本体が既に生成済み
+    /// （[`RoutineInfo::entry_known`]）であれば確定したアドレスへ、
+    /// まだであれば仮アドレスで発行して[`Self::pending_calls`]に記録し、
+    /// 後で[`Self::begin_routine_body`]がバックパッチする。
+    ///
+    /// 発行する命令は常に[`ConfirmedOp::Cpg`]である
+    /// （[`crate::opcode::ConfirmedOp::Cpl`]のドキュメント参照:
+    /// 本ステップのASTでは`PROCEDURE`/`FUNCTION`は常にlexレベル1にしか
+    /// 宣言できないため）。
+    fn emit_call(&mut self, callee_key: &str, span: Span) {
+        let (entry_known, entry) = {
+            let info = self
+                .routines
+                .get(callee_key)
+                .expect("callee must already be registered by the time a call is emitted");
+            (info.entry_known, info.entry)
+        };
+        if entry_known {
+            self.emit(ConfirmedOp::Cpg(entry).into(), span);
+        } else {
+            let idx = self.emit(ConfirmedOp::Cpg(CodeAddress(0)).into(), span);
+            self.pending_calls
+                .entry(callee_key.to_string())
+                .or_default()
+                .push(PendingJump(idx));
+        }
     }
 
     fn gen_block(&mut self, block: &Block) {
@@ -258,16 +738,7 @@ impl CodeGenerator {
                     "CASE statements are out of scope for this step's minimal codegen",
                 );
             }
-            Statement::ProcCall { name, span, .. } => {
-                self.error(
-                    *span,
-                    format!(
-                        "procedure calls ('{}') are out of scope for this step's minimal \
-                         codegen",
-                        name.name
-                    ),
-                );
-            }
+            Statement::ProcCall { name, args, span } => self.gen_proc_call(name, args, *span),
             // `Statement`は`#[non_exhaustive]`（`wasd-ast`のドキュメント
             // 参照）なので、他クレートである本クレートからのmatchには
             // ワイルドカード腕が必須。将来追加される未知の文バリアントは
@@ -290,15 +761,53 @@ impl CodeGenerator {
             );
             return;
         };
-        let Some(slot) = self.vars.get(&normalize(&ident.name)).copied() else {
-            self.error(
-                ident.span,
-                format!("'{}' is not a known variable in this scope", ident.name),
-            );
-            return;
-        };
-        self.gen_expr(value);
-        self.emit(UnconfirmedOp::Str(slot.address).into(), span);
+        let key = normalize(&ident.name);
+
+        // 伝統的なPascalの意味論: `FUNCTION`本体内での自分自身の名前への
+        // 代入は、戻り値の設定を意味する（`wasd-sema`の
+        // `check_assignment_to_identifier`と同じ解釈。専用の
+        // `ReturnStatement`ノードは設けず、パーサーは通常の代入文として
+        // パースし、意味解析・コード生成の双方でこの特別扱いを行う）。
+        if let Some(scope) = &self.current_scope {
+            if scope.is_function && scope.function_name == key {
+                let return_address = scope
+                    .return_address
+                    .expect("function scope always has a return_address");
+                self.gen_expr(value);
+                self.emit(UnconfirmedOp::Str(Level(0), return_address).into(), span);
+                return;
+            }
+        }
+
+        match self.resolve_var(&key) {
+            Some(resolved) => {
+                self.gen_store_resolved(resolved, span, |g| g.gen_expr(value));
+            }
+            None => {
+                if let Some(info) = self.routines.get(&key) {
+                    if info.is_func {
+                        self.error(
+                            ident.span,
+                            format!(
+                                "Cannot assign to function '{}' outside of its own body",
+                                ident.name
+                            ),
+                        );
+                    } else {
+                        self.error(
+                            ident.span,
+                            format!("Cannot assign to procedure '{}'", ident.name),
+                        );
+                    }
+                } else {
+                    self.error(
+                        ident.span,
+                        format!("'{}' is not a known variable in this scope", ident.name),
+                    );
+                }
+                self.gen_expr(value);
+            }
+        }
     }
 
     fn gen_if(
@@ -354,7 +863,8 @@ impl CodeGenerator {
         body: &Statement,
         span: Span,
     ) {
-        let Some(slot) = self.vars.get(&normalize(&var.name)).copied() else {
+        let key = normalize(&var.name);
+        let Some(resolved) = self.resolve_var(&key) else {
             self.error(
                 var.span,
                 format!("'{}' is not a known variable in this scope", var.name),
@@ -362,19 +872,17 @@ impl CodeGenerator {
             return;
         };
 
-        self.gen_expr(start);
-        self.emit(UnconfirmedOp::Str(slot.address).into(), span);
+        self.gen_store_resolved(resolved, span, |g| g.gen_expr(start));
 
         // 終了値はISO Pascalの規定通りループ開始前に一度だけ評価し、
         // 隠し一時変数に保持する（ループ本体に副作用があっても、毎回
         // 再評価されて終了条件がずれることを防ぐ）。
-        let limit = self.alloc_slot();
-        self.gen_expr(end);
-        self.emit(UnconfirmedOp::Str(limit).into(), span);
+        let limit = self.alloc_temp();
+        self.gen_store_resolved(limit, span, |g| g.gen_expr(end));
 
         let loop_start = self.here();
-        self.emit(UnconfirmedOp::Lod(slot.address).into(), span);
-        self.emit(UnconfirmedOp::Lod(limit).into(), span);
+        self.gen_load_resolved(resolved, span);
+        self.gen_load_resolved(limit, span);
         let continue_test = match direction {
             ForDirection::To => UnconfirmedOp::Leq,
             ForDirection::DownTo => UnconfirmedOp::Geq,
@@ -384,16 +892,157 @@ impl CodeGenerator {
 
         self.gen_stmt(body);
 
-        self.emit(UnconfirmedOp::Lod(slot.address).into(), span);
-        self.emit(UnconfirmedOp::Ldc(1).into(), span);
-        let step = match direction {
-            ForDirection::To => UnconfirmedOp::Adi,
-            ForDirection::DownTo => UnconfirmedOp::Sbi,
-        };
-        self.emit(step.into(), span);
-        self.emit(UnconfirmedOp::Str(slot.address).into(), span);
+        self.gen_store_resolved(resolved, span, |g| {
+            g.gen_load_resolved(resolved, span);
+            g.emit(UnconfirmedOp::Ldc(1).into(), span);
+            let step = match direction {
+                ForDirection::To => UnconfirmedOp::Adi,
+                ForDirection::DownTo => UnconfirmedOp::Sbi,
+            };
+            g.emit(step.into(), span);
+        });
         self.emit(UnconfirmedOp::Ujp(loop_start).into(), span);
         self.patch_jump(exit_loop, self.here());
+    }
+
+    /// 手続き呼び出し文。組み込み手続き（`Write`/`WriteLn`/`Read`/
+    /// `ReadLn`/`New`/`Dispose`）は引き続きこのクレートのスコープ外
+    /// （I/O・ヒープ確保のp-codeは別ステップ）としてエラー報告する。
+    /// それ以外の名前は、ユーザー定義の`PROCEDURE`として解決を試みる。
+    fn gen_proc_call(&mut self, name: &Identifier, args: &[Expr], span: Span) {
+        const BUILTINS: &[&str] = &["write", "writeln", "read", "readln", "new", "dispose"];
+        let key = normalize(&name.name);
+        if BUILTINS.contains(&key.as_str()) {
+            self.error(
+                span,
+                format!(
+                    "built-in procedure '{}' is out of scope for this step's minimal codegen",
+                    name.name
+                ),
+            );
+            for arg in args {
+                self.gen_expr(arg);
+            }
+            return;
+        }
+
+        match self.routines.get(&key).cloned() {
+            Some(info) if !info.is_func => {
+                self.gen_call_args(&info.params, args, name, span);
+                self.emit_call(&key, span);
+            }
+            Some(_) => {
+                self.error(
+                    name.span,
+                    format!(
+                        "'{}' is a function; a function cannot be called as a statement (its \
+                         return value would be discarded)",
+                        name.name
+                    ),
+                );
+                for arg in args {
+                    self.gen_expr(arg);
+                }
+            }
+            None => {
+                self.error(name.span, format!("Undefined procedure '{}'", name.name));
+                for arg in args {
+                    self.gen_expr(arg);
+                }
+            }
+        }
+    }
+
+    /// `FUNCTION`呼び出し式。呼び出し後、戻り値1ワードがスタックへ
+    /// 残る（呼び出し先本体末尾の`RPU`が戻り値領域だけを残して活性化
+    /// レコードを切り詰めるという設計。[`crate`]モジュールドキュメント
+    /// 参照）。
+    fn gen_func_call(&mut self, name: &Identifier, args: &[Expr], span: Span) {
+        let key = normalize(&name.name);
+        match self.routines.get(&key).cloned() {
+            Some(info) if info.is_func => {
+                self.gen_call_args(&info.params, args, name, span);
+                self.emit_call(&key, span);
+            }
+            Some(_) => {
+                self.error(
+                    name.span,
+                    format!(
+                        "'{}' is a procedure; procedures cannot be used in an expression",
+                        name.name
+                    ),
+                );
+                for arg in args {
+                    self.gen_expr(arg);
+                }
+                self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            }
+            None => {
+                self.error(name.span, format!("Undefined identifier '{}'", name.name));
+                for arg in args {
+                    self.gen_expr(arg);
+                }
+                self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            }
+        }
+    }
+
+    /// 呼び出し引数を評価してスタックへ積む。`VAR`仮引数（`by_ref`）には
+    /// アドレスを（[`Self::gen_address_of_resolved`]、単純な変数参照のみ
+    /// サポート）、それ以外には値を（[`Self::gen_expr`]）積む。
+    fn gen_call_args(
+        &mut self,
+        params: &[FrameSlot],
+        args: &[Expr],
+        callee: &Identifier,
+        span: Span,
+    ) {
+        if args.len() != params.len() {
+            self.error(
+                span,
+                format!(
+                    "'{}' expects {} argument(s), found {}",
+                    callee.name,
+                    params.len(),
+                    args.len()
+                ),
+            );
+            for arg in args {
+                self.gen_expr(arg);
+            }
+            return;
+        }
+
+        for (arg, param) in args.iter().zip(params.iter()) {
+            if param.by_ref {
+                self.gen_var_arg(arg, span);
+            } else {
+                self.gen_expr(arg);
+            }
+        }
+    }
+
+    fn gen_var_arg(&mut self, arg: &Expr, span: Span) {
+        let Expr::Identifier(ident) = arg else {
+            self.error(
+                arg.span(),
+                "cannot pass an expression as a VAR argument (only a simple variable reference \
+                 is supported by this step's minimal codegen)",
+            );
+            self.gen_expr(arg);
+            return;
+        };
+        let key = normalize(&ident.name);
+        match self.resolve_var(&key) {
+            Some(resolved) => self.gen_address_of_resolved(resolved, span),
+            None => {
+                self.error(
+                    ident.span,
+                    format!("'{}' is not a known variable in this scope", ident.name),
+                );
+                self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            }
+        }
     }
 
     fn gen_expr(&mut self, expr: &Expr) {
@@ -421,6 +1070,7 @@ impl CodeGenerator {
                 self.emit(opcode.into(), *span);
             }
             Expr::Paren(inner, _) => self.gen_expr(inner),
+            Expr::FuncCall { name, args, span } => self.gen_func_call(name, args, *span),
             Expr::RealLiteral(_, span) => {
                 self.unsupported_expr(*span, "REAL literals");
             }
@@ -429,9 +1079,6 @@ impl CodeGenerator {
             }
             Expr::NilLiteral(span) => {
                 self.unsupported_expr(*span, "NIL / pointer values");
-            }
-            Expr::FuncCall { span, .. } => {
-                self.unsupported_expr(*span, "function calls");
             }
             Expr::IndexAccess { span, .. } => {
                 self.unsupported_expr(*span, "array indexing");
@@ -462,8 +1109,18 @@ impl CodeGenerator {
         self.emit(UnconfirmedOp::Ldc(0).into(), span);
     }
 
+    /// 識別子1つだけの式の読み込み。ローカル/グローバル変数、定数の順で
+    /// 解決を試み、いずれでもなければ`PROCEDURE`/`FUNCTION`名として
+    /// 解決を試みる。`FUNCTION`の名前が括弧なしで現れた場合は、伝統的な
+    /// Pascalの慣習に従い引数なしの呼び出しとして扱う（`wasd-sema`の
+    /// `infer_identifier_type`と同じ解釈）。
     fn gen_identifier_load(&mut self, ident: &Identifier) {
         let key = normalize(&ident.name);
+
+        if let Some(resolved) = self.resolve_var(&key) {
+            self.gen_load_resolved(resolved, ident.span);
+            return;
+        }
         if let Some(value) = self.consts.get(&key).copied() {
             match value {
                 ConstValue::Int(v) => self.emit_ldc_int(v, ident.span),
@@ -473,8 +1130,31 @@ impl CodeGenerator {
             }
             return;
         }
-        if let Some(slot) = self.vars.get(&key).copied() {
-            self.emit(UnconfirmedOp::Lod(slot.address).into(), ident.span);
+        if let Some(info) = self.routines.get(&key).cloned() {
+            if info.is_func {
+                if info.params.is_empty() {
+                    self.emit_call(&key, ident.span);
+                } else {
+                    self.error(
+                        ident.span,
+                        format!(
+                            "Function '{}' expects {} argument(s), found 0",
+                            ident.name,
+                            info.params.len()
+                        ),
+                    );
+                    self.emit(UnconfirmedOp::Ldc(0).into(), ident.span);
+                }
+            } else {
+                self.error(
+                    ident.span,
+                    format!(
+                        "'{}' is a procedure; procedures cannot be used in an expression",
+                        ident.name
+                    ),
+                );
+                self.emit(UnconfirmedOp::Ldc(0).into(), ident.span);
+            }
             return;
         }
         self.error(
@@ -530,6 +1210,36 @@ impl CodeGenerator {
             }
         };
         self.emit(opcode.into(), span);
+    }
+}
+
+/// `body`の中に現れる`FOR`文の個数を再帰的に数える（隠しループ終了値の
+/// 一時変数がいくつ必要になるかの見積もりに使う。[`crate`]モジュール
+/// ドキュメントの「活性化レコードのレイアウト」参照）。`CASE`の各分岐は
+/// スコープ外として実際には生成されない（[`CodeGenerator::gen_stmt`]
+/// 参照）ため、意図的に数え上げの対象外とする。
+fn count_for_temps(block: &Block) -> u16 {
+    block.statements.iter().map(count_for_temps_stmt).sum()
+}
+
+fn count_for_temps_stmt(stmt: &Statement) -> u16 {
+    match stmt {
+        Statement::For { body, .. } => 1 + count_for_temps_stmt(body),
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            count_for_temps_stmt(then_branch)
+                + else_branch
+                    .as_deref()
+                    .map(count_for_temps_stmt)
+                    .unwrap_or(0)
+        }
+        Statement::While { body, .. } => count_for_temps_stmt(body),
+        Statement::Repeat { body, .. } => body.iter().map(count_for_temps_stmt).sum(),
+        Statement::Compound(block) => count_for_temps(block),
+        _ => 0,
     }
 }
 

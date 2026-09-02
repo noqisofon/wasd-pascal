@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::ir::{Instruction, PCodeModule};
-use crate::opcode::{Opcode, UnconfirmedOp};
+use crate::opcode::{ConfirmedOp, Opcode, UnconfirmedOp};
 
 impl fmt::Display for PCodeModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -25,19 +25,30 @@ fn format_instruction(instruction: &Instruction) -> String {
 
 fn format_opcode(opcode: &Opcode) -> String {
     match opcode {
-        // `ConfirmedOp`は現時点でバリアントを持たない（uninhabited type。
-        // `crate::opcode::ConfirmedOp`のドキュメント参照）ため、`match`は
-        // 値を束縛せずに空腕で網羅できる。
-        Opcode::Confirmed(never) => match *never {},
+        Opcode::Confirmed(op) => format_confirmed(op),
         Opcode::Unconfirmed(op) => format_unconfirmed(op),
+    }
+}
+
+fn format_confirmed(op: &ConfirmedOp) -> String {
+    match op {
+        ConfirmedOp::Cpl(target) => format!("CPL {}", target.0),
+        ConfirmedOp::Cpg(target) => format!("CPG {}", target.0),
+        ConfirmedOp::Cpi(db, target) => format!("CPI {db},{}", target.0),
+        ConfirmedOp::Scpi1(target) => format!("SCPI1 {}", target.0),
+        ConfirmedOp::Scpi2(target) => format!("SCPI2 {}", target.0),
+        ConfirmedOp::Rpu(b) => format!("RPU {b}"),
     }
 }
 
 fn format_unconfirmed(op: &UnconfirmedOp) -> String {
     match op {
         UnconfirmedOp::Ldc(value) => format!("LDC {value}"),
-        UnconfirmedOp::Lod(addr) => format!("LOD {}", addr.0),
-        UnconfirmedOp::Str(addr) => format!("STR {}", addr.0),
+        UnconfirmedOp::Lod(level, addr) => format!("LOD {},{}", level.0, addr.0),
+        UnconfirmedOp::Str(level, addr) => format!("STR {},{}", level.0, addr.0),
+        UnconfirmedOp::Lda(level, addr) => format!("LDA {},{}", level.0, addr.0),
+        UnconfirmedOp::Ind => "IND".to_string(),
+        UnconfirmedOp::Sti => "STI".to_string(),
         UnconfirmedOp::Adi => "ADI".to_string(),
         UnconfirmedOp::Sbi => "SBI".to_string(),
         UnconfirmedOp::Mpi => "MPI".to_string(),
@@ -64,11 +75,18 @@ mod tests {
     use wasd_ast::Span;
 
     use super::*;
-    use crate::opcode::{Address, CodeAddress};
+    use crate::opcode::{Address, CodeAddress, Level};
 
     fn instr(opcode: UnconfirmedOp) -> Instruction {
         Instruction {
             opcode: Opcode::Unconfirmed(opcode),
+            span: Span::new(0, 1),
+        }
+    }
+
+    fn confirmed_instr(opcode: ConfirmedOp) -> Instruction {
+        Instruction {
+            opcode: Opcode::Confirmed(opcode),
             span: Span::new(0, 1),
         }
     }
@@ -80,7 +98,7 @@ mod tests {
                 instr(UnconfirmedOp::Ldc(1)),
                 instr(UnconfirmedOp::Ldc(2)),
                 instr(UnconfirmedOp::Adi),
-                instr(UnconfirmedOp::Str(Address(0))),
+                instr(UnconfirmedOp::Str(Level(0), Address(0))),
                 instr(UnconfirmedOp::Stp),
             ],
             global_data_words: 1,
@@ -94,7 +112,7 @@ mod tests {
                 "    0: LDC 1",
                 "    1: LDC 2",
                 "    2: ADI",
-                "    3: STR 0",
+                "    3: STR 0,0",
                 "    4: STP",
             ]
         );
@@ -113,5 +131,20 @@ mod tests {
         let text = module.to_string();
         assert!(text.contains("FJP 2"));
         assert!(text.contains("UJP 0"));
+    }
+
+    #[test]
+    fn renders_call_and_return_instructions() {
+        let module = PCodeModule {
+            instructions: vec![
+                confirmed_instr(ConfirmedOp::Cpg(CodeAddress(3))),
+                confirmed_instr(ConfirmedOp::Rpu(2)),
+            ],
+            global_data_words: 0,
+        };
+
+        let text = module.to_string();
+        assert!(text.contains("CPG 3"));
+        assert!(text.contains("RPU 2"));
     }
 }

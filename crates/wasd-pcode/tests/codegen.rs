@@ -14,7 +14,9 @@
 use wasd_ast::Program;
 use wasd_lexer::Lexer;
 use wasd_parser::Parser;
-use wasd_pcode::{Address, CodeAddress, CodeGenerator, Opcode, PCodeModule, UnconfirmedOp};
+use wasd_pcode::{
+    Address, CodeAddress, CodeGenerator, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
+};
 
 fn parse_program(source: &str) -> Program {
     let mut lexer = Lexer::new(source);
@@ -36,6 +38,10 @@ fn opcodes(module: &PCodeModule) -> Vec<Opcode> {
 
 fn op(o: UnconfirmedOp) -> Opcode {
     Opcode::Unconfirmed(o)
+}
+
+fn cop(o: ConfirmedOp) -> Opcode {
+    Opcode::Confirmed(o)
 }
 
 /// 1. 単純な代入文 `x := 1 + 2` のp-code生成が期待通りの命令列になること。
@@ -61,7 +67,7 @@ fn simple_assignment_generates_expected_instructions() {
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Ldc(2)),
             op(UnconfirmedOp::Adi),
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Stp),
         ]
     );
@@ -91,15 +97,15 @@ fn if_then_else_generates_fjp_and_ujp_with_correctly_patched_targets() {
     assert_eq!(
         opcodes(&module),
         vec![
-            op(UnconfirmedOp::Lod(Address(0))), // x
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // x
             op(UnconfirmedOp::Ldc(0)),
             op(UnconfirmedOp::Grt),
             op(UnconfirmedOp::Fjp(CodeAddress(7))), // -> else branch (index 7)
             op(UnconfirmedOp::Ldc(1)),
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Ujp(CodeAddress(9))), // -> past else branch (STP)
             op(UnconfirmedOp::Ldc(2)),
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Stp),
         ]
     );
@@ -127,12 +133,12 @@ fn if_then_without_else_only_emits_a_single_forward_jump() {
     assert_eq!(
         opcodes(&module),
         vec![
-            op(UnconfirmedOp::Lod(Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(0)),
             op(UnconfirmedOp::Grt),
             op(UnconfirmedOp::Fjp(CodeAddress(6))), // -> STP, right after THEN body
             op(UnconfirmedOp::Ldc(1)),
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Stp),
         ]
     );
@@ -160,14 +166,14 @@ fn while_loop_generates_backward_and_forward_jumps() {
     assert_eq!(
         opcodes(&module),
         vec![
-            op(UnconfirmedOp::Lod(Address(0))), // loop start (index 0)
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // loop start (index 0)
             op(UnconfirmedOp::Ldc(0)),
             op(UnconfirmedOp::Grt),
             op(UnconfirmedOp::Fjp(CodeAddress(9))), // -> STP, past the loop
-            op(UnconfirmedOp::Lod(Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Sbi),
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Ujp(CodeAddress(0))), // -> back to loop start
             op(UnconfirmedOp::Stp),
         ]
@@ -200,19 +206,19 @@ fn for_loop_generates_init_test_body_and_increment() {
         opcodes(&module),
         vec![
             op(UnconfirmedOp::Ldc(1)),
-            op(UnconfirmedOp::Str(Address(0))), // i := 1
+            op(UnconfirmedOp::Str(Level(0), Address(0))), // i := 1
             op(UnconfirmedOp::Ldc(10)),
-            op(UnconfirmedOp::Str(Address(1))), // hidden limit := 10
-            op(UnconfirmedOp::Lod(Address(0))), // loop start (index 4)
-            op(UnconfirmedOp::Lod(Address(1))),
-            op(UnconfirmedOp::Leq),                  // i <= limit
-            op(UnconfirmedOp::Fjp(CodeAddress(15))), // -> STP, past the loop
-            op(UnconfirmedOp::Lod(Address(0))),      // body: i := i
-            op(UnconfirmedOp::Str(Address(0))),
-            op(UnconfirmedOp::Lod(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(1))), // hidden limit := 10
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // loop start (index 4)
+            op(UnconfirmedOp::Lod(Level(0), Address(1))),
+            op(UnconfirmedOp::Leq),                       // i <= limit
+            op(UnconfirmedOp::Fjp(CodeAddress(15))),      // -> STP, past the loop
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // body: i := i
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Adi), // i + 1
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Ujp(CodeAddress(4))), // -> back to loop start
             op(UnconfirmedOp::Stp),
         ]
@@ -267,18 +273,18 @@ fn nested_if_inside_while_resolves_labels_independently() {
     assert_eq!(
         opcodes(&module),
         vec![
-            op(UnconfirmedOp::Lod(Address(0))), // outer IF condition (index 0)
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // outer IF condition (index 0)
             op(UnconfirmedOp::Ldc(0)),
             op(UnconfirmedOp::Grt),
             op(UnconfirmedOp::Fjp(CodeAddress(13))), // outer IF -> STP
-            op(UnconfirmedOp::Lod(Address(0))),      // inner WHILE condition (loop start, index 4)
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // inner WHILE condition (loop start, index 4)
             op(UnconfirmedOp::Ldc(0)),
             op(UnconfirmedOp::Grt),
             op(UnconfirmedOp::Fjp(CodeAddress(13))), // inner WHILE -> STP
-            op(UnconfirmedOp::Lod(Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Sbi),
-            op(UnconfirmedOp::Str(Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Ujp(CodeAddress(4))), // inner WHILE -> back to loop start
             op(UnconfirmedOp::Stp),
         ]
@@ -308,11 +314,11 @@ fn repeat_until_generates_a_single_backward_conditional_jump() {
     assert_eq!(
         opcodes(&module),
         vec![
-            op(UnconfirmedOp::Lod(Address(0))), // loop start (index 0): body
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // loop start (index 0): body
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Sbi),
-            op(UnconfirmedOp::Str(Address(0))),
-            op(UnconfirmedOp::Lod(Address(0))), // UNTIL x = 0
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // UNTIL x = 0
             op(UnconfirmedOp::Ldc(0)),
             op(UnconfirmedOp::Equ),
             op(UnconfirmedOp::Fjp(CodeAddress(0))), // false -> back to loop start
@@ -321,14 +327,254 @@ fn repeat_until_generates_a_single_backward_conditional_jump() {
     );
 }
 
-/// 6. 今回のスコープ外の構文（`PROCEDURE`宣言等）を含むASTを渡した場合、
-///    パニックせず明確なエラーが返ること。
+/// 6. `PROCEDURE`/`FUNCTION`呼び出しのp-code生成（Step 12）。
+///
+/// 引数なしの単純な呼び出し。`Foo`（`PROGRAM`直下、lexレベル1）は
+/// メイン本体より前に生成されるため、`CPG`の呼び出し先アドレスは
+/// バックパッチ不要で直接確定できる。
 #[test]
-fn procedure_declarations_are_reported_as_an_error_without_panicking() {
+fn no_arg_procedure_call_generates_cpg_and_rpu() {
     let program = parse_program(
         r#"
         PROGRAM P;
         PROCEDURE Foo;
+        BEGIN
+        END;
+        BEGIN
+            Foo
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            cop(ConfirmedOp::Rpu(0)),              // Foo's body (entry = 0)
+            cop(ConfirmedOp::Cpg(CodeAddress(0))), // Foo() call
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// 値引数を持つ`PROCEDURE`呼び出し: 呼び出し元は式を評価した値を積み、
+/// 呼び出し先はそれをローカルスコープ（レベル差0）の仮引数スロットとして
+/// 読む。
+#[test]
+fn procedure_call_with_value_parameter_pushes_the_evaluated_value() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR result: INTEGER;
+        PROCEDURE Double(n: INTEGER);
+        BEGIN
+            result := n + n
+        END;
+        BEGIN
+            Double(21)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Double's body (entry = 0): result := n + n
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // n (own frame, level 0)
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // n
+            op(UnconfirmedOp::Adi),
+            op(UnconfirmedOp::Str(Level(1), Address(0))), // result (global, level 1)
+            cop(ConfirmedOp::Rpu(1)),
+            // Double(21) call
+            op(UnconfirmedOp::Ldc(21)),
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `VAR`引数を持つ`PROCEDURE`呼び出し: 呼び出し元は値ではなく
+/// **アドレス**（`LDA`）を積み、呼び出し先はそのスロットを`LOD`+`IND`/
+/// `LOD`+(値を積んで)`STI`で間接的に読み書きする。
+#[test]
+fn procedure_call_with_var_parameter_pushes_the_address_of_the_argument() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR x: INTEGER;
+        PROCEDURE Inc(VAR n: INTEGER);
+        BEGIN
+            n := n + 1
+        END;
+        BEGIN
+            Inc(x)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Inc's body (entry = 0): n := n + 1 (n is a VAR parameter)
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // n's slot holds an address
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ... read it again to dereference
+            op(UnconfirmedOp::Ind),                       // ... and load the referenced value
+            op(UnconfirmedOp::Ldc(1)),
+            op(UnconfirmedOp::Adi),
+            op(UnconfirmedOp::Sti), // store through the address pushed first
+            cop(ConfirmedOp::Rpu(1)),
+            // Inc(x) call: the caller pushes the ADDRESS of x, not its value
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `FUNCTION`の戻り値が正しく設定され、呼び出し元へ返ること。
+/// `FunctionName := value`は戻り値スロット（活性化レコード末尾）への
+/// `STR`として、呼び出し元での使用は`CPG`直後にその1ワードがスタックに
+/// 残っているものとして扱われる。
+#[test]
+fn function_call_stores_and_returns_its_return_value() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR result: INTEGER;
+        FUNCTION Square(n: INTEGER): INTEGER;
+        BEGIN
+            Square := n * n
+        END;
+        BEGIN
+            result := Square(5)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Square's body (entry = 0): Square := n * n
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // n
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // n
+            op(UnconfirmedOp::Mpi),
+            op(UnconfirmedOp::Str(Level(0), Address(6))), // return value slot (5 + data_size(0) + 1 param)
+            cop(ConfirmedOp::Rpu(1)),
+            // result := Square(5)
+            op(UnconfirmedOp::Ldc(5)),
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(0))), // result
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// 再帰呼び出し: 自分自身をまだ本体生成中に呼ぶ場合でも、
+/// [`CodeGenerator::begin_routine_body`]が本体生成の直前にエントリ
+/// アドレスを確定させるため、バックパッチなしで正しい`CPG`が発行される
+/// こと。
+#[test]
+fn recursive_function_call_uses_cpg_targeting_its_own_entry() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        FUNCTION Fact(n: INTEGER): INTEGER;
+        BEGIN
+            IF n <= 1 THEN
+                Fact := 1
+            ELSE
+                Fact := n * Fact(n - 1)
+        END;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+    let ops = opcodes(&module);
+
+    // Fact自身の本体はentry = CodeAddress(0)から始まる。再帰呼び出しは
+    // その0を指すCPGとして現れるはず。
+    assert!(
+        ops.contains(&cop(ConfirmedOp::Cpg(CodeAddress(0)))),
+        "expected a recursive CPG(0) call, got {ops:?}"
+    );
+    // IF/ELSEの分岐（FJP/UJP）がバックパッチされ、末尾はRPU/STPで終わる。
+    assert!(ops
+        .iter()
+        .any(|o| matches!(o, Opcode::Unconfirmed(UnconfirmedOp::Fjp(_)))));
+    assert!(ops
+        .iter()
+        .any(|o| matches!(o, Opcode::Unconfirmed(UnconfirmedOp::Ujp(_)))));
+    assert!(matches!(
+        ops[ops.len() - 2],
+        Opcode::Confirmed(ConfirmedOp::Rpu(_))
+    ));
+    assert_eq!(ops[ops.len() - 1], op(UnconfirmedOp::Stp));
+}
+
+/// ネストしたスコープでの変数参照: `PROCEDURE`本体からローカル変数を
+/// 読む場合はレベル差0、外側（`PROGRAM`）のグローバル変数を読む場合は
+/// レベル差1になること。
+#[test]
+fn local_and_global_variable_references_use_different_levels() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR g: INTEGER;
+        PROCEDURE UseBoth(n: INTEGER);
+        VAR local: INTEGER;
+        BEGIN
+            local := n;
+            g := local
+        END;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lod(Level(0), Address(6))), // n (own frame)
+            op(UnconfirmedOp::Str(Level(0), Address(5))), // local := n (own frame)
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // local (own frame)
+            op(UnconfirmedOp::Str(Level(1), Address(0))), // g := local (one level up: global)
+            cop(ConfirmedOp::Rpu(2)),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// 今回のスコープ外の`PROCEDURE`/`FUNCTION`構文（配列型の仮引数）を
+/// 含むASTを渡した場合、パニックせず明確なエラーが返ること。
+#[test]
+fn procedure_with_unsupported_parameter_type_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Foo(arr: ARRAY [1..10] OF INTEGER);
         BEGIN
         END;
         BEGIN
@@ -337,11 +583,10 @@ fn procedure_declarations_are_reported_as_an_error_without_panicking() {
     );
 
     let result = CodeGenerator::new().generate(&program);
-    let diagnostics = result.expect_err("PROCEDURE declarations must be rejected, not codegen'd");
+    let diagnostics =
+        result.expect_err("unsupported parameter types must be rejected, not codegen'd");
     assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.message.contains("PROCEDURE") || d.message.contains("FUNCTION")),
+        diagnostics.iter().any(|d| d.message.contains("ARRAY")),
         "diagnostics: {diagnostics:?}"
     );
 }
