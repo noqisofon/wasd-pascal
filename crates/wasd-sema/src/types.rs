@@ -40,6 +40,14 @@ pub enum Type {
     Char,
     /// UCSD拡張: `STRING[n]`（`n`は最大長）。
     ///
+    /// # `n`の型: `u8`（`wasd_ast::TypeExpr::StringN`のドキュメント参照）
+    ///
+    /// STRING[n]のメモリレイアウトが「先頭1バイト＝長さ、続く最大`n`バイト
+    /// が文字データ」であるという前提（UCSD p-System固有の一次資料での
+    /// 確認は未了。`docs/research/ucsd-pascal-primary-sources.md`参照）の
+    /// もとでは、`n`は255を超えられない（1バイトの長さフィールドが表現
+    /// できる最大値という算術的帰結）。
+    ///
     /// # 既知の制限: 長さの異なる`STRING[n]`同士の代入互換性は判定しない
     ///
     /// 実際のUCSD Pascalでは（一次資料未確認だが慣用的に）異なる最大長を
@@ -47,25 +55,33 @@ pub enum Type {
     /// ことが多いと理解している。今回のスコープではその互換性判定までは
     /// 実装せず、`Type::StringN(n)`同士は`n`が完全に一致する場合のみ
     /// （`#[derive(PartialEq)]`による構造的等価性）互換とみなす暫定実装。
-    StringN(usize),
+    /// ただし`Type::StringLiteral(len)`（文字列リテラル）から
+    /// `Type::StringN(n)`への代入は、`len <= n as usize`であれば互換と
+    /// みなす特別扱いを[`crate::typeck::assignment_compatible`]に持たせて
+    /// ある（STRING[n]変数への文字列リテラル代入という、Step 16の主要な
+    /// ユースケースを成立させるため）。
+    StringN(u8),
     /// 文字列リテラル定数の型（長さ`usize`）。
     ///
-    /// # `Type::StringN`との違い: これはStep 9のUCSD `STRING[n]`型ではない
+    /// # `Type::StringN`との違い: 宣言された最大長を持たない
     ///
-    /// Step 15で「`WriteLn('Hello, world!')`を実際に動かす」ことだけを
-    /// 目的として導入した、意図的に最小限の型。本格的な`STRING[n]`型
-    /// （変数として宣言でき、代入・文字列演算の対象になる可変長文字列型。
-    /// [`Type::StringN`]、UCSD dialect限定）とは別物であり、区別のため
-    /// 別のバリアントにしてある。`Type::StringLiteral`の値は
-    /// `WriteLn`へ直接渡す（`crate::typeck::SemaContext::check_proc_call`の
-    /// 組み込み手続き向けの分岐）以外の用途（変数への代入、二項演算子の
-    /// オペランド、`STRING[n]`変数との比較・代入等）には一切使えず、
-    /// 使おうとすると通常の型エラーになる（[`Type`]同士は
+    /// リテラル自身の文字数だけを保持する型であり、`STRING[n]`のように
+    /// 変数として宣言された固定の最大長を持たない。`Type`同士は
     /// `#[derive(PartialEq)]`による構造的等価性で比較されるため、
     /// `Type::StringLiteral(_)`は`Type::StringN(_)`はもちろん
-    /// `Type::StringLiteral`同士でも長さが異なれば別の型として扱われ、
-    /// 追加の特別扱いなしに意図した挙動になる）。dialectには依存しない
-    /// （`Dialect::Iso7185`/`Dialect::Ucsd`のどちらでも同じ）。
+    /// `Type::StringLiteral`同士でも長さが異なれば別の型として扱われる。
+    ///
+    /// 用途は次の2つ:
+    /// - `WriteLn`へ直接渡す（`crate::typeck::SemaContext::check_proc_call`の
+    ///   組み込み手続き向けの分岐。特別扱いは不要で、他の型と同様に
+    ///   受理される）。
+    /// - `STRING[n]`変数への代入（`len <= n`の場合のみ。
+    ///   [`crate::typeck::assignment_compatible`]参照）。
+    ///
+    /// それ以外の用途（二項演算子のオペランド、`STRING[n]`以外の型への
+    /// 代入、宣言長を超える`STRING[n]`への代入等）には使えず、通常の
+    /// 型エラーになる。dialectには依存しない（`Dialect::Iso7185`/
+    /// `Dialect::Ucsd`のどちらでも同じ）。
     StringLiteral(usize),
     /// 配列型。`ArrayType`のドキュメント参照。
     Array(Box<ArrayType>),

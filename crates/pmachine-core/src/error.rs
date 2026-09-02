@@ -64,6 +64,13 @@ pub enum RuntimeError {
     /// 内部エラー。`crates/wasd-pcode/src/builtin.rs`の
     /// `BUILTIN_WRITELN_STRING`ドキュメント参照）。
     InvalidStringIndex(usize),
+    /// `BUILTIN_WRITELN_STRVAR`が`STRING[n]`変数の先頭ワード（長さ）を
+    /// 読んだところ、`0..=255`（`u8`の範囲。`STRING[n]`の`n`の上限と同じ）
+    /// に収まらない値だった。コード生成器（`wasd-pcode`）が書き込む長さは
+    /// 常にこの範囲に収まる前提が崩れていることを示す（通常は起こらない
+    /// はずの内部エラー。`crates/wasd-pcode/src/builtin.rs`の
+    /// `BUILTIN_WRITELN_STRVAR`ドキュメント参照）。
+    InvalidStringLength(i16),
 }
 
 impl fmt::Display for RuntimeError {
@@ -86,6 +93,9 @@ impl fmt::Display for RuntimeError {
             RuntimeError::Io(message) => write!(f, "I/O error: {message}"),
             RuntimeError::InvalidStringIndex(index) => {
                 write!(f, "invalid string pool index: {index}")
+            }
+            RuntimeError::InvalidStringLength(length) => {
+                write!(f, "invalid STRING[n] length prefix: {length}")
             }
         }
     }

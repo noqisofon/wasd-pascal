@@ -8,7 +8,7 @@ use std::io::Write;
 use wasd_pcode::{
     Address, CodeAddress, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
     BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
-    KERNEL_SEGMENT,
+    BUILTIN_WRITELN_STRVAR, KERNEL_SEGMENT,
 };
 
 use crate::error::RuntimeError;
@@ -283,10 +283,46 @@ impl PMachine {
                     .clone();
                 self.write_output(format_args!("{s}\n"))
             }
+            BUILTIN_WRITELN_STRVAR => {
+                let s = self.read_string_var()?;
+                self.write_output(format_args!("{s}\n"))
+            }
             _ => Err(RuntimeError::UnimplementedOpcode(format!(
                 "unknown KERNEL procedure number {proc}"
             ))),
         }
+    }
+
+    /// [`BUILTIN_WRITELN_STRVAR`]が呼ばれた際、スタックからpopしたアドレス
+    /// （[`UnconfirmedOp::Lda`]が積んだ、`self.stack`中の絶対インデックス）
+    /// から`STRING[n]`変数の中身を文字列として読み出す。
+    ///
+    /// [`wasd_pcode::BUILTIN_WRITELN_STRVAR`]のドキュメント「メモリ
+    /// レイアウト」参照: 先頭1ワードが長さ、続く「長さ」ワード分が
+    /// 文字コード（1ワード=1文字という、本クレート・`wasd-pcode`独自の
+    /// 単純化されたレイアウト。実際のUCSD p-Systemのバイト単位レイアウトを
+    /// 再現するものではない）。
+    fn read_string_var(&mut self) -> Result<String, RuntimeError> {
+        let addr = self.pop()?;
+        let idx = usize::try_from(addr).map_err(|_| RuntimeError::AddressOutOfRange)?;
+        let length_word = *self.stack.get(idx).ok_or(RuntimeError::AddressOutOfRange)?;
+        let length = u8::try_from(length_word)
+            .map_err(|_| RuntimeError::InvalidStringLength(length_word))?
+            as usize;
+
+        let mut s = String::with_capacity(length);
+        for i in 0..length {
+            let word = *self
+                .stack
+                .get(idx + 1 + i)
+                .ok_or(RuntimeError::AddressOutOfRange)?;
+            // UNCONFIRMED: 文字コードは下位8bitへ切り詰める
+            // （`wasd-pcode`の`gen_string_literal_assignment`がASCII範囲
+            // （0..=127）のみを書き込む前提。`crate::builtin::
+            // BUILTIN_WRITELN_STRVAR`のドキュメント参照）。
+            s.push((word as u16 as u8) as char);
+        }
+        Ok(s)
     }
 
     fn write_output(&mut self, args: std::fmt::Arguments<'_>) -> Result<(), RuntimeError> {

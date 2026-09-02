@@ -994,10 +994,10 @@ impl SemaContext {
     /// （`Type::StringLiteral`を含め）意味解析上のエラーにはならない。
     /// 「`WriteLn`が実際に出力できる型」の制限は、この後段の`wasd-pcode`の
     /// コード生成が担う（`crates/wasd-pcode/src/codegen.rs`の
-    /// `gen_writeln_call`参照。現時点では`INTEGER`/`BOOLEAN`/文字列リテラルの
-    /// みサポート）。そのため`Type::StringLiteral`をここで特別扱いする必要は
-    /// なく、既存の「引数式自体の内部エラーの検出のみ」という方針の範囲内で
-    /// 自然に受理される。
+    /// `gen_writeln_call`参照。現時点では`INTEGER`/`BOOLEAN`/文字列リテラル/
+    /// `STRING[n]`変数のみサポート）。そのため`Type::StringLiteral`を
+    /// ここで特別扱いする必要はなく、既存の「引数式自体の内部エラーの検出
+    /// のみ」という方針の範囲内で自然に受理される。
     ///
     /// 手続き呼び出しは文であり値を持たない。識別子が`FUNCTION`に解決された
     /// 場合は、その戻り値が捨てられてしまう不正な呼び出しとしてエラーにする
@@ -1443,20 +1443,19 @@ impl SemaContext {
     ///
     /// # 長さ1以外: dialectを問わず`Type::StringLiteral(n)`
     ///
-    /// Step 15の目的（`WriteLn('Hello, world!')`を実際に動かす）のための
-    /// 最小対応として、長さ`n`（`n != 1`）の文字列リテラルは常に
-    /// `Type::StringLiteral(n)`として受理する（以前はここで
-    /// `Dialect::Iso7185`のとき`Severity::Warning`を出して`Type::Error`に
-    /// していたが、その暫定処理は撤廃した）。
+    /// 長さ`n`（`n != 1`）の文字列リテラルは常に`Type::StringLiteral(n)`
+    /// として受理する（dialectによる警告・エラーは出さない）。
     ///
-    /// **本格的なSTRING型サポートはStep 9のUCSD `STRING[n]`拡張で扱う。
-    /// ここでは文字列リテラルを`WriteLn`に直接渡すケースのみの最小対応**
-    /// であり、`Type::StringLiteral`の値を他の用途（変数への代入、
-    /// 演算子のオペランド、`STRING[n]`型との相互運用等）に使おうとした
-    /// 場合は、引き続き通常の型エラーになる（`Type::StringLiteral`は
-    /// `Type::StringN`とは異なるバリアントなので、[`assignment_compatible`]
-    /// や二項演算の型検査が特別扱いしなくても自然に拒否される。
-    /// `crate::types::Type::StringLiteral`のドキュメント参照）。
+    /// # Step 16: `Type::StringLiteral`は正規の`STRING[n]`型検査と連携する
+    ///
+    /// `Type::StringLiteral`は文字列リテラル自身の型であり、`STRING[n]`の
+    /// ように宣言された最大長を持たない点で`Type::StringN`とは異なる
+    /// （`crate::types::Type::StringLiteral`のドキュメント参照）が、Step 15
+    /// 時点とは異なり、もはや`WriteLn`への直接渡し専用の「最小対応」では
+    /// ない。`Type::StringLiteral(len)`から`Type::StringN(n)`への代入は
+    /// `len <= n`であれば[`assignment_compatible`]が許可する（Step 16で
+    /// 追加）。それ以外の用途（二項演算子のオペランド等）は引き続き
+    /// 通常の型エラーになる。
     fn infer_string_literal_type(&mut self, value: &str, _span: Span) -> Type {
         let len = value.chars().count();
         if len == 1 {
@@ -1627,9 +1626,16 @@ fn pointer_eq_compatible(op: ast::BinOp, lhs: &Type, rhs: &Type) -> bool {
 
 /// 代入`target := value`が型検査上許可されるかどうか。
 ///
-/// 完全一致に加え、`REAL := INTEGER`の暗黙昇格、および任意の`Type::Pointer`
-/// への`NIL`の代入を許可する。どちらかが`Type::Error`の場合はカスケード
-/// エラー防止のため許可扱いにする。
+/// 完全一致に加え、`REAL := INTEGER`の暗黙昇格、任意の`Type::Pointer`への
+/// `NIL`の代入、および文字列リテラルから収まる長さの`STRING[n]`への代入
+/// （Step 16で追加。下記参照）を許可する。どちらかが`Type::Error`の場合は
+/// カスケードエラー防止のため許可扱いにする。
+///
+/// # Step 16: `Type::StringLiteral(len) -> Type::StringN(n)`（`len <= n`）
+///
+/// `s := 'Hello, world!';`のような、`STRING[n]`変数への文字列リテラル
+/// 代入を成立させるための特別扱い。リテラルの実際の文字数`len`が宣言された
+/// 最大長`n`を超える場合は許可しない（型エラーになる）。
 fn assignment_compatible(target: &Type, value: &Type) -> bool {
     if *target == Type::Error || *value == Type::Error {
         return true;
@@ -1637,6 +1643,10 @@ fn assignment_compatible(target: &Type, value: &Type) -> bool {
     target == value
         || (*target == Type::Real && *value == Type::Integer)
         || (matches!(target, Type::Pointer(_)) && *value == Type::Nil)
+        || matches!(
+            (target, value),
+            (Type::StringN(n), Type::StringLiteral(len)) if *len <= *n as usize
+        )
 }
 
 /// 添字式がコンパイル時定数の`INTEGER`リテラルとして評価できる場合に
@@ -2598,21 +2608,42 @@ mod tests {
         assert!(errs.iter().any(|d| d.message.contains("Type mismatch")));
     }
 
-    /// Step 15: `Type::StringLiteral`は`Type::StringN`とは別の型なので、
-    /// `STRING[n]`変数への代入は（長さが一致していても、`Dialect::Ucsd`で
-    /// あっても）引き続き型エラーになる。`Type::StringLiteral`の唯一の
-    /// 用途は`WriteLn`への直接渡しのみであること（
-    /// `crate::types::Type::StringLiteral`のドキュメント参照）の
-    /// リグレッション確認。
+    /// Step 16: 文字列リテラルの文字数が`STRING[n]`の`n`ぴったりに収まる
+    /// 場合、代入は型エラーにならない（`assignment_compatible`の
+    /// `Type::StringLiteral(len) -> Type::StringN(n)`、`len <= n`の規則）。
     #[test]
-    fn string_literal_is_not_assignable_to_a_string_n_variable() {
+    fn string_literal_is_assignable_to_a_string_n_variable_when_it_fits() {
         let diags = check_with_dialect(
             "PROGRAM Foo; VAR s: STRING[5]; BEGIN s := 'hello' END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// Step 16: 文字列リテラルの文字数が`STRING[n]`の`n`を超える場合は
+    /// 引き続き型エラーになる。
+    #[test]
+    fn string_literal_longer_than_string_n_max_len_is_a_type_error() {
+        let diags = check_with_dialect(
+            "PROGRAM Foo; VAR s: STRING[4]; BEGIN s := 'hello' END.",
             Dialect::Ucsd,
         );
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    /// Step 16: 動作確認用のサンプルプログラム
+    /// （`greeting: STRING[80]; greeting := 'Hello, world!'; WriteLn(greeting)`）
+    /// が意味解析上エラーなく通ること。
+    #[test]
+    fn string_test_sample_program_has_no_diagnostics() {
+        let diags = check_with_dialect(
+            "PROGRAM StringTest; VAR greeting: STRING[80]; BEGIN \
+             greeting := 'Hello, world!'; WriteLn(greeting) END.",
+            Dialect::Ucsd,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     /// Step 15: `WriteLn('hello')`のような、長さ1以外の文字列リテラルを

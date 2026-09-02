@@ -597,24 +597,49 @@ impl Parser {
     ///
     /// UNCONFIRMED: 角括弧`[n]`を省略した`STRING`単体の宣言が許されるか、
     /// 許される場合の既定最大長は何かは一次資料で未確認のまま（2026-09-01の
-    /// 一次資料調査でも未調査。継続調査が必要。リポジトリのUCSD Pascal
-    /// 一次資料調査メモ参照）。ここでは慣用的によく引用される既定値`80`を
-    /// 仮に採用し、パーサーレベルでは拒否しない（`wasd_ast::Dialect`の設計方針どおり、
+    /// 一次資料調査でも未調査。Step 16のセッションでも
+    /// archive.org/pascal.hansotten.com/markbessey.blog/ntrs.nasa.govへの
+    /// アクセスがすべてネットワークegressプロキシにブロックされ、確認できな
+    /// かった。継続調査が必要。`docs/research/ucsd-pascal-primary-sources.md`
+    /// 参照）。ここでは慣用的によく引用される既定値`80`を仮に採用し、
+    /// パーサーレベルでは拒否しない（`wasd_ast::Dialect`の設計方針どおり、
     /// UCSD拡張構文は常に受理する）。
+    ///
+    /// # `n`の範囲を1..=255に制限する理由
+    ///
+    /// `wasd_ast::TypeExpr::StringN`のドキュメント参照。STRING[n]のメモリ
+    /// レイアウトが「先頭1バイト＝長さ、続く最大`n`バイトが文字データ」で
+    /// あるという前提（一次資料でのUCSD固有確認は未了だが、一般的な
+    /// Pascal系実装の慣習としては確認済み）のもとでは、1バイトの長さ
+    /// フィールドが表現できる最大値が255であるため、`n`は255を超えられない
+    /// （純粋な算術的帰結）。範囲外の場合は`STRING[n]`の`[n]`省略時と同じ
+    /// フォールバック値`80`を使い、エラー回復を続ける。
     fn parse_string_n_type(&mut self, type_start: Span) -> TypeExpr {
         if !self.check(&TokenKind::LBracket) {
             return TypeExpr::StringN(80, type_start);
         }
         self.advance(); // '['
 
+        let len_span = self.peek_span();
         let len = match self.peek().clone() {
-            TokenKind::IntegerLiteral(v) if v > 0 => {
+            TokenKind::IntegerLiteral(v) if (1..=255).contains(&v) => {
                 self.advance();
-                v as usize
+                v as u8
+            }
+            TokenKind::IntegerLiteral(v) => {
+                self.advance();
+                self.error(
+                    len_span,
+                    format!(
+                        "STRING[n]: length must be between 1 and 255 (a UCSD Pascal string's \
+                         length prefix is a single byte), found {v}"
+                    ),
+                );
+                80
             }
             other => {
                 self.error(
-                    self.peek_span(),
+                    len_span,
                     format!(
                         "expected a positive integer length for STRING[n], found {}",
                         describe(&other)
@@ -2454,6 +2479,20 @@ mod tests {
 
         assert_eq!(program.var_decls.len(), 1);
         assert!(matches!(program.var_decls[0].ty, TypeExpr::StringN(10, _)));
+    }
+
+    /// Step 16: `STRING[n]`の`n`が255を超える場合はエラーになり、
+    /// フォールバック値`80`で回復すること（`parse_string_n_type`の
+    /// ドキュメント参照: 1バイトの長さフィールドが表現できる最大値が255）。
+    #[test]
+    fn string_n_type_rejects_length_over_255() {
+        let (program, diags) = parse_source("PROGRAM Foo; VAR s: STRING[256]; BEGIN END.");
+        assert_eq!(diags.len(), 1, "diagnostics: {diags:?}");
+        assert!(diags[0].message.contains("between 1 and 255"));
+        let program = program.expect("should parse a Program despite the error");
+
+        assert_eq!(program.var_decls.len(), 1);
+        assert!(matches!(program.var_decls[0].ty, TypeExpr::StringN(80, _)));
     }
 
     /// コンパイラディレクティブが文の並びの中で
