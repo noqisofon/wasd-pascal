@@ -20,8 +20,10 @@ Wizardry 風 3D ダンジョンゲームの実現を見据えている。全体�
 ## 現在のスコープ
 
 このリポジトリの現段階のスコープは、コンパイラのフロントエンド
-（レキサ・パーサー・意味解析）と LSP サーバーの土台まで。p-machine の
-命令セット実装そのものは別リポジトリ／別 workspace を想定している。
+（レキサ・パーサー・意味解析）と、LSP サーバー (`wasd-lsp`) の
+診断表示 (`textDocument/publishDiagnostics`) まで。ホバー・補完・
+定義へジャンプ等は次段階。p-machine の命令セット実装そのものは
+別リポジトリ／別 workspace を想定している。
 
 ## クレート構成
 
@@ -78,9 +80,40 @@ cargo run -p wasd-cli -- parse examples/procedures.pas --emit-ast
 診断にエラー（`error:`）が1件でもあれば終了コードは`1`、警告のみ・
 エラーなしであれば`0`、ファイルが存在しない等のI/Oエラーは`2`になる。
 
+## `wasd-lsp` の使い方
+
+`wasd-lsp`は、標準入出力（stdio）経由でLSPクライアントに接続できる
+Language Serverバイナリ。今回のスコープは診断表示
+（`textDocument/publishDiagnostics`）のみで、ホバー・補完・定義へ
+ジャンプ等は未実装。dialectは現時点ではサーバー起動時に固定
+（デフォルトのISO 7185）で、エディタ設定からの切り替えには未対応。
+
+```sh
+# ビルドする。
+cargo build -p wasd-lsp
+
+# バイナリは target/debug/wasd-lsp (または --release なら target/release/wasd-lsp) に生成される。
+cargo run -p wasd-lsp
+```
+
+サーバーはstdin/stdoutでJSON-RPCのLSPメッセージを待ち受ける（他の
+出力は行わない）ので、単体で起動しても何も表示されずブロックする
+のが正常な動作。エディタ側から接続するには、汎用のLSPクライアント
+拡張（VS Codeなら例えば`vscode-languageclient`を使った簡易拡張）に
+サーバーコマンドとして上記のバイナリパスを指定し、`.pas`ファイルを
+対象言語として登録すればよい。本リポジトリでは今回、専用のVS Code
+拡張の作成はスコープ外としている。
+
+`textDocument/didOpen`/`didChange`（`TextDocumentSyncKind::FULL`、
+つまり変更のたびに全文が送られてくる）を受けて`wasd-driver::compile`
+を呼び出し、返ってきた診断を`publishDiagnostics`で配信する。
+ソース上のバイト位置（`Span`）からLSPが期待する「0始まりの行番号 +
+UTF-16コードユニット単位の列」への変換ロジックは`src/position.rs`に
+あり、日本語コメント等マルチバイト文字を含むソースについてもユニット
+テストで検証している。
+
 ## 次のステップ
 
-- `wasd-lexer`: UCSD Pascal の字句仕様の実装（一次資料に基づく）
-- `wasd-ast`: 文/式/宣言の AST ノード定義
-- `wasd-parser`: 再帰下降パーサーの実装
+- `wasd-lsp`: ホバー・補完・定義へジャンプ、dialectのエディタ設定連携
+- `PROCEDURE`/`FUNCTION`・配列・レコード・ポインタ・UNITのp-code生成
 - p-machine 命令セットの実装（別リポジトリ or 別 workspace 想定）
