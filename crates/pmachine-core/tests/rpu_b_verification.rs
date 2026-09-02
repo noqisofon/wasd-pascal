@@ -19,6 +19,47 @@ mod common;
 use pmachine_core::PMachine;
 use wasd_pcode::{ConfirmedOp, Opcode};
 
+/// Step 17: `examples/procedure_call_repeated.pas`と同じ形（引数なし
+/// `PROCEDURE`が本体で`WriteLn`を呼び、`PROGRAM`本体から複数回呼び出す）
+/// を`pmachine-core`レベルで検証する。`repeated_procedure_calls_each_restore_sp`
+/// との違いは、被呼び出し側の本体が`CXG`（KERNEL呼び出し）を含む点
+/// （呼び出し先本体内の別の呼び出しがMSCW/スタックのバランスを崩さない
+/// ことも合わせて確認する）。
+#[test]
+fn repeated_no_arg_procedure_calls_with_writeln_restore_sp_and_print_in_order() {
+    let module = common::compile(
+        r#"
+        PROGRAM ProcTest2;
+        PROCEDURE Greet;
+        BEGIN
+            WriteLn('Hi!')
+        END;
+        BEGIN
+            Greet;
+            Greet;
+            Greet
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    let sp_at_start = vm.sp();
+    vm.run().expect("program should run without error");
+
+    assert_eq!(
+        vm.sp(),
+        sp_at_start,
+        "no leftover activation records or temporaries after 3 calls"
+    );
+    assert_eq!(
+        vm.call_depth(),
+        0,
+        "every MSCW pushed by a call must be popped by its RPU"
+    );
+    assert_eq!(output.as_string(), "Hi!\nHi!\nHi!\n");
+}
+
 /// ソース中で最初に現れる`CPG`命令の命令列インデックスと、その呼び出し先の
 /// パラメータ語数（[`wasd_pcode::RoutineMeta::param_count`]）を返す。
 fn first_call(module: &wasd_pcode::PCodeModule) -> (usize, u16) {
