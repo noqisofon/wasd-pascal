@@ -21,11 +21,15 @@
 //! オペランドのバイトエンコーディングは未確認（`Confirmed`/`Unconfirmed`
 //! の分離方針に従い、[`opcode::ConfirmedOp`]は意図的に空にしてある）。
 
+pub mod builtin;
 pub mod codegen;
 pub mod ir;
 pub mod opcode;
 pub mod text;
 
+pub use builtin::{
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
+};
 pub use codegen::CodeGenerator;
 pub use ir::{Instruction, PCodeModule, RoutineMeta};
 pub use opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};
