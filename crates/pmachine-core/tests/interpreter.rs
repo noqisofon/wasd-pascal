@@ -385,6 +385,47 @@ fn multiple_writeln_calls_print_in_order() {
     assert_eq!(output.as_string(), "1\n2\n3\n");
 }
 
+/// Step 15, テスト方針1: `WriteLn('Hello, world!')`が正しく文字列を
+/// 出力すること（`examples/hello.pas`が実際に動くことの単体テスト版）。
+#[test]
+fn writeln_prints_a_string_literal() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn('Hello, world!')
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "Hello, world!\n");
+}
+
+/// Step 15, テスト方針2: 複数の異なる文字列リテラルを含むプログラムで、
+/// それぞれ正しい文字列が出力されること（文字列プールのインデックスが
+/// 正しく対応していることの確認）。
+#[test]
+fn multiple_distinct_string_literals_print_in_order() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn('first');
+            WriteLn('second');
+            WriteLn('third')
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "first\nsecond\nthird\n");
+}
+
 /// テスト方針5: `PROCEDURE`内から`WriteLn`を呼び出しても正しく動作し、
 /// `CXG`が`CPG`/`RPU`と混在しても活性化レコードの整合性が保たれること。
 #[test]

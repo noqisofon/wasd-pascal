@@ -990,6 +990,15 @@ impl SemaContext {
     /// 内部エラーの検出のみ）。ユーザー定義の`PROCEDURE`はシグネチャ
     /// （引数の型・個数・`VAR`引数）を検査する。
     ///
+    /// この意味解析レイヤーでは、`WriteLn`に渡された引数がどの型であっても
+    /// （`Type::StringLiteral`を含め）意味解析上のエラーにはならない。
+    /// 「`WriteLn`が実際に出力できる型」の制限は、この後段の`wasd-pcode`の
+    /// コード生成が担う（`crates/wasd-pcode/src/codegen.rs`の
+    /// `gen_writeln_call`参照。現時点では`INTEGER`/`BOOLEAN`/文字列リテラルの
+    /// みサポート）。そのため`Type::StringLiteral`をここで特別扱いする必要は
+    /// なく、既存の「引数式自体の内部エラーの検出のみ」という方針の範囲内で
+    /// 自然に受理される。
+    ///
     /// 手続き呼び出しは文であり値を持たない。識別子が`FUNCTION`に解決された
     /// 場合は、その戻り値が捨てられてしまう不正な呼び出しとしてエラーにする
     /// （関数呼び出しは式としてのみ評価できる）。
@@ -1432,40 +1441,29 @@ impl SemaContext {
     /// 長さ1の文字列リテラル（`'x'`）はISO 7185上も`CHAR`型の値として
     /// 直接使えるため、dialectに関わらずこの場合は`CHAR`として受理する。
     ///
-    /// # `Dialect::Ucsd`: 長さ1以外の文字列リテラルは`STRING[n]`型
+    /// # 長さ1以外: dialectを問わず`Type::StringLiteral(n)`
     ///
-    /// `Dialect::Ucsd`では`STRING[n]`型（Step 7で導入）が使えるため、
-    /// 長さ`n`（`n != 1`）の文字列リテラルはその長さの`Type::StringN(n)`
-    /// として扱う。`STRING[n]`同士の長さ互換性判定（異なる`n`を持つ
-    /// `STRING`変数への代入可否）は行わない暫定実装であることに注意
-    /// （`crate::types::Type::StringN`のドキュメント参照）。
+    /// Step 15の目的（`WriteLn('Hello, world!')`を実際に動かす）のための
+    /// 最小対応として、長さ`n`（`n != 1`）の文字列リテラルは常に
+    /// `Type::StringLiteral(n)`として受理する（以前はここで
+    /// `Dialect::Iso7185`のとき`Severity::Warning`を出して`Type::Error`に
+    /// していたが、その暫定処理は撤廃した）。
     ///
-    /// # `Dialect::Iso7185`: 長さ1以外の文字列リテラルは未対応
-    ///
-    /// ISO 7185のPascalでも文字列リテラルは本来
-    /// `PACKED ARRAY [1..n] OF CHAR`型の値であり、配列型が未実装の
-    /// 現時点ではその型を正しく表現できない。そのため`Severity::Warning`の
-    /// 診断で「対応する型が未実装であること」を知らせたうえで（書いた
-    /// プログラム自体の意味エラーではなく、まだ実装していない機能を
-    /// 使おうとしたことを表すため`Error`ではなく`Warning`とする）、
-    /// `Type::Error`を返す。これによりこの式を使った以降の演算・代入で
-    /// 無関係なカスケードエラーが出るのを防ぐ。
-    fn infer_string_literal_type(&mut self, value: &str, span: Span) -> Type {
+    /// **本格的なSTRING型サポートはStep 9のUCSD `STRING[n]`拡張で扱う。
+    /// ここでは文字列リテラルを`WriteLn`に直接渡すケースのみの最小対応**
+    /// であり、`Type::StringLiteral`の値を他の用途（変数への代入、
+    /// 演算子のオペランド、`STRING[n]`型との相互運用等）に使おうとした
+    /// 場合は、引き続き通常の型エラーになる（`Type::StringLiteral`は
+    /// `Type::StringN`とは異なるバリアントなので、[`assignment_compatible`]
+    /// や二項演算の型検査が特別扱いしなくても自然に拒否される。
+    /// `crate::types::Type::StringLiteral`のドキュメント参照）。
+    fn infer_string_literal_type(&mut self, value: &str, _span: Span) -> Type {
         let len = value.chars().count();
         if len == 1 {
-            return Type::Char;
+            Type::Char
+        } else {
+            Type::StringLiteral(len)
         }
-        if self.dialect == Dialect::Ucsd {
-            return Type::StringN(len);
-        }
-        self.diagnostics.push(Diagnostic::new(
-            span,
-            Severity::Warning,
-            "string literals with a length other than 1 are not supported yet \
-             (STRING/array types are not implemented); this literal is ignored \
-             for type checking purposes",
-        ));
-        Type::Error
     }
 
     fn infer_literal_type(&mut self, literal: &ast::Literal) -> Type {
@@ -1891,14 +1889,18 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
-    /// 複数文字の文字列リテラルは(今回未対応のため)警告に留まり、
-    /// エラーにはならないこと。
+    /// Step 15: 複数文字の文字列リテラルを`WriteLn`以外の文脈（ここでは
+    /// `CHAR`変数への代入）で使おうとした場合は、引き続き型エラーになる
+    /// こと（`Type::StringLiteral`の唯一の用途は`WriteLn`への直接渡しの
+    /// みであることのリグレッション確認。以前は`Severity::Warning`のみで
+    /// `Type::Error`扱いだったため代入自体はカスケードエラー防止で素通り
+    /// していたが、その暫定処理は撤廃した）。
     #[test]
-    fn multi_char_string_literal_produces_only_a_warning() {
+    fn multi_char_string_literal_is_a_type_error_outside_writeln() {
         let diags = check("PROGRAM Foo; VAR c: CHAR; BEGIN c := 'xy' END.");
-        assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
-        assert_eq!(diags.len(), 1, "diagnostics: {diags:?}");
-        assert_eq!(diags[0].severity, Severity::Warning);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
     }
 
     /// 識別子の参照はcase-insensitiveに解決されること。
@@ -2596,31 +2598,35 @@ mod tests {
         assert!(errs.iter().any(|d| d.message.contains("Type mismatch")));
     }
 
-    /// `Dialect::Ucsd`では、長さ1以外の文字列リテラルが`STRING[n]`型として
-    /// 扱われ、`STRING[n]`変数への代入が（長さが完全一致する場合）許可される。
+    /// Step 15: `Type::StringLiteral`は`Type::StringN`とは別の型なので、
+    /// `STRING[n]`変数への代入は（長さが一致していても、`Dialect::Ucsd`で
+    /// あっても）引き続き型エラーになる。`Type::StringLiteral`の唯一の
+    /// 用途は`WriteLn`への直接渡しのみであること（
+    /// `crate::types::Type::StringLiteral`のドキュメント参照）の
+    /// リグレッション確認。
     #[test]
-    fn ucsd_dialect_infers_string_n_type_for_multi_char_literal() {
+    fn string_literal_is_not_assignable_to_a_string_n_variable() {
         let diags = check_with_dialect(
             "PROGRAM Foo; VAR s: STRING[5]; BEGIN s := 'hello' END.",
             Dialect::Ucsd,
         );
-        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
     }
 
-    /// 既定の`Dialect::Iso7185`では、長さ1以外の文字列リテラルは以前と
-    /// 変わらず警告のみ（型エラーではない）で、既存の挙動が壊れていない
-    /// こと（リグレッション確認）。
+    /// Step 15: `WriteLn('hello')`のような、長さ1以外の文字列リテラルを
+    /// `WriteLn`へ直接渡すケースは、dialectを問わずエラーにも警告にも
+    /// ならない（以前は`Dialect::Iso7185`で`Severity::Warning`を出して
+    /// `Type::Error`にしていたが、その暫定処理は撤廃した。このモジュールの
+    /// `infer_string_literal_type`ドキュメント参照）。
     #[test]
-    fn iso7185_dialect_keeps_multi_char_string_literal_as_warning_only() {
-        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x := 1 END.");
+    fn writeln_with_multi_char_string_literal_has_no_diagnostics_under_either_dialect() {
+        let diags = check("PROGRAM Foo; BEGIN WriteLn('hello') END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
 
-        let diags = check("PROGRAM Foo; BEGIN WriteLn('hello') END.");
-        assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
-        assert!(
-            diags.iter().any(|d| d.severity == Severity::Warning),
-            "expected a warning for the multi-char string literal: {diags:?}"
-        );
+        let diags = check_with_dialect("PROGRAM Foo; BEGIN WriteLn('hello') END.", Dialect::Ucsd);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     /// USES節: `Dialect::Ucsd`では正常に受理される。

@@ -25,6 +25,12 @@ impl fmt::Display for PCodeModule {
                 )?;
             }
         }
+        if !self.string_pool.is_empty() {
+            writeln!(f, "; string pool:")?;
+            for (index, value) in self.string_pool.iter().enumerate() {
+                writeln!(f, ";   [{index}] {value:?}")?;
+            }
+        }
         Ok(())
     }
 }
@@ -113,6 +119,7 @@ mod tests {
             global_data_words: 1,
             routines: Vec::new(),
             entry: CodeAddress(0),
+            string_pool: Vec::new(),
         };
 
         let text = module.to_string();
@@ -139,6 +146,7 @@ mod tests {
             global_data_words: 0,
             routines: Vec::new(),
             entry: CodeAddress(0),
+            string_pool: Vec::new(),
         };
 
         let text = module.to_string();
@@ -156,6 +164,7 @@ mod tests {
             global_data_words: 0,
             routines: Vec::new(),
             entry: CodeAddress(0),
+            string_pool: Vec::new(),
         };
 
         let text = module.to_string();

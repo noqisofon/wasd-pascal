@@ -7,7 +7,8 @@ use std::io::Write;
 
 use wasd_pcode::{
     Address, CodeAddress, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
-    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
+    KERNEL_SEGMENT,
 };
 
 use crate::error::RuntimeError;
@@ -85,6 +86,10 @@ pub struct PMachine {
     /// してある（[`Self::new`]は標準出力へ、[`Self::with_output`]は任意の
     /// `Write`実装へ書き込む。テストは後者でキャプチャする）。
     output: Box<dyn Write>,
+    /// 文字列定数プール（[`wasd_pcode::PCodeModule::string_pool`]）。
+    /// `BUILTIN_WRITELN_STRING`（[`Self::call_builtin_kernel`]）が、
+    /// スタックからpopしたインデックスをここへ引いて出力する。
+    string_pool: Vec<String>,
 }
 
 impl PMachine {
@@ -105,6 +110,7 @@ impl PMachine {
             global_data_words,
             routines,
             entry,
+            string_pool,
         } = module;
         let routine_table = routines.into_iter().map(|r| (r.entry.0, r)).collect();
         Self {
@@ -121,6 +127,7 @@ impl PMachine {
             global_data_words,
             halted: false,
             output,
+            string_pool,
         }
     }
 
@@ -267,6 +274,15 @@ impl PMachine {
                 self.write_output(format_args!("{value}\n"))
             }
             BUILTIN_WRITELN_NONE => self.write_output(format_args!("\n")),
+            BUILTIN_WRITELN_STRING => {
+                let index = self.pop()? as usize;
+                let s = self
+                    .string_pool
+                    .get(index)
+                    .ok_or(RuntimeError::InvalidStringIndex(index))?
+                    .clone();
+                self.write_output(format_args!("{s}\n"))
+            }
             _ => Err(RuntimeError::UnimplementedOpcode(format!(
                 "unknown KERNEL procedure number {proc}"
             ))),

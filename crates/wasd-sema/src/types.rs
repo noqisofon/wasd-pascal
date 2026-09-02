@@ -48,6 +48,25 @@ pub enum Type {
     /// 実装せず、`Type::StringN(n)`同士は`n`が完全に一致する場合のみ
     /// （`#[derive(PartialEq)]`による構造的等価性）互換とみなす暫定実装。
     StringN(usize),
+    /// 文字列リテラル定数の型（長さ`usize`）。
+    ///
+    /// # `Type::StringN`との違い: これはStep 9のUCSD `STRING[n]`型ではない
+    ///
+    /// Step 15で「`WriteLn('Hello, world!')`を実際に動かす」ことだけを
+    /// 目的として導入した、意図的に最小限の型。本格的な`STRING[n]`型
+    /// （変数として宣言でき、代入・文字列演算の対象になる可変長文字列型。
+    /// [`Type::StringN`]、UCSD dialect限定）とは別物であり、区別のため
+    /// 別のバリアントにしてある。`Type::StringLiteral`の値は
+    /// `WriteLn`へ直接渡す（`crate::typeck::SemaContext::check_proc_call`の
+    /// 組み込み手続き向けの分岐）以外の用途（変数への代入、二項演算子の
+    /// オペランド、`STRING[n]`変数との比較・代入等）には一切使えず、
+    /// 使おうとすると通常の型エラーになる（[`Type`]同士は
+    /// `#[derive(PartialEq)]`による構造的等価性で比較されるため、
+    /// `Type::StringLiteral(_)`は`Type::StringN(_)`はもちろん
+    /// `Type::StringLiteral`同士でも長さが異なれば別の型として扱われ、
+    /// 追加の特別扱いなしに意図した挙動になる）。dialectには依存しない
+    /// （`Dialect::Iso7185`/`Dialect::Ucsd`のどちらでも同じ）。
+    StringLiteral(usize),
     /// 配列型。`ArrayType`のドキュメント参照。
     Array(Box<ArrayType>),
     /// レコード型。中身は`SemaContext`のレコードレジストリで名前を
@@ -88,6 +107,7 @@ impl fmt::Display for Type {
             Type::Boolean => f.write_str("BOOLEAN"),
             Type::Char => f.write_str("CHAR"),
             Type::StringN(n) => write!(f, "STRING[{n}]"),
+            Type::StringLiteral(n) => write!(f, "<string literal, length {n}>"),
             Type::Array(arr) => {
                 if arr.packed {
                     write!(f, "PACKED ")?;

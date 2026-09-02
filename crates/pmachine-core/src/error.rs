@@ -57,6 +57,13 @@ pub enum RuntimeError {
     /// 失敗した。ホストの標準出力が閉じられている等、通常は起こらないはずの
     /// I/Oエラーを報告するために用意してある。
     Io(String),
+    /// `BUILTIN_WRITELN_STRING`がスタックからpopしたインデックスが、
+    /// [`wasd_pcode::PCodeModule::string_pool`]の範囲外だった。コード生成器
+    /// （`wasd-pcode`）が発行したインデックスとp-code生成時の`string_pool`が
+    /// 常に対応している前提が崩れていることを示す（通常は起こらないはずの
+    /// 内部エラー。`crates/wasd-pcode/src/builtin.rs`の
+    /// `BUILTIN_WRITELN_STRING`ドキュメント参照）。
+    InvalidStringIndex(usize),
 }
 
 impl fmt::Display for RuntimeError {
@@ -77,6 +84,9 @@ impl fmt::Display for RuntimeError {
                 write!(f, "call target has no matching routine metadata")
             }
             RuntimeError::Io(message) => write!(f, "I/O error: {message}"),
+            RuntimeError::InvalidStringIndex(index) => {
+                write!(f, "invalid string pool index: {index}")
+            }
         }
     }
 }

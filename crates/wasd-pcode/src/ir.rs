@@ -77,4 +77,16 @@ pub struct PCodeModule {
     /// プログラムの初期`IPC`）はここでしか判別できないため、明示的な
     /// フィールドとして持たせる。
     pub entry: CodeAddress,
+    /// 文字列定数プール。`WriteLn('...')`のような文字列リテラルを積む命令
+    /// （[`crate::codegen::CodeGenerator::gen_writeln_call`]）が、実際の
+    /// 文字列をここへ追加してそのインデックスをコードから参照する。
+    ///
+    /// 一次資料（Internal Architecture Guide, II.2.1.4 "The Constant
+    /// Pool"）が示す、複数ワードの定数を専用領域（Constant Pool）に
+    /// 格納し`LCO`命令で参照するという設計を借りているが、本フィールドは
+    /// そのバイナリレイアウト（オフセット計算、ワード境界への詰め方等）を
+    /// 再現するものではなく、「文字列とインデックスの対応表」という
+    /// 意図的に簡略化した表現である（[`crate::builtin::BUILTIN_WRITELN_STRING`]
+    /// のドキュメント参照）。
+    pub string_pool: Vec<String>,
 }

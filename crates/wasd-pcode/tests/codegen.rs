@@ -16,7 +16,8 @@ use wasd_lexer::Lexer;
 use wasd_parser::Parser;
 use wasd_pcode::{
     Address, CodeAddress, CodeGenerator, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
-    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
+    KERNEL_SEGMENT,
 };
 
 fn parse_program(source: &str) -> Program {
@@ -720,6 +721,70 @@ fn writeln_with_no_arguments_emits_cxg_writeln_none() {
         opcodes(&module),
         vec![
             cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_NONE)),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// Step 15: `WriteLn('...')`（文字列リテラル）が文字列を`string_pool`へ
+/// 追加し、そのインデックスを`LDC`で積んでから`BUILTIN_WRITELN_STRING`を
+/// 呼ぶこと（`crates/wasd-pcode/src/builtin.rs`の`BUILTIN_WRITELN_STRING`
+/// ドキュメント参照）。
+#[test]
+fn writeln_with_string_literal_interns_it_and_emits_cxg_writeln_string() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn('Hello, world!')
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(module.string_pool, vec!["Hello, world!".to_string()]);
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Ldc(0)), // index 0 into string_pool
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRING)),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// 複数の異なる文字列リテラルを含むプログラムで、それぞれ別のインデックス
+/// が割り当てられ、`string_pool`の対応する位置に正しく格納されること。
+#[test]
+fn multiple_distinct_string_literals_get_distinct_pool_indices() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn('first');
+            WriteLn('second')
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        module.string_pool,
+        vec!["first".to_string(), "second".to_string()]
+    );
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Ldc(0)),
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRING)),
+            op(UnconfirmedOp::Ldc(1)),
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRING)),
             op(UnconfirmedOp::Stp),
         ]
     );

@@ -55,7 +55,7 @@ enum Command {
     },
     /// レキサ〜semaまで実行し、成功すればp-codeを生成して
     /// `pmachine-core`で実行する。Step 14から`WriteLn`（INTEGER/BOOLEAN・
-    /// 0/1引数のみ）は実際に標準出力へ出力される
+    /// 0/1引数のみ）、Step 15から文字列リテラルも実際に標準出力へ出力される
     /// （`crates/wasd-pcode/src/codegen.rs`の`gen_writeln_call`のドキュメント
     /// 参照）。それ以外の組み込み手続きは引き続き未実装。加えて、実行結果
     /// はグローバル変数のスナップショットとしてもデバッグ表示する。
