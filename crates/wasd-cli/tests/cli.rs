@@ -111,6 +111,19 @@ fn compile_without_emit_pcode_only_prints_diagnostics() {
 }
 
 #[test]
+fn compile_emits_pcode_for_a_program_with_procedures_and_functions() {
+    wasdc()
+        .arg("compile")
+        .arg(example("pcode_procedures.pas"))
+        .arg("--emit-pcode")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK: no errors found"))
+        .stdout(predicate::str::contains("CPG"))
+        .stdout(predicate::str::contains("RPU"));
+}
+
+#[test]
 fn compile_reports_out_of_scope_constructs_without_panicking() {
     wasdc()
         .arg("compile")
