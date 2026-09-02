@@ -66,9 +66,14 @@
 //! ワード数」を採用する（[`CodeGenerator::emit_rpu`]参照）。これにより、
 //! 呼び出し時に積んだパラメータ領域と本体が使ったローカル変数領域が
 //! ちょうど切り詰められ、関数の戻り値領域（存在する場合）だけが
-//! 呼び出し元に残る、という设計を意図している。ただし`pmachine-core`
-//! （未実装）による実行検証はまだできないため、UNCONFIRMEDのまま
-//! 仮実装であることを明記する。
+//! 呼び出し元に残る、という設計を意図している。Step 13で`pmachine-core`
+//! を実装し、この方針Aで実際に`PROCEDURE`/`FUNCTION`呼び出しを実行して
+//! 呼び出し前後のスタックポインタが期待通りに戻ることを確認した
+//! （`crates/pmachine-core/tests/rpu_b_verification.rs`参照）。方針Aは
+//! **本プロジェクトの実行モデル内ではCONFIRMED**である
+//! （[`crate::opcode::ConfirmedOp::Rpu`]のドキュメント、および
+//! `pmachine-core`のクレートドキュメントも参照。実機バイナリでの検証で
+//! はない点に注意）。
 //!
 //! # 制御構造とラベル解決
 //!
@@ -106,7 +111,7 @@ use wasd_ast::{
     ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
 };
 
-use crate::ir::{Instruction, PCodeModule};
+use crate::ir::{Instruction, PCodeModule, RoutineMeta};
 use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};
 
 /// 未確定のジャンプ先・呼び出し先を持つ命令のインデックス。
@@ -258,13 +263,28 @@ impl CodeGenerator {
             self.gen_routine_body(&func.name, &func.body);
         }
 
+        let entry = self.here();
         self.gen_block(&program.body);
         self.emit(UnconfirmedOp::Stp.into(), program.span);
 
         if self.diagnostics.is_empty() {
+            let mut routines: Vec<RoutineMeta> = self
+                .routines
+                .values()
+                .map(|info| RoutineMeta {
+                    entry: info.entry,
+                    param_count: info.params.len() as u16,
+                    data_size: info.data_size,
+                    is_func: info.is_func,
+                })
+                .collect();
+            routines.sort_by_key(|r| r.entry.0);
+
             Ok(PCodeModule {
                 instructions: std::mem::take(&mut self.instructions),
                 global_data_words: self.next_address,
+                routines,
+                entry,
             })
         } else {
             Err(std::mem::take(&mut self.diagnostics))
@@ -506,14 +526,15 @@ impl CodeGenerator {
 
     /// [`crate::opcode::ConfirmedOp::Rpu`]を発行する。
     ///
-    /// # UNCONFIRMED: `b`の計算式（方針A）
+    /// # `b`の計算式（方針A、Step 13で実行検証済み）
     ///
     /// タスク依頼で示された2方針のうち方針A、「`b` = ローカル変数・
     /// 一時変数領域のワード数(`DATASIZE`) + パラメータ領域のワード数」を
-    /// 採用する。`pmachine-core`（未実装）による実行検証ができないため、
-    /// この計算式が実機の`RPU`の実際の挙動と一致するかは未確認のまま
-    /// 仮実装している（[`crate::opcode::ConfirmedOp::Rpu`]のドキュメント
-    /// 参照）。
+    /// 採用する。Step 13で`pmachine-core`を実装し、この方針で呼び出し
+    /// 前後のスタックポインタが期待通りに戻ることを実行検証した
+    /// （[`crate::opcode::ConfirmedOp::Rpu`]のドキュメント参照。本
+    /// プロジェクトの実行モデル内ではCONFIRMED、実機バイナリでの検証では
+    /// ない点に注意）。
     fn emit_rpu(&mut self, info: &RoutineInfo, span: Span) {
         let b = info.data_size + info.params.len() as u16;
         self.emit(ConfirmedOp::Rpu(b).into(), span);

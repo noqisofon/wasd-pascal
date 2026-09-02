@@ -6,6 +6,7 @@ members = [
     "crates/wasd-parser",
     "crates/wasd-sema",
     "crates/wasd-pcode",
+    "crates/pmachine-core",
     "crates/wasd-driver",
     "crates/wasd-cli",
     "crates/wasd-lsp",
@@ -23,6 +24,7 @@ wasd-lexer = { path = "crates/wasd-lexer" }
 wasd-parser = { path = "crates/wasd-parser" }
 wasd-sema = { path = "crates/wasd-sema" }
 wasd-pcode = { path = "crates/wasd-pcode" }
+pmachine-core = { path = "crates/pmachine-core" }
 wasd-driver = { path = "crates/wasd-driver" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }

@@ -137,6 +137,41 @@ fn compile_reports_out_of_scope_constructs_without_panicking() {
 }
 
 #[test]
+fn run_executes_a_minimal_scope_program_and_prints_globals() {
+    wasdc()
+        .arg("run")
+        .arg(example("pcode_minimal.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK: program ran to completion"))
+        .stdout(predicate::str::contains("[0] = 55"));
+}
+
+#[test]
+fn run_executes_procedures_and_functions_including_recursion_and_var_params() {
+    // Factorial(5) = 120, then Increment(VAR result) makes it 121.
+    wasdc()
+        .arg("run")
+        .arg(example("pcode_procedures.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK: program ran to completion"))
+        .stdout(predicate::str::contains("[0] = 121"));
+}
+
+#[test]
+fn run_reports_out_of_scope_constructs_without_panicking() {
+    wasdc()
+        .arg("run")
+        .arg(example("hello.pas"))
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("out of scope"))
+        .stdout(predicate::str::contains("<not run:"));
+}
+
+#[test]
 fn missing_file_exits_with_io_error_code() {
     wasdc()
         .arg("check")

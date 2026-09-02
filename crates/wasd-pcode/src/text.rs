@@ -15,6 +15,16 @@ impl fmt::Display for PCodeModule {
         for (index, instruction) in self.instructions.iter().enumerate() {
             writeln!(f, "{index:>5}: {}", format_instruction(instruction))?;
         }
+        if !self.routines.is_empty() {
+            writeln!(f, "; routines (entry, params, data_size, is_func):")?;
+            for r in &self.routines {
+                writeln!(
+                    f,
+                    ";   entry={} params={} data_size={} is_func={}",
+                    r.entry.0, r.param_count, r.data_size, r.is_func
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -102,6 +112,8 @@ mod tests {
                 instr(UnconfirmedOp::Stp),
             ],
             global_data_words: 1,
+            routines: Vec::new(),
+            entry: CodeAddress(0),
         };
 
         let text = module.to_string();
@@ -126,6 +138,8 @@ mod tests {
                 instr(UnconfirmedOp::Ujp(CodeAddress(0))),
             ],
             global_data_words: 0,
+            routines: Vec::new(),
+            entry: CodeAddress(0),
         };
 
         let text = module.to_string();
@@ -141,6 +155,8 @@ mod tests {
                 confirmed_instr(ConfirmedOp::Rpu(2)),
             ],
             global_data_words: 0,
+            routines: Vec::new(),
+            entry: CodeAddress(0),
         };
 
         let text = module.to_string();
