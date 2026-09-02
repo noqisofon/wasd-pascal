@@ -1,7 +1,9 @@
 //! 式のASTノード。
 //!
-//! 今回のスコープ: リテラル・識別子参照・二項演算・単項演算・括弧のみ。
-//! 集合式やポインタ参照(`^`)などUCSD拡張以降で必要になるノードは含めない。
+//! リテラル・識別子参照・二項演算・単項演算・括弧に加え、配列添字アクセス
+//! (`arr[i]`)・レコードフィールドアクセス(`rec.field`)・ポインタ参照
+//! (`p^`)・`NIL`リテラルを含む。集合式などさらに先の拡張で必要になる
+//! ノードは今回のスコープにまだ含めない。
 
 use crate::ident::Identifier;
 use crate::span::Span;
@@ -62,6 +64,31 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// `NIL`リテラル。ポインタ型の初期値・比較対象として使う
+    /// （`wasd_ast::TypeExpr::Pointer`のドキュメント参照）。
+    NilLiteral(Span),
+    /// 配列添字アクセス `array[index]`。
+    ///
+    /// 多次元添字（`arr[i, j]`、`arr[i][j]`）は、パーサーが左結合で
+    /// ネストした`IndexAccess`に展開する（`ARRAY [1..10, 1..20] OF INTEGER`が
+    /// `TypeExpr::Array`のネストに展開されるのと対称的な設計。
+    /// `wasd_ast::decl::TypeExpr::Array`のドキュメント参照）。
+    IndexAccess {
+        array: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
+    /// レコードフィールドアクセス `record.field`。
+    FieldAccess {
+        record: Box<Expr>,
+        field: Identifier,
+        span: Span,
+    },
+    /// ポインタのデリファレンス `pointer^`。
+    Deref {
+        pointer: Box<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -72,11 +99,15 @@ impl Expr {
             Expr::RealLiteral(_, span) => *span,
             Expr::StringLiteral(_, span) => *span,
             Expr::BoolLiteral(_, span) => *span,
+            Expr::NilLiteral(span) => *span,
             Expr::Identifier(ident) => ident.span,
             Expr::BinaryOp { span, .. } => *span,
             Expr::UnaryOp { span, .. } => *span,
             Expr::Paren(_, span) => *span,
             Expr::FuncCall { span, .. } => *span,
+            Expr::IndexAccess { span, .. } => *span,
+            Expr::FieldAccess { span, .. } => *span,
+            Expr::Deref { span, .. } => *span,
         }
     }
 }
@@ -178,6 +209,28 @@ mod tests {
             span: s,
         };
         assert_eq!(call.span(), s);
+
+        assert_eq!(Expr::NilLiteral(s).span(), s);
+
+        let index = Expr::IndexAccess {
+            array: Box::new(Expr::Identifier(Identifier::new("arr", s))),
+            index: Box::new(Expr::IntLiteral(1, s)),
+            span: s,
+        };
+        assert_eq!(index.span(), s);
+
+        let field = Expr::FieldAccess {
+            record: Box::new(Expr::Identifier(Identifier::new("rec", s))),
+            field: Identifier::new("x", s),
+            span: s,
+        };
+        assert_eq!(field.span(), s);
+
+        let deref = Expr::Deref {
+            pointer: Box::new(Expr::Identifier(Identifier::new("p", s))),
+            span: s,
+        };
+        assert_eq!(deref.span(), s);
     }
 
     #[test]

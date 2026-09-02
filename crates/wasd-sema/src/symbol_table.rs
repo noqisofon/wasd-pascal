@@ -14,7 +14,7 @@ use wasd_ast::Span;
 use crate::types::Type;
 
 /// 仮引数の型と受け渡し方法（値渡し/参照渡し）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamSignature {
     pub ty: Type,
     pub by_ref: bool,

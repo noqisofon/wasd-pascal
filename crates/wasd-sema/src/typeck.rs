@@ -12,12 +12,32 @@
 //! 出さないことで、1つのエラーが無関係な多数のエラーを誘発する
 //! カスケードエラーを防ぐ。
 
+use std::collections::HashMap;
+
 use wasd_ast as ast;
 use wasd_ast::{Dialect, Diagnostic, Identifier, Severity, Span};
 
 use crate::dialect_check;
 use crate::symbol_table::{ParamSignature, SymbolInfo, SymbolKind, SymbolTable};
-use crate::types::Type;
+use crate::types::{ArrayType, Type};
+
+/// レコード型のフィールド一覧。`crate::types::Type::Record`のドキュメント
+/// 参照: `Type::Record`自体は名前（識別用のハンドル）のみを保持し、実際の
+/// フィールド一覧はここに切り出す。これにより`next: ^Node`のような
+/// 自己参照的なレコード定義を、`Type`自体を無限サイズにすることなく
+/// 表現できる。
+#[derive(Debug, Clone)]
+struct RecordInfo {
+    fields: Vec<RecordField>,
+}
+
+#[derive(Debug, Clone)]
+struct RecordField {
+    /// ソース上の表記のまま（フィールド名はcase-insensitiveに比較する。
+    /// `SymbolTable`と同じ方針）。
+    name: String,
+    ty: Type,
+}
 
 /// 意味解析（型検査 + dialectチェック）の実行コンテキスト。
 pub struct SemaContext {
@@ -30,6 +50,17 @@ pub struct SemaContext {
     dialect: Dialect,
     symbol_table: SymbolTable,
     diagnostics: Vec<Diagnostic>,
+    /// `TYPE`セクションで宣言された型名(小文字正規化済み) -> 解決済み`Type`。
+    /// `TypeExpr::Named`の解決に使う。レコード型については、対応する
+    /// `record_registry`エントリの名前と同じ文字列を持つ
+    /// `Type::Record(name)`を値として持つ（`crate::types::Type`の
+    /// ドキュメント参照）。
+    type_table: HashMap<String, Type>,
+    /// レコード型の識別名(小文字正規化済み) -> フィールド一覧。
+    /// `Type::Record`のドキュメント参照。
+    record_registry: HashMap<String, RecordInfo>,
+    /// `TYPE`宣言を経ない無名`RECORD`型に合成名を割り当てるための連番。
+    next_anon_id: u32,
     /// 現在型検査中の`FUNCTION`本体の名前（小文字正規化済み）。
     ///
     /// `FunctionName := value`という形の代入は「戻り値の設定」を意味するが、
@@ -65,6 +96,9 @@ impl SemaContext {
             dialect,
             symbol_table: SymbolTable::new(),
             diagnostics: Vec::new(),
+            type_table: HashMap::new(),
+            record_registry: HashMap::new(),
+            next_anon_id: 0,
             current_function: None,
             for_loop_vars: Vec::new(),
         }
@@ -87,7 +121,8 @@ impl SemaContext {
     /// `Type`へ変換する。`TypeExpr::StringN`はUCSD拡張なので、ここで
     /// dialectチェックを行う（`self`を要求するのはこのため。以前は
     /// フリー関数だったが、dialectチェックのために`SemaContext`のメソッドに
-    /// 変更した）。
+    /// 変更した）。配列・レコード・ポインタ型はISO 7185相当の標準機能
+    /// なのでdialectチェックの対象外。
     fn type_from_type_expr(&mut self, ty: &ast::TypeExpr) -> Type {
         match ty {
             ast::TypeExpr::Integer(_) => Type::Integer,
@@ -98,9 +133,256 @@ impl SemaContext {
                 self.check_dialect_gate(*span, "STRING[n] type", Dialect::Ucsd);
                 Type::StringN(*n)
             }
-            // `TypeExpr`は`#[non_exhaustive]`。配列型/レコード型などが将来
-            // 追加された際は、ここを拡張するまでの間`Type::Error`とする。
+            ast::TypeExpr::Named(ident) => self.resolve_named_type(ident),
+            ast::TypeExpr::Array {
+                index_type,
+                element_type,
+                packed,
+                ..
+            } => self.resolve_array_type(index_type, element_type, *packed),
+            ast::TypeExpr::Record { fields, .. } => self.resolve_record_type(None, fields),
+            ast::TypeExpr::Pointer(inner, _) => {
+                let pointee = self.type_from_type_expr(inner);
+                Type::Pointer(Box::new(pointee))
+            }
+            // `TypeExpr::Subrange`は`Array`の添字位置以外には現れない
+            // （`wasd-parser`は`Array`の`[low..high]`の中でのみ`Subrange`を
+            // 構築する）。単独で型の位置に現れることは想定していないが、
+            // 万一渡された場合でも`Type::Integer`にフォールバックして
+            // パニックを避ける。`TypeExpr`は`#[non_exhaustive]`なので、
+            // 将来追加されるバリアントもここで`Type::Error`にフォールバック
+            // させるまでのワイルドカードを兼ねる。
+            ast::TypeExpr::Subrange { .. } => Type::Integer,
+            #[allow(unreachable_patterns)]
             _ => Type::Error,
+        }
+    }
+
+    /// `TypeExpr::Named`（`TYPE`セクションで宣言された型名への参照）の解決。
+    /// 見つからない場合は「未知の型」の診断を出し`Type::Error`を返す。
+    fn resolve_named_type(&mut self, ident: &Identifier) -> Type {
+        let key = ident.name.to_ascii_lowercase();
+        if let Some(ty) = self.type_table.get(&key) {
+            return ty.clone();
+        }
+        self.diagnostics.push(Diagnostic::new(
+            ident.span,
+            Severity::Error,
+            format!("Unknown type '{}'", ident.name),
+        ));
+        Type::Error
+    }
+
+    /// `ARRAY [index_type] OF element_type`の解決。今回のスコープでは
+    /// 添字は`INTEGER`のサブレンジ（コンパイル時定数のリテラル2つ）のみを
+    /// サポートする（タスク文書参照）。
+    fn resolve_array_type(
+        &mut self,
+        index_type: &ast::TypeExpr,
+        element_type: &ast::TypeExpr,
+        packed: bool,
+    ) -> Type {
+        let (low, high) = match index_type {
+            ast::TypeExpr::Subrange { low, high, .. } => self.eval_subrange_bounds(low, high),
+            other => {
+                self.diagnostics.push(Diagnostic::new(
+                    other.span(),
+                    Severity::Error,
+                    "array index type must be an INTEGER subrange (e.g. 1..10); this \
+                     implementation does not support any other index type yet",
+                ));
+                (0, -1)
+            }
+        };
+        let element = self.type_from_type_expr(element_type);
+        Type::Array(Box::new(ArrayType {
+            low,
+            high,
+            element,
+            packed,
+        }))
+    }
+
+    /// 配列添字のサブレンジ境界`low..high`を評価する。今回のスコープでは
+    /// `INTEGER`リテラルのみをサポートする（タスク文書参照: 「添字の型が
+    /// index_typeと適合すること。今回はINTEGERのサブレンジのみ対応」）。
+    fn eval_subrange_bounds(&mut self, low: &ast::Literal, high: &ast::Literal) -> (i64, i64) {
+        let low_span = low.span();
+        let high_span = high.span();
+        let low_val = match low {
+            ast::Literal::Int(v, _) => *v,
+            _ => {
+                self.diagnostics.push(Diagnostic::new(
+                    low_span,
+                    Severity::Error,
+                    "array index bounds must be INTEGER literals",
+                ));
+                0
+            }
+        };
+        let high_val = match high {
+            ast::Literal::Int(v, _) => *v,
+            _ => {
+                self.diagnostics.push(Diagnostic::new(
+                    high_span,
+                    Severity::Error,
+                    "array index bounds must be INTEGER literals",
+                ));
+                0
+            }
+        };
+        if low_val > high_val {
+            self.diagnostics.push(Diagnostic::new(
+                Span::new(low_span.start, high_span.end),
+                Severity::Error,
+                format!(
+                    "array index low bound {low_val} must not exceed the high bound {high_val}"
+                ),
+            ));
+        }
+        (low_val, high_val)
+    }
+
+    /// `RECORD field1, field2: T1; ... END`の解決。`explicit_name`が`Some`
+    /// なら`TYPE`セクションでの宣言由来（識別名はその型名そのもの）、
+    /// `None`なら`VAR`/仮引数/フィールドの型注釈に直接書かれた無名の
+    /// `RECORD`（識別名は連番から合成する）。
+    ///
+    /// # 設計判断: レコードの型同一性は名前的（nominal）に判定する
+    ///
+    /// ISO 7185自体はレコード型の型同一性を構造的に定義しておらず、
+    /// 実装依存の余地がある（タスク文書参照）。ここでは「同じ`TYPE`宣言に
+    /// 由来するレコードのみ代入可能」という単純な名前的型付けを採用する。
+    /// そのため無名`RECORD`（`TYPE`宣言を経ないもの）は、たとえ
+    /// フィールド構成が完全に同一でも、書かれた箇所が異なれば別の型として
+    /// 扱われる（`next_anon_id`で連番の合成名を割り当てるため）。
+    fn resolve_record_type(&mut self, explicit_name: Option<&str>, fields: &[ast::FieldDecl]) -> Type {
+        let identity = match explicit_name {
+            Some(name) => name.to_string(),
+            None => {
+                self.next_anon_id += 1;
+                format!("{}{}", crate::types::ANONYMOUS_RECORD_PREFIX, self.next_anon_id)
+            }
+        };
+        let key = identity.to_ascii_lowercase();
+        self.resolve_record_fields_into(&key, fields);
+        Type::Record(identity)
+    }
+
+    /// [`Self::resolve_record_type`]の下請け。フィールド一覧を解決し、
+    /// `record_registry[key]`へ（既存のプレースホルダエントリがあれば
+    /// それを上書きする形で）書き込む。`TYPE`セクションの前方参照解決
+    /// （`collect_type_decls`のドキュメント参照）で、レコード名を先に
+    /// 仮登録してからフィールドだけを後で解決する際にも使う。
+    fn resolve_record_fields_into(&mut self, key: &str, fields: &[ast::FieldDecl]) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved_fields = Vec::new();
+        for field_decl in fields {
+            let field_ty = self.type_from_type_expr(&field_decl.ty);
+            for name in &field_decl.names {
+                let lower = name.name.to_ascii_lowercase();
+                if !seen.insert(lower) {
+                    self.diagnostics.push(Diagnostic::new(
+                        name.span,
+                        Severity::Error,
+                        format!("field '{}' is already declared in this RECORD", name.name),
+                    ));
+                    continue;
+                }
+                resolved_fields.push(RecordField {
+                    name: name.name.clone(),
+                    ty: field_ty.clone(),
+                });
+            }
+        }
+
+        self.record_registry.insert(
+            key.to_string(),
+            RecordInfo {
+                fields: resolved_fields,
+            },
+        );
+    }
+
+    /// `TYPE`セクションを2パスで解決する。
+    ///
+    /// # 前方参照の解決方針: レコード型を指すポインタ型のみを対象とする
+    ///
+    /// `TYPE PNode = ^Node; Node = RECORD next: PNode; ... END;`のように、
+    /// ポインタ型が同じ`TYPE`セクション内で後から宣言されるレコード型を
+    /// 指すことを許可する（連結リストの定番パターン）。これを実現するため
+    /// 2パスに分ける:
+    ///
+    /// - パス0: このセクション内の`RECORD`型宣言をすべて先に見つけ、
+    ///   `record_registry`/`type_table`へ**名前だけ**を仮登録する
+    ///   （フィールド一覧はまだ空）。レコード型の識別（`Type::Record`）は
+    ///   名前だけで完結する（`crate::types::Type`のドキュメント参照）ため、
+    ///   フィールドが未解決でも「この名前はレコード型である」という事実
+    ///   だけで、それを指すポインタ型は解決できる。
+    /// - パス1: 宣言順に各`TypeDecl`を解決する。`RECORD`型はパス0で
+    ///   仮登録済みのフィールドを実際の内容で上書きし、それ以外
+    ///   （配列・ポインタ・`STRING[n]`・型名の別名など）は宣言順に
+    ///   逐次解決する。
+    ///
+    /// # 既知の制限: レコード以外への前方参照は未対応
+    ///
+    /// パス0はレコード型の宣言だけを先読みするため、`TYPE PArr = ^MyArr;
+    /// MyArr = ARRAY [1..5] OF INTEGER;`のような「レコード以外の型を指す
+    /// ポインタの前方参照」や、`TYPE A = B; B = INTEGER;`のような
+    /// 「非ポインタの前方参照（別名の別名）」は解決できず、「Unknown
+    /// type」エラーになる。ISO 7185はポインタ型の前方参照を型全般に
+    /// 許可しているため、これは意図的なスコープ制限である（タスク文書が
+    /// 明示的に要求するのは連結リストパターン、すなわちレコードへの
+    /// ポインタの前方参照のみ）。
+    fn collect_type_decls(&mut self, decls: &[ast::TypeDecl]) {
+        // 重複宣言をあらかじめ洗い出しておく。以降のパス0/パス1は
+        // 重複した（=先頭以外の）宣言を完全に無視することで、重複宣言の
+        // 中身で正規の宣言を上書きしてしまう事故を防ぐ。
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut is_duplicate = vec![false; decls.len()];
+        for (i, decl) in decls.iter().enumerate() {
+            let key = decl.name.name.to_ascii_lowercase();
+            if !seen_names.insert(key) {
+                self.diagnostics.push(Diagnostic::new(
+                    decl.name.span,
+                    Severity::Error,
+                    format!("Type '{}' is already declared", decl.name.name),
+                ));
+                is_duplicate[i] = true;
+            }
+        }
+
+        // パス0: レコード型の名前だけを先に仮登録する（前方参照解決の
+        // ドキュメント参照）。
+        for (i, decl) in decls.iter().enumerate() {
+            if is_duplicate[i] {
+                continue;
+            }
+            if let ast::TypeExpr::Record { .. } = &decl.ty {
+                let key = decl.name.name.to_ascii_lowercase();
+                self.record_registry.insert(
+                    key.clone(),
+                    RecordInfo { fields: Vec::new() },
+                );
+                self.type_table
+                    .insert(key, Type::Record(decl.name.name.clone()));
+            }
+        }
+
+        // パス1: 宣言順に解決する。
+        for (i, decl) in decls.iter().enumerate() {
+            if is_duplicate[i] {
+                continue;
+            }
+            let key = decl.name.name.to_ascii_lowercase();
+            let resolved = match &decl.ty {
+                ast::TypeExpr::Record { fields, .. } => {
+                    self.resolve_record_fields_into(&key, fields);
+                    Type::Record(decl.name.name.clone())
+                }
+                other => self.type_from_type_expr(other),
+            };
+            self.type_table.insert(key, resolved);
         }
     }
 
@@ -127,11 +409,15 @@ impl SemaContext {
         // 呼び出しのたびに状態をリセットする。
         self.symbol_table = SymbolTable::new();
         self.diagnostics = Vec::new();
+        self.type_table = HashMap::new();
+        self.record_registry = HashMap::new();
+        self.next_anon_id = 0;
         self.current_function = None;
         self.for_loop_vars = Vec::new();
 
         self.check_uses_clause(&program.uses);
 
+        self.collect_type_decls(&program.type_decls);
         self.collect_const_decls(&program.const_decls);
         self.collect_var_decls(&program.var_decls);
 
@@ -163,12 +449,16 @@ impl SemaContext {
     pub fn check_unit(&mut self, unit: &ast::Unit) -> Vec<Diagnostic> {
         self.symbol_table = SymbolTable::new();
         self.diagnostics = Vec::new();
+        self.type_table = HashMap::new();
+        self.record_registry = HashMap::new();
+        self.next_anon_id = 0;
         self.current_function = None;
         self.for_loop_vars = Vec::new();
 
         self.check_dialect_gate(unit.span, "UNIT declarations", Dialect::Ucsd);
         self.check_uses_clause(&unit.interface.uses);
 
+        self.collect_type_decls(&unit.interface.type_decls);
         self.collect_const_decls(&unit.interface.const_decls);
         self.collect_var_decls(&unit.interface.var_decls);
 
@@ -238,7 +528,7 @@ impl SemaContext {
         let return_type = self.type_from_type_expr(&decl.return_type);
         self.declare(
             &decl.name,
-            return_type,
+            return_type.clone(),
             SymbolKind::Func {
                 params,
                 return_type,
@@ -272,7 +562,7 @@ impl SemaContext {
         for decl in decls {
             let ty = self.type_from_type_expr(&decl.ty);
             for name in &decl.names {
-                self.declare(name, ty, SymbolKind::Var, decl.span);
+                self.declare(name, ty.clone(), SymbolKind::Var, decl.span);
             }
         }
     }
@@ -552,9 +842,44 @@ impl SemaContext {
         self.for_loop_vars.pop();
     }
 
-    fn check_assignment(&mut self, target: &Identifier, value: &ast::Expr) {
+    /// 代入文`target := value`の型検査。`target`は単純な識別子とは限らず、
+    /// 配列添字アクセス・レコードフィールドアクセス・ポインタ
+    /// デリファレンス（の組み合わせ）にもなり得る
+    /// （`wasd_ast::stmt::Statement::Assignment`のドキュメント参照）。
+    fn check_assignment(&mut self, target: &ast::Expr, value: &ast::Expr) {
         let value_ty = self.infer_expr_type(value);
+        match target {
+            ast::Expr::Identifier(ident) => self.check_assignment_to_identifier(ident, value_ty),
+            ast::Expr::IndexAccess { .. } | ast::Expr::FieldAccess { .. } | ast::Expr::Deref { .. } => {
+                // 配列要素・レコードフィールド・デリファレンスは、基点となる
+                // 式（配列/レコード/ポインタ）さえ解決できれば常に左辺値で
+                // あるため、`FOR`ループ変数のような特別扱いは不要
+                // （そもそも`FOR`ループ変数として宣言できるのは単純な
+                // 識別子のみ）。診断は`infer_expr_type`側（存在しない
+                // フィールド・範囲外添字・非ポインタのデリファレンスなど）が
+                // 出す。
+                let target_ty = self.infer_expr_type(target);
+                if !assignment_compatible(&target_ty, &value_ty) {
+                    self.diagnostics.push(Diagnostic::new(
+                        target.span(),
+                        Severity::Error,
+                        format!("Type mismatch: cannot assign '{value_ty}' to '{target_ty}'"),
+                    ));
+                }
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::new(
+                    target.span(),
+                    Severity::Error,
+                    "left-hand side of assignment is not a variable",
+                ));
+                self.infer_expr_type(target);
+            }
+        }
+    }
 
+    /// [`Self::check_assignment`]の下請け: 単純な識別子への代入。
+    fn check_assignment_to_identifier(&mut self, target: &Identifier, value_ty: Type) {
         let lower_target = target.name.to_ascii_lowercase();
         if self.for_loop_vars.contains(&lower_target) {
             self.diagnostics.push(Diagnostic::new(
@@ -574,7 +899,7 @@ impl SemaContext {
             Some(info) => match info.kind {
                 SymbolKind::Var | SymbolKind::Const | SymbolKind::Param { .. } => {
                     let target_ty = info.ty;
-                    if !assignment_compatible(target_ty, value_ty) {
+                    if !assignment_compatible(&target_ty, &value_ty) {
                         self.diagnostics.push(Diagnostic::new(
                             target.span,
                             Severity::Error,
@@ -597,7 +922,7 @@ impl SemaContext {
                         .as_deref()
                         .is_some_and(|f| f == target.name.to_ascii_lowercase());
                     if is_own_function {
-                        if !assignment_compatible(return_type, value_ty) {
+                        if !assignment_compatible(&return_type, &value_ty) {
                             self.diagnostics.push(Diagnostic::new(
                                 target.span,
                                 Severity::Error,
@@ -659,10 +984,20 @@ impl SemaContext {
     /// （関数呼び出しは式としてのみ評価できる）。
     fn check_proc_call(&mut self, name: &Identifier, args: &[ast::Expr]) {
         const BUILTIN_PROCEDURES: &[&str] = &["write", "writeln", "read", "readln"];
-        if BUILTIN_PROCEDURES.contains(&name.name.to_ascii_lowercase().as_str()) {
+        let lower_name = name.name.to_ascii_lowercase();
+        if BUILTIN_PROCEDURES.contains(&lower_name.as_str()) {
             for arg in args {
                 self.infer_expr_type(arg);
             }
+            return;
+        }
+
+        // 組み込み手続き`NEW`/`DISPOSE`: 引数は1つで、ポインタ型でなければ
+        // ならない。今回のスコープでは意味解析レベルでこのチェックのみを
+        // 行う（実際のヒープ確保・解放はp-code生成/ランタイムの課題。
+        // タスク文書参照）。
+        if lower_name == "new" || lower_name == "dispose" {
+            self.check_new_or_dispose_call(name, args);
             return;
         }
 
@@ -703,6 +1038,35 @@ impl SemaContext {
                     self.infer_expr_type(arg);
                 }
             }
+        }
+    }
+
+    /// `NEW(p)`/`DISPOSE(p)`の型検査。引数はちょうど1つで、その型が
+    /// ポインタ型でなければならない（タスク文書参照: 「引数がポインタ型
+    /// であることをチェックするだけでよい」）。
+    fn check_new_or_dispose_call(&mut self, name: &Identifier, args: &[ast::Expr]) {
+        if args.len() != 1 {
+            self.diagnostics.push(Diagnostic::new(
+                name.span,
+                Severity::Error,
+                format!("'{}' expects 1 argument, found {}", name.name, args.len()),
+            ));
+            for arg in args {
+                self.infer_expr_type(arg);
+            }
+            return;
+        }
+
+        let arg_ty = self.infer_expr_type(&args[0]);
+        if arg_ty != Type::Error && !matches!(arg_ty, Type::Pointer(_)) {
+            self.diagnostics.push(Diagnostic::new(
+                args[0].span(),
+                Severity::Error,
+                format!(
+                    "'{}' expects a pointer-typed argument, found '{arg_ty}'",
+                    name.name
+                ),
+            ));
         }
     }
 
@@ -802,7 +1166,7 @@ impl SemaContext {
             let compatible = if param.by_ref {
                 param.ty == arg_ty
             } else {
-                assignment_compatible(param.ty, arg_ty)
+                assignment_compatible(&param.ty, &arg_ty)
             };
             if !compatible {
                 self.diagnostics.push(Diagnostic::new(
@@ -821,12 +1185,21 @@ impl SemaContext {
 
     /// `VAR`引数に渡せる左辺値（変数・仮引数への参照）かどうか。
     /// リテラルや式（`x + 1`など）、定数、関数呼び出しはすべて左辺値ではない。
+    ///
+    /// 配列添字アクセス・レコードフィールドアクセスは、基点となる式が
+    /// 左辺値である場合に限り左辺値になる（`arr[i]`は`arr`が変数/仮引数の
+    /// ときのみ、`rec.field`は`rec`が変数/仮引数のときのみ）。ポインタの
+    /// デリファレンス（`p^`）は、`p`自体の左辺値性に関わらず常に左辺値
+    /// （ヒープ上の領域を指しており、常にアドレス指定可能なため）。
     fn is_lvalue(&self, expr: &ast::Expr) -> bool {
         match expr {
             ast::Expr::Identifier(ident) => matches!(
                 self.symbol_table.lookup(&ident.name).map(|info| &info.kind),
                 Some(SymbolKind::Var) | Some(SymbolKind::Param { .. })
             ),
+            ast::Expr::IndexAccess { array, .. } => self.is_lvalue(array),
+            ast::Expr::FieldAccess { record, .. } => self.is_lvalue(record),
+            ast::Expr::Deref { .. } => true,
             _ => false,
         }
     }
@@ -858,9 +1231,119 @@ impl SemaContext {
             }
             ast::Expr::Paren(inner, _) => self.infer_expr_type(inner),
             ast::Expr::FuncCall { name, args, .. } => self.check_func_call(name, args),
-            // `Expr`は`#[non_exhaustive]`。配列添字式・集合式など今後追加される
+            ast::Expr::NilLiteral(_) => Type::Nil,
+            ast::Expr::IndexAccess { array, index, .. } => self.infer_index_access_type(array, index),
+            ast::Expr::FieldAccess { record, field, .. } => self.infer_field_access_type(record, field),
+            ast::Expr::Deref { pointer, .. } => self.infer_deref_type(pointer),
+            // `Expr`は`#[non_exhaustive]`。集合式など今後追加される
             // バリアントは、追加時にここを拡張するまでの間`Type::Error`とする。
             _ => Type::Error,
+        }
+    }
+
+    /// 配列添字アクセス`array[index]`の型推論。要素型を返す。
+    ///
+    /// - `index`の型は`INTEGER`でなければならない（今回のスコープでは
+    ///   添字型は`INTEGER`のサブレンジのみ対応。タスク文書参照）。
+    /// - `index`がコンパイル時定数（リテラル、あるいは単項`-`を付けた
+    ///   リテラル）として評価できる場合のみ、添字の範囲チェック
+    ///   （`Array::low..=high`に収まっているか）を行う。実行時の範囲
+    ///   チェックは今回のscopeでは行わない（タスク文書参照）。
+    fn infer_index_access_type(&mut self, array: &ast::Expr, index: &ast::Expr) -> Type {
+        let array_ty = self.infer_expr_type(array);
+        let index_ty = self.infer_expr_type(index);
+
+        match &array_ty {
+            Type::Array(arr) => {
+                if index_ty != Type::Integer && index_ty != Type::Error {
+                    self.diagnostics.push(Diagnostic::new(
+                        index.span(),
+                        Severity::Error,
+                        format!("array index must be of type INTEGER, found '{index_ty}'"),
+                    ));
+                } else if let Some(value) = const_eval_int(index) {
+                    if value < arr.low || value > arr.high {
+                        self.diagnostics.push(Diagnostic::new(
+                            index.span(),
+                            Severity::Error,
+                            format!(
+                                "array index {value} is out of bounds [{}..{}]",
+                                arr.low, arr.high
+                            ),
+                        ));
+                    }
+                }
+                arr.element.clone()
+            }
+            Type::Error => Type::Error,
+            other => {
+                self.diagnostics.push(Diagnostic::new(
+                    array.span(),
+                    Severity::Error,
+                    format!("cannot index into non-array type '{other}'"),
+                ));
+                Type::Error
+            }
+        }
+    }
+
+    /// レコードフィールドアクセス`record.field`の型推論。
+    fn infer_field_access_type(&mut self, record: &ast::Expr, field: &Identifier) -> Type {
+        let record_ty = self.infer_expr_type(record);
+        match &record_ty {
+            Type::Record(name) => {
+                let key = name.to_ascii_lowercase();
+                let lower_field = field.name.to_ascii_lowercase();
+                let found = self
+                    .record_registry
+                    .get(&key)
+                    .and_then(|info| info.fields.iter().find(|f| f.name.to_ascii_lowercase() == lower_field));
+                match found {
+                    Some(f) => f.ty.clone(),
+                    None => {
+                        self.diagnostics.push(Diagnostic::new(
+                            field.span,
+                            Severity::Error,
+                            format!("record type '{record_ty}' has no field '{}'", field.name),
+                        ));
+                        Type::Error
+                    }
+                }
+            }
+            Type::Error => Type::Error,
+            other => {
+                self.diagnostics.push(Diagnostic::new(
+                    record.span(),
+                    Severity::Error,
+                    format!("cannot access field of non-record type '{other}'"),
+                ));
+                Type::Error
+            }
+        }
+    }
+
+    /// ポインタデリファレンス`pointer^`の型推論。指す先の型を返す。
+    fn infer_deref_type(&mut self, pointer: &ast::Expr) -> Type {
+        let ptr_ty = self.infer_expr_type(pointer);
+        match ptr_ty {
+            Type::Pointer(pointee) => *pointee,
+            Type::Error => Type::Error,
+            Type::Nil => {
+                self.diagnostics.push(Diagnostic::new(
+                    pointer.span(),
+                    Severity::Error,
+                    "cannot dereference NIL",
+                ));
+                Type::Error
+            }
+            other => {
+                self.diagnostics.push(Diagnostic::new(
+                    pointer.span(),
+                    Severity::Error,
+                    format!("cannot dereference non-pointer type '{other}'"),
+                ));
+                Type::Error
+            }
         }
     }
 
@@ -982,41 +1465,63 @@ impl SemaContext {
 
         use ast::BinOp::*;
         match op {
-            Add | Sub | Mul => match numeric_result(lhs, rhs) {
+            Add | Sub | Mul => match numeric_result(&lhs, &rhs) {
                 Some(ty) => ty,
-                None => self.binary_type_error(op, lhs, rhs, span),
+                None => self.binary_type_error(op, &lhs, &rhs, span),
             },
             // `/`は標準Pascalの実数除算演算子であり、オペランドが両方
             // INTEGERであっても結果はREALになる（DIVとは異なる）。
-            Div => match numeric_result(lhs, rhs) {
+            Div => match numeric_result(&lhs, &rhs) {
                 Some(_) => Type::Real,
-                None => self.binary_type_error(op, lhs, rhs, span),
+                None => self.binary_type_error(op, &lhs, &rhs, span),
             },
             IntDiv | Mod => {
                 if lhs == Type::Integer && rhs == Type::Integer {
                     Type::Integer
                 } else {
-                    self.binary_type_error(op, lhs, rhs, span)
+                    self.binary_type_error(op, &lhs, &rhs, span)
                 }
             }
-            Eq | NotEq | Lt | Gt | LtEq | GtEq => {
-                if lhs == rhs || numeric_result(lhs, rhs).is_some() {
+            // `=`/`<>`は、スカラー型同士（下記`Lt`等と共通）に加え、
+            // ポインタ型・`NIL`の組み合わせも許可する
+            // （タスク文書: 「NILとの比較は任意のポインタ型に対して許可する」）。
+            // `ARRAY`/`RECORD`型はISO 7185上も比較演算子の対象ではないため、
+            // `is_comparable_scalar`の対象外のまま（下記`pointer_eq_compatible`
+            // にも該当しないため`binary_type_error`になる）。
+            Eq | NotEq => {
+                if pointer_eq_compatible(op, &lhs, &rhs)
+                    || (is_comparable_scalar(&lhs)
+                        && is_comparable_scalar(&rhs)
+                        && (lhs == rhs || numeric_result(&lhs, &rhs).is_some()))
+                {
                     Type::Boolean
                 } else {
-                    self.binary_type_error(op, lhs, rhs, span)
+                    self.binary_type_error(op, &lhs, &rhs, span)
+                }
+            }
+            // 大小比較はISO 7185上も順序型（INTEGER/REAL/BOOLEAN/CHAR）と
+            // `STRING[n]`のみが対象で、`ARRAY`/`RECORD`/ポインタ型は対象外。
+            Lt | Gt | LtEq | GtEq => {
+                if is_comparable_scalar(&lhs)
+                    && is_comparable_scalar(&rhs)
+                    && (lhs == rhs || numeric_result(&lhs, &rhs).is_some())
+                {
+                    Type::Boolean
+                } else {
+                    self.binary_type_error(op, &lhs, &rhs, span)
                 }
             }
             And | Or => {
                 if lhs == Type::Boolean && rhs == Type::Boolean {
                     Type::Boolean
                 } else {
-                    self.binary_type_error(op, lhs, rhs, span)
+                    self.binary_type_error(op, &lhs, &rhs, span)
                 }
             }
         }
     }
 
-    fn binary_type_error(&mut self, op: ast::BinOp, lhs: Type, rhs: Type, span: Span) -> Type {
+    fn binary_type_error(&mut self, op: ast::BinOp, lhs: &Type, rhs: &Type, span: Span) -> Type {
         self.diagnostics.push(Diagnostic::new(
             span,
             Severity::Error,
@@ -1063,7 +1568,7 @@ impl SemaContext {
 /// `INTEGER`/`REAL`同士の二項演算の結果型。`INTEGER op REAL`
 /// （どちらの順序でも）は`REAL`への暗黙昇格を許可する。
 /// どちらかが`INTEGER`/`REAL`以外なら`None`。
-fn numeric_result(lhs: Type, rhs: Type) -> Option<Type> {
+fn numeric_result(lhs: &Type, rhs: &Type) -> Option<Type> {
     match (lhs, rhs) {
         (Type::Integer, Type::Integer) => Some(Type::Integer),
         (Type::Real, Type::Real) | (Type::Real, Type::Integer) | (Type::Integer, Type::Real) => {
@@ -1073,16 +1578,64 @@ fn numeric_result(lhs: Type, rhs: Type) -> Option<Type> {
     }
 }
 
+/// 大小比較演算子（`=`/`<>`を含む）の対象になり得るスカラー型かどうか。
+/// `ARRAY`/`RECORD`/ポインタ型・`NIL`はISO 7185上も比較演算子の一般的な
+/// 対象ではないため対象外（ポインタ型の`=`/`<>`は`NIL`比較・同型ポインタ
+/// 同士の比較のみ別途[`pointer_eq_compatible`]で許可する）。
+fn is_comparable_scalar(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Integer | Type::Real | Type::Boolean | Type::Char | Type::StringN(_)
+    )
+}
+
+/// `=`/`<>`に限り、ポインタ型・`NIL`の組み合わせを許可する
+/// （タスク文書: 「NILとの比較は任意のポインタ型に対して許可する」）。
+/// 同型ポインタ同士の比較（`p1 = p2`）も、`NIL`との比較と同様にここで
+/// 扱う（ISO 7185はポインタの大小比較を定義しないため`Lt`等は対象外）。
+fn pointer_eq_compatible(op: ast::BinOp, lhs: &Type, rhs: &Type) -> bool {
+    if !matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
+        return false;
+    }
+    match (lhs, rhs) {
+        (Type::Pointer(_), Type::Pointer(_)) => lhs == rhs,
+        (Type::Pointer(_), Type::Nil) | (Type::Nil, Type::Pointer(_)) | (Type::Nil, Type::Nil) => true,
+        _ => false,
+    }
+}
+
 /// 代入`target := value`が型検査上許可されるかどうか。
 ///
-/// 完全一致に加え、`REAL := INTEGER`の暗黙昇格のみを許可する
-/// （`INTEGER := REAL`のような縮小変換は不可）。どちらかが`Type::Error`の
-/// 場合はカスケードエラー防止のため許可扱いにする。
-fn assignment_compatible(target: Type, value: Type) -> bool {
-    if target == Type::Error || value == Type::Error {
+/// 完全一致に加え、`REAL := INTEGER`の暗黙昇格、および任意の`Type::Pointer`
+/// への`NIL`の代入を許可する。どちらかが`Type::Error`の場合はカスケード
+/// エラー防止のため許可扱いにする。
+fn assignment_compatible(target: &Type, value: &Type) -> bool {
+    if *target == Type::Error || *value == Type::Error {
         return true;
     }
-    target == value || (target == Type::Real && value == Type::Integer)
+    target == value
+        || (*target == Type::Real && *value == Type::Integer)
+        || (matches!(target, Type::Pointer(_)) && *value == Type::Nil)
+}
+
+/// 添字式がコンパイル時定数の`INTEGER`リテラルとして評価できる場合に
+/// その値を返す。今回のスコープでは配列添字の範囲チェックの対象を
+/// 「明らかなリテラル添字」に限定するため（タスク文書参照:
+/// 「範囲チェックは今回はコンパイル時定数に対してのみ行う」）、
+/// リテラル・単項`-`を付けたリテラル・括弧で囲んだものだけを対象にする
+/// （変数を含む式は`None`を返し、範囲チェックの対象外になる）。
+fn const_eval_int(expr: &ast::Expr) -> Option<i64> {
+    match expr {
+        ast::Expr::IntLiteral(v, _) => Some(*v),
+        ast::Expr::HexIntLiteral(v, _) => Some(*v),
+        ast::Expr::UnaryOp {
+            op: ast::UnOp::Neg,
+            operand,
+            ..
+        } => const_eval_int(operand).map(|v| -v),
+        ast::Expr::Paren(inner, _) => const_eval_int(inner),
+        _ => None,
+    }
 }
 
 fn bin_op_symbol(op: ast::BinOp) -> &'static str {
@@ -2243,5 +2796,536 @@ mod tests {
         "#;
         let diags = check(src);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // ==================================================================
+    // 配列型・レコード型・ポインタ型（Step 9）
+    // ==================================================================
+
+    // ---- 配列型 ----
+
+    #[test]
+    fn well_typed_array_declaration_and_element_access_has_no_diagnostics() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; x: INTEGER; \
+             BEGIN a[1] := 42; x := a[2] END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn array_index_must_be_integer() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; b: BOOLEAN; \
+             BEGIN a[TRUE] := 1 END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("array index must be of type INTEGER"));
+    }
+
+    #[test]
+    fn array_element_type_mismatch_is_reported() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[1] := TRUE END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    #[test]
+    fn indexing_a_non_array_type_is_an_error() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x[1] := 1 END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("cannot index into non-array type"));
+    }
+
+    /// コンパイル時定数のリテラル添字に対する範囲チェック
+    /// （タスク文書: 「範囲チェックは今回はコンパイル時定数に対してのみ行う」）。
+    #[test]
+    fn literal_out_of_bounds_array_index_is_reported() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[20] := 1 END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("out of bounds"));
+    }
+
+    /// 変数を添字に使う場合は、コンパイル時定数ではないため範囲チェックの
+    /// 対象外（実行時範囲チェックは今回のスコープ外。タスク文書参照）。
+    #[test]
+    fn non_constant_array_index_is_not_range_checked() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; i: INTEGER; \
+             BEGIN i := 999; a[i] := 1 END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn multi_dimensional_array_element_access_is_well_typed() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..10, 1..10] OF INTEGER; x: INTEGER; \
+             BEGIN a[1, 2] := 5; x := a[3, 4] END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 同じ次元・要素型・添字範囲を持つ配列同士は構造的に同じ型とみなされ、
+    /// 代入可能であること（タスク文書: 配列は構造的型付け）。
+    #[test]
+    fn structurally_identical_array_types_are_assignment_compatible() {
+        let diags = check(
+            "PROGRAM Foo; VAR a, b: ARRAY [1..5] OF INTEGER; BEGIN a := b END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn array_types_with_different_bounds_are_not_assignment_compatible() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: ARRAY [1..5] OF INTEGER; b: ARRAY [1..6] OF INTEGER; \
+             BEGIN a := b END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    // ---- レコード型 ----
+
+    #[test]
+    fn well_typed_record_declaration_and_field_access_has_no_diagnostics() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Point = RECORD x, y: INTEGER END;
+            VAR
+                p: Point;
+                n: INTEGER;
+            BEGIN
+                p.x := 1;
+                p.y := 2;
+                n := p.x + p.y
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn accessing_an_undeclared_field_is_an_error() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Point = RECORD x, y: INTEGER END;
+            VAR
+                p: Point;
+            BEGIN
+                p.z := 1
+            END.
+        "#;
+        let diags = check(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("no field 'z'"));
+    }
+
+    #[test]
+    fn accessing_a_field_of_a_non_record_type_is_an_error() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x.field := 1 END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("cannot access field of non-record type"));
+    }
+
+    #[test]
+    fn duplicate_field_name_in_a_record_is_an_error() {
+        let diags = check("PROGRAM Foo; TYPE R = RECORD a: INTEGER; a: BOOLEAN END; BEGIN END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("already declared"));
+    }
+
+    /// 「同じ型宣言に由来するレコードのみ代入可能」という名前的型付けの
+    /// ルール（タスク文書参照）: 同じ`TYPE`宣言由来のレコード同士は
+    /// 代入可能。
+    #[test]
+    fn records_from_the_same_type_declaration_are_assignment_compatible() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE Point = RECORD x, y: INTEGER END;
+            VAR a, b: Point;
+            BEGIN a := b END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 別々の`TYPE`宣言由来のレコードは、たとえフィールド構成が同一でも
+    /// 代入できない（名前的型付け）。
+    #[test]
+    fn records_from_different_type_declarations_are_not_assignment_compatible() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                PointA = RECORD x, y: INTEGER END;
+                PointB = RECORD x, y: INTEGER END;
+            VAR a: PointA; b: PointB;
+            BEGIN a := b END.
+        "#;
+        let diags = check(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    /// `TYPE`宣言を経ない無名`RECORD`（`VAR`に直接書かれたもの）は、
+    /// たとえ書かれた場所が異なっていても、それぞれ別の型として扱われる
+    /// （`crate::typeck::SemaContext::resolve_record_type`のドキュメント参照）。
+    #[test]
+    fn anonymous_record_var_decls_are_each_their_own_type() {
+        let diags = check(
+            "PROGRAM Foo; VAR a: RECORD x: INTEGER END; b: RECORD x: INTEGER END; \
+             BEGIN a := b END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    // ---- ポインタ型 ----
+
+    #[test]
+    fn well_typed_pointer_declaration_and_deref_has_no_diagnostics() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Node = RECORD value: INTEGER END;
+                PNode = ^Node;
+            VAR
+                p: PNode;
+                n: INTEGER;
+            BEGIN
+                NEW(p);
+                p^.value := 1;
+                n := p^.value;
+                DISPOSE(p)
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 前方参照を含む再帰的レコード定義（連結リスト的な構造）が解決できる
+    /// こと（タスク文書の主要な検証項目）。
+    #[test]
+    fn forward_referenced_recursive_record_via_pointer_is_well_typed() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                PNode = ^Node;
+                Node = RECORD
+                    value: INTEGER;
+                    next: PNode
+                END;
+            VAR
+                head, cur: PNode;
+            BEGIN
+                head := NIL;
+                NEW(head);
+                head^.value := 1;
+                head^.next := NIL;
+                cur := head^.next;
+                IF cur = NIL THEN
+                    head^.value := 2
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 直接の自己参照（`PNode`のような別名を経由しない`^Node`）も解決できる。
+    #[test]
+    fn directly_self_referential_record_via_pointer_is_well_typed() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Node = RECORD
+                    value: INTEGER;
+                    next: ^Node
+                END;
+            VAR
+                head: ^Node;
+            BEGIN
+                head := NIL
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn dereferencing_a_non_pointer_type_is_an_error() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x^ := 1 END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("cannot dereference non-pointer type"));
+    }
+
+    #[test]
+    fn dereferencing_nil_directly_is_an_error() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x := NIL^ END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("cannot dereference NIL"));
+    }
+
+    #[test]
+    fn new_and_dispose_require_a_pointer_argument() {
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN NEW(x) END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("expects a pointer-typed argument"));
+
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN DISPOSE(x) END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("expects a pointer-typed argument"));
+    }
+
+    #[test]
+    fn new_with_wrong_argument_count_is_an_error() {
+        let diags = check("PROGRAM Foo; VAR p: ^INTEGER; BEGIN NEW(p, p) END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("expects 1 argument"));
+    }
+
+    #[test]
+    fn nil_is_comparable_to_any_pointer_type() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR p: ^INTEGER; q: ^BOOLEAN; b: BOOLEAN;
+            BEGIN
+                b := p = NIL;
+                b := NIL <> p;
+                b := q = NIL
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn pointers_of_the_same_type_are_comparable() {
+        let diags = check(
+            "PROGRAM Foo; VAR p, q: ^INTEGER; b: BOOLEAN; BEGIN b := p = q END.",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 異なる指す先の型を持つポインタ同士は比較できない
+    /// （タスク文書: 「同じ指す先の型のポインタ同士のみ代入可能」という
+    /// ルールを比較にも一貫して適用する）。
+    #[test]
+    fn pointers_of_different_pointee_types_are_not_comparable() {
+        let diags = check(
+            "PROGRAM Foo; VAR p: ^INTEGER; q: ^BOOLEAN; b: BOOLEAN; BEGIN b := p = q END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    /// ポインタ型は`<`のような順序比較の対象にはならない
+    /// （ISO 7185はポインタの大小比較を定義しない）。
+    #[test]
+    fn pointers_do_not_support_ordering_comparisons() {
+        let diags = check(
+            "PROGRAM Foo; VAR p, q: ^INTEGER; b: BOOLEAN; BEGIN b := p < q END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    #[test]
+    fn nil_is_assignable_to_any_pointer_type() {
+        let diags = check("PROGRAM Foo; VAR p: ^INTEGER; BEGIN p := NIL END.");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn assigning_pointer_of_different_pointee_type_is_an_error() {
+        let diags = check(
+            "PROGRAM Foo; VAR p: ^INTEGER; q: ^BOOLEAN; BEGIN p := q END.",
+        );
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Type mismatch"));
+    }
+
+    #[test]
+    fn passing_a_dereferenced_pointer_as_a_var_argument_is_allowed() {
+        let src = r#"
+            PROGRAM Foo;
+            VAR p: ^INTEGER;
+
+            PROCEDURE Bump(VAR n: INTEGER);
+            BEGIN
+                n := n + 1
+            END;
+
+            BEGIN
+                NEW(p);
+                p^ := 1;
+                Bump(p^)
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // ---- 未知の型名 ----
+
+    #[test]
+    fn referencing_an_undeclared_type_name_is_an_error() {
+        let diags = check("PROGRAM Foo; VAR x: NoSuchType; BEGIN END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("Unknown type 'NoSuchType'"));
+    }
+
+    #[test]
+    fn duplicate_type_declaration_is_an_error() {
+        let diags = check("PROGRAM Foo; TYPE T = INTEGER; T = BOOLEAN; BEGIN END.");
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
+        assert!(errs[0].message.contains("already declared"));
+    }
+
+    // ---- 複合ケース ----
+
+    /// レコードの配列。
+    #[test]
+    fn array_of_records_is_well_typed() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Point = RECORD x, y: INTEGER END;
+                Points = ARRAY [1..10] OF Point;
+            VAR
+                pts: Points;
+                n: INTEGER;
+            BEGIN
+                pts[1].x := 1;
+                pts[1].y := 2;
+                n := pts[1].x + pts[1].y
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// 配列を含むレコード。
+    #[test]
+    fn record_containing_an_array_field_is_well_typed() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Buffer = RECORD
+                    data: ARRAY [1..10] OF INTEGER;
+                    len: INTEGER
+                END;
+            VAR
+                buf: Buffer;
+                x: INTEGER;
+            BEGIN
+                buf.len := 0;
+                buf.data[1] := 42;
+                x := buf.data[1]
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// レコードへのポインタの配列（連結リストのノードへのポインタを
+    /// 複数持つような構造を単純化した形）。
+    #[test]
+    fn array_of_pointers_to_records_is_well_typed() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Node = RECORD value: INTEGER END;
+                PNode = ^Node;
+                PNodeArray = ARRAY [1..5] OF PNode;
+            VAR
+                nodes: PNodeArray;
+                i: INTEGER;
+            BEGIN
+                FOR i := 1 TO 5 DO
+                    nodes[i] := NIL;
+                NEW(nodes[1]);
+                nodes[1]^.value := 10
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// レコードのフィールドがポインタで、そのポインタが指す先がまた
+    /// レコードの配列を含む、というやや深い組み合わせ。
+    #[test]
+    fn deeply_nested_record_array_pointer_combination_is_well_typed() {
+        let src = r#"
+            PROGRAM Foo;
+            TYPE
+                Row = ARRAY [1..3] OF INTEGER;
+                Grid = RECORD
+                    rows: ARRAY [1..3] OF Row;
+                    width, height: INTEGER
+                END;
+                PGrid = ^Grid;
+            VAR
+                g: PGrid;
+                v: INTEGER;
+            BEGIN
+                NEW(g);
+                g^.width := 3;
+                g^.height := 3;
+                g^.rows[1][2] := 7;
+                v := g^.rows[1][2]
+            END.
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // ---- UNIT（前方参照はINTERFACE部のTYPEセクションでも解決できること）----
+
+    #[test]
+    fn unit_interface_type_section_supports_forward_referenced_records() {
+        let src = r#"
+            UNIT ListUnit;
+            INTERFACE
+            TYPE
+                PNode = ^Node;
+                Node = RECORD
+                    value: INTEGER;
+                    next: PNode
+                END;
+            VAR
+                head: PNode;
+            IMPLEMENTATION
+            END.
+        "#;
+        let diags = check_unit_with_dialect(src, Dialect::Ucsd);
+        let errs = errors(&diags);
+        assert!(errs.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

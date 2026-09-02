@@ -12,8 +12,9 @@ pub mod span;
 pub mod stmt;
 
 pub use decl::{
-    CompilationUnit, ConstDecl, FuncDecl, FuncSignature, ImplementationSection, InterfaceSection,
-    ParamDecl, ProcDecl, ProcSignature, Program, TypeExpr, Unit, VarDecl,
+    CompilationUnit, ConstDecl, FieldDecl, FuncDecl, FuncSignature, ImplementationSection,
+    InterfaceSection, ParamDecl, ProcDecl, ProcSignature, Program, TypeDecl, TypeExpr, Unit,
+    VarDecl,
 };
 pub use diagnostic::{Diagnostic, Severity};
 pub use dialect::Dialect;
