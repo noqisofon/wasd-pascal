@@ -71,3 +71,29 @@ pub const BUILTIN_WRITELN_BOOL: u8 = 2;
 /// 引数なし`WriteLn`（改行のみ出力）に対応する、wasd-pcode独自の簡易
 /// procedure番号。[`BUILTIN_WRITELN_INT`]と同様UNCONFIRMED。
 pub const BUILTIN_WRITELN_NONE: u8 = 3;
+
+/// `WriteLn(文字列リテラル)`に対応する、wasd-pcode独自の簡易procedure番号。
+/// [`BUILTIN_WRITELN_INT`]と同様UNCONFIRMED。
+///
+/// # 文字列定数の扱い: Constant Poolを模した`string_pool`
+///
+/// Internal Architecture Guide, Section II.2.1.4 "The Constant Pool"に
+/// よれば、1ワードに収まらない定数（文字列を含む）はp-codeの命令列とは
+/// 別の「Constant Pool」領域に格納され、`LCO`（Load Constant Offset）
+/// 命令でそこへのオフセットを指定して参照する。この呼び出し（
+/// `WriteLn('...')`）でも同じ発想を借り、文字列定数は命令列に埋め込まず
+/// [`crate::ir::PCodeModule::string_pool`]という別テーブルに集約する。
+///
+/// ただし本クレートは`LCO`の正確なエンコーディング（オフセットの単位が
+/// バイトかワードか、Constant Pool自体のバイナリレイアウト等）を一次資料
+/// から完全には確認できていないため、それを再現することはしない。実際に
+/// 使うのは「文字列を`string_pool`に追加してインデックス（`usize`）を得て、
+/// そのインデックスをスタックへ積む（本クレートは`LDC`命令をそのまま
+/// 転用する。他に専用の即値ロード命令を持たないため）」という、
+/// **コンパイラ（本クレート）とVM（`pmachine-core`）の間だけで通用する
+/// 自前の簡略化されたプロトコル**である。「スタック上のこの値は
+/// 文字列プールへのインデックスである」という意味づけ自体は命令からは
+/// 読み取れず、`BUILTIN_WRITELN_STRING`という呼び出し先の番号だけが
+/// それを暗黙に約束している点に注意（[`crate::codegen::CodeGenerator::gen_writeln_call`]
+/// 参照）。
+pub const BUILTIN_WRITELN_STRING: u8 = 4;

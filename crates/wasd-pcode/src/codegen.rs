@@ -6,8 +6,11 @@
 //! 論理演算（`AND OR NOT`）、代入文、`IF`/`WHILE`/`REPEAT UNTIL`/`FOR`に
 //! よる制御構造、`BEGIN...END`の複合文、`PROGRAM ... BEGIN ... END.`
 //! 全体構造、`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の呼び出し、
-//! および組み込み手続き`WriteLn`（引数0個または1個、`INTEGER`/`BOOLEAN`の
-//! みサポート。[`CodeGenerator::gen_writeln_call`]参照）を扱う。
+//! および組み込み手続き`WriteLn`（引数0個または1個。`INTEGER`/`BOOLEAN`
+//! に加え、Step 15から文字列リテラルの直接渡し（`WriteLn('...')`）も
+//! サポート。[`CodeGenerator::gen_writeln_call`]参照）を扱う。文字列リテラルは
+//! `WriteLn`への直接渡し以外の文脈では引き続きスコープ外（意味解析
+//! （`wasd-sema`）の段階で型エラーになるため、本クレートまで到達しない）。
 //!
 //! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、`WriteLn`
 //! 以外の組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数
@@ -114,7 +117,8 @@ use wasd_ast::{
 };
 
 use crate::builtin::{
-    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
+    KERNEL_SEGMENT,
 };
 use crate::ir::{Instruction, PCodeModule, RoutineMeta};
 use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};
@@ -255,6 +259,11 @@ pub struct CodeGenerator {
     pending_calls: HashMap<String, Vec<PendingJump>>,
     /// `PROCEDURE`/`FUNCTION`本体を生成中の場合のみ`Some`。
     current_scope: Option<LocalScope>,
+    /// 文字列定数プール。`WriteLn('...')`が積む文字列リテラルをここへ
+    /// 追加し、そのインデックスを命令列から参照する
+    /// （[`Self::gen_writeln_call`]、[`crate::ir::PCodeModule::string_pool`]
+    /// のドキュメント参照）。
+    string_pool: Vec<String>,
 }
 
 fn normalize(name: &str) -> String {
@@ -277,6 +286,7 @@ impl CodeGenerator {
         self.routines.clear();
         self.pending_calls.clear();
         self.current_scope = None;
+        self.string_pool.clear();
 
         if !program.uses.is_empty() {
             self.error(
@@ -328,6 +338,7 @@ impl CodeGenerator {
                 global_data_words: self.next_address,
                 routines,
                 entry,
+                string_pool: std::mem::take(&mut self.string_pool),
             })
         } else {
             Err(std::mem::take(&mut self.diagnostics))
@@ -1053,11 +1064,16 @@ impl CodeGenerator {
     ///
     /// - 引数なし（`WriteLn`）: 値を積まずに`BUILTIN_WRITELN_NONE`を呼ぶ
     ///   （改行のみ出力）。
-    /// - 引数1つ（`WriteLn(expr)`）: `expr`を評価してスタックへ積み、
-    ///   その式の種類（[`Self::infer_expr_kind`]）に応じて
+    /// - 引数1つが文字列リテラル（`WriteLn('...')`）: `expr`自体を評価する
+    ///   のではなく、文字列を[`Self::string_pool`]へ追加してそのインデックス
+    ///   を（[`Self::emit_ldc_int`]で、簡略化した自前のプロトコルとして）
+    ///   スタックへ積み、`BUILTIN_WRITELN_STRING`を呼ぶ（
+    ///   [`crate::builtin::BUILTIN_WRITELN_STRING`]のドキュメント参照）。
+    /// - 引数1つ（文字列リテラル以外の`WriteLn(expr)`）: `expr`を評価して
+    ///   スタックへ積み、その式の種類（[`Self::infer_expr_kind`]）に応じて
     ///   `BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`のいずれかを呼ぶ。
-    ///   `INTEGER`/`BOOLEAN`以外（`REAL`/`STRING`等、今回のスコープ外）と
-    ///   推論された場合はエラーを報告する。
+    ///   `INTEGER`/`BOOLEAN`以外（`REAL`等、今回のスコープ外）と推論された
+    ///   場合はエラーを報告する。
     /// - 引数2つ以上: 今回のスコープ外としてエラーを報告する
     ///   （タスク依頼: 「複数引数`WriteLn(a, b, c)`は今回はサポートしなくて
     ///   よい」）。
@@ -1066,6 +1082,14 @@ impl CodeGenerator {
             [] => {
                 self.emit(
                     ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_NONE).into(),
+                    span,
+                );
+            }
+            [Expr::StringLiteral(value, str_span)] => {
+                let index = self.intern_string(value.clone());
+                self.emit_ldc_int(index as i64, *str_span);
+                self.emit(
+                    ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRING).into(),
                     span,
                 );
             }
@@ -1078,8 +1102,8 @@ impl CodeGenerator {
                     None => {
                         self.error(
                             arg.span(),
-                            "WriteLn only supports INTEGER/BOOLEAN arguments in this step's \
-                             minimal codegen",
+                            "WriteLn only supports INTEGER/BOOLEAN/string literal arguments in \
+                             this step's minimal codegen",
                         );
                         BUILTIN_WRITELN_INT
                     }
@@ -1097,6 +1121,14 @@ impl CodeGenerator {
                 }
             }
         }
+    }
+
+    /// 文字列を[`Self::string_pool`]へ追加し、そのインデックスを返す
+    /// （同じ文字列が複数回現れても重複排除はしない。単純な追記のみ）。
+    fn intern_string(&mut self, value: String) -> usize {
+        let index = self.string_pool.len();
+        self.string_pool.push(value);
+        index
     }
 
     /// 式の「種類」（[`ValueKind`]）を推論する。`WriteLn(expr)`が

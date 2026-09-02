@@ -2,8 +2,9 @@
 //! `pmachine-core`で実際に実行するところまでを一気通貫で行う。
 //!
 //! `wasdc run <file>`（`wasd-cli`）から使われる。Step 14から`WriteLn`
-//! （INTEGER/BOOLEAN・0/1引数のみ。`crates/wasd-pcode/src/codegen.rs`の
-//! `gen_writeln_call`のドキュメント参照）は実際に標準出力へ書き込まれる
+//! （INTEGER/BOOLEAN・0/1引数のみ）、Step 15から文字列リテラルも
+//! （`crates/wasd-pcode/src/codegen.rs`の`gen_writeln_call`のドキュメント
+//! 参照）実際に標準出力へ書き込まれる
 //! （`pmachine_core::PMachine::new`が標準出力へ直結する簡易実装のため）。
 //! `WriteLn`以外の組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）は
 //! 引き続きスコープ外。実行結果（`WriteLn`の出力とは別に）グローバル変数の

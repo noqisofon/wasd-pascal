@@ -20,6 +20,11 @@ fn wasdc() -> Command {
     Command::cargo_bin("wasdc").expect("wasdc binary should build")
 }
 
+/// Step 15: `hello.pas`（`WriteLn('Hello, world!')`を含む）は、dialectを
+/// 問わず意味解析上の警告もエラーも出さずに`check`が成功すること
+/// （以前は多文字の文字列リテラルに対して`Severity::Warning`を出していた
+/// が、その暫定処理は撤廃した。`crates/wasd-sema/src/typeck.rs`の
+/// `infer_string_literal_type`ドキュメント参照）。
 #[test]
 fn check_succeeds_on_a_valid_program() {
     wasdc()
@@ -27,7 +32,8 @@ fn check_succeeds_on_a_valid_program() {
         .arg(example("hello.pas"))
         .assert()
         .success()
-        .stdout(predicate::str::contains("warning:"));
+        .stdout(predicate::str::contains("OK: no errors found"))
+        .stdout(predicate::str::contains("warning:").not());
 }
 
 #[test]
@@ -123,11 +129,15 @@ fn compile_emits_pcode_for_a_program_with_procedures_and_functions() {
         .stdout(predicate::str::contains("RPU"));
 }
 
+/// Step 15: `hello.pas`は文字列リテラルを`WriteLn`へ直接渡すだけなので
+/// もはや"out of scope"の例として使えない（`check_succeeds_on_a_valid_program`
+/// 参照）。`pcode_unsupported.pas`（配列型の`VAR`宣言。意味解析は通るが
+/// `wasd-pcode`のスコープ外）に差し替える。
 #[test]
 fn compile_reports_out_of_scope_constructs_without_panicking() {
     wasdc()
         .arg("compile")
-        .arg(example("hello.pas"))
+        .arg(example("pcode_unsupported.pas"))
         .arg("--emit-pcode")
         .assert()
         .failure()
@@ -159,6 +169,19 @@ fn run_executes_procedures_and_functions_including_recursion_and_var_params() {
         .stdout(predicate::str::contains("[0] = 121"));
 }
 
+/// Step 15のゴール: `wasdc run examples/hello.pas`が実際に
+/// `Hello, world!`と出力すること。
+#[test]
+fn run_executes_hello_and_prints_hello_world() {
+    wasdc()
+        .arg("run")
+        .arg(example("hello.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hello, world!\n42\n"))
+        .stdout(predicate::str::contains("OK: program ran to completion"));
+}
+
 #[test]
 fn run_executes_writeln_demo_and_prints_output() {
     wasdc()
@@ -170,11 +193,13 @@ fn run_executes_writeln_demo_and_prints_output() {
         .stdout(predicate::str::contains("OK: program ran to completion"));
 }
 
+/// Step 15: `compile_reports_out_of_scope_constructs_without_panicking`と
+/// 同じ理由で`hello.pas`から`pcode_unsupported.pas`に差し替える。
 #[test]
 fn run_reports_out_of_scope_constructs_without_panicking() {
     wasdc()
         .arg("run")
-        .arg(example("hello.pas"))
+        .arg(example("pcode_unsupported.pas"))
         .assert()
         .failure()
         .code(1)

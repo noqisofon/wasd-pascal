@@ -98,9 +98,10 @@ fn compile_to_pcode_generates_a_module_for_a_program_with_procedures_and_functio
     );
 }
 
-/// `WriteLn`はStep 14からINTEGER/BOOLEAN・0/1引数のみ実際に動作する
-/// （`crates/wasd-pcode/src/codegen.rs`の`gen_writeln_call`のドキュメント
-/// 参照）。それ以外（`CASE`文等）は引き続きこのクレートのスコープ外。
+/// `WriteLn`はStep 14からINTEGER/BOOLEAN、Step 15から文字列リテラルの
+/// 0/1引数のみ実際に動作する（`crates/wasd-pcode/src/codegen.rs`の
+/// `gen_writeln_call`のドキュメント参照）。それ以外（`CASE`文等）は
+/// 引き続きこのクレートのスコープ外。
 #[test]
 fn compile_to_pcode_reports_out_of_scope_constructs_without_generating_pcode() {
     let source = r#"
