@@ -1,14 +1,19 @@
 //! `wasdc` — WASD Pascalコマンドラインコンパイラ。
 //!
-//! 今回のスコープはレキサ〜意味解析までの診断表示とAST確認まで
-//! （`wasd-pcode`が無いため、実際にコード生成する`build`のような
-//! サブコマンドはまだ実装しない）。
+//! レキサ〜意味解析までの診断表示とAST確認（`check`/`parse`）に加え、
+//! `compile --emit-pcode`でp-code（`wasd-pcode`）のテキスト表現
+//! （逆アセンブリ的なニーモニック表示）を確認できる。ただし今回の
+//! p-code生成は最小スコープ（`INTEGER`/`BOOLEAN`、制御構造、代入文のみ）
+//! であり、実際にApple II p-System上で実行可能なバイナリを生成する
+//! `build`のようなサブコマンドはまだ実装しない。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use wasd_driver::{compile, locate, CompileOptions, Diagnostic, Dialect, Severity};
+use wasd_driver::{
+    compile, compile_to_pcode, locate, CompileOptions, Diagnostic, Dialect, Severity,
+};
 
 /// UCSD Pascal風のPascal処理系 `wasdc`。
 #[derive(Parser, Debug)]
@@ -36,6 +41,17 @@ enum Command {
         /// パース結果のASTをデバッグ出力する。
         #[arg(long)]
         emit_ast: bool,
+    },
+    /// レキサ〜semaまで実行し、成功すればp-codeを生成する。
+    Compile {
+        file: PathBuf,
+        /// 使用するdialect。デフォルトはISO 7185準拠の標準Pascal。
+        #[arg(long = "std", value_enum, default_value_t = DialectArg::Iso7185)]
+        std: DialectArg,
+        /// 生成したp-codeのテキスト表現（逆アセンブリ的なニーモニック
+        /// 表示）を標準出力へ表示する。
+        #[arg(long)]
+        emit_pcode: bool,
     },
 }
 
@@ -68,6 +84,11 @@ fn main() -> ExitCode {
             std,
             emit_ast,
         } => run_parse(&file, std.into(), emit_ast),
+        Command::Compile {
+            file,
+            std,
+            emit_pcode,
+        } => run_compile(&file, std.into(), emit_pcode),
     }
 }
 
@@ -109,6 +130,28 @@ fn run_parse(file: &Path, dialect: Dialect, emit_ast: bool) -> ExitCode {
             println!("{unit:#?}");
         } else {
             println!("<no AST: parsing failed completely>");
+        }
+    }
+
+    exit_code_for(&result.diagnostics)
+}
+
+fn run_compile(file: &Path, dialect: Dialect, emit_pcode: bool) -> ExitCode {
+    let source = match read_source(file) {
+        Ok(source) => source,
+        Err(code) => return code,
+    };
+
+    let options = CompileOptions::new(dialect).with_source_path(file.to_path_buf());
+    let result = compile_to_pcode(&source, &options);
+
+    print_diagnostics(&source, file, &result.diagnostics);
+
+    if emit_pcode {
+        if let Some(pcode) = &result.pcode {
+            print!("{pcode}");
+        } else {
+            println!("<no p-code: compilation failed or produced no PROGRAM to generate from>");
         }
     }
 

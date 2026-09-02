@@ -1003,6 +1003,8 @@ name = "wasd-pcode"
 version = "0.1.0"
 dependencies = [
  "wasd-ast",
+ "wasd-lexer",
+ "wasd-parser",
  "wasd-sema",
 ]
 

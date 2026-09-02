@@ -3,7 +3,7 @@
 //! `wasd-driver`の公開APIのみを通して、レキサ→パーサー→意味解析の
 //! パイプライン全体（正常系・型エラー・dialectエラー）を検証する。
 
-use wasd_driver::{compile, CompileOptions, Dialect, Severity};
+use wasd_driver::{compile, compile_to_pcode, CompileOptions, Dialect, Severity};
 
 #[test]
 fn compiles_a_valid_program_end_to_end() {
@@ -26,6 +26,51 @@ fn compiles_a_valid_program_end_to_end() {
         "expected no diagnostics, got {:?}",
         result.diagnostics
     );
+}
+
+#[test]
+fn compile_to_pcode_generates_a_module_for_a_minimal_scope_program() {
+    let source = r#"
+        PROGRAM Sum;
+        VAR
+            total: INTEGER;
+        BEGIN
+            total := 0;
+            IF total = 0 THEN
+                total := 1
+        END.
+    "#;
+
+    let result = compile_to_pcode(source, &CompileOptions::default());
+
+    assert!(
+        result.diagnostics.is_empty(),
+        "expected no diagnostics, got {:?}",
+        result.diagnostics
+    );
+    let pcode = result.pcode.expect("pcode should have been generated");
+    assert!(!pcode.instructions.is_empty());
+}
+
+#[test]
+fn compile_to_pcode_reports_out_of_scope_constructs_without_generating_pcode() {
+    let source = r#"
+        PROGRAM UsesWriteLn;
+        VAR
+            answer: INTEGER;
+        BEGIN
+            answer := 42;
+            WriteLn(answer)
+        END.
+    "#;
+
+    let result = compile_to_pcode(source, &CompileOptions::default());
+
+    assert!(result.pcode.is_none());
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error));
 }
 
 #[test]

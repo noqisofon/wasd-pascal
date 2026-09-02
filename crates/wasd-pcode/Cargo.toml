@@ -9,3 +9,7 @@ description = "p-code (IR) generation for WASD Pascal."
 [dependencies]
 wasd-ast.workspace = true
 wasd-sema.workspace = true
+
+[dev-dependencies]
+wasd-lexer.workspace = true
+wasd-parser.workspace = true

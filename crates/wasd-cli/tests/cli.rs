@@ -88,6 +88,42 @@ fn parse_without_emit_ast_only_prints_diagnostics() {
 }
 
 #[test]
+fn compile_emits_pcode_for_a_minimal_scope_program() {
+    wasdc()
+        .arg("compile")
+        .arg(example("pcode_minimal.pas"))
+        .arg("--emit-pcode")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK: no errors found"))
+        .stdout(predicate::str::contains("STP"));
+}
+
+#[test]
+fn compile_without_emit_pcode_only_prints_diagnostics() {
+    wasdc()
+        .arg("compile")
+        .arg(example("pcode_minimal.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK: no errors found"))
+        .stdout(predicate::str::contains("STP").not());
+}
+
+#[test]
+fn compile_reports_out_of_scope_constructs_without_panicking() {
+    wasdc()
+        .arg("compile")
+        .arg(example("hello.pas"))
+        .arg("--emit-pcode")
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("out of scope"))
+        .stdout(predicate::str::contains("<no p-code:"));
+}
+
+#[test]
 fn missing_file_exits_with_io_error_code() {
     wasdc()
         .arg("check")
