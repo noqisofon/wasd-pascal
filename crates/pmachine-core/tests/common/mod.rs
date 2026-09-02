@@ -2,6 +2,9 @@
 //! `crates/wasd-pcode/tests/codegen.rs`と同様、レキサ→パーサー→p-code生成
 //! のみを通す（意味解析エラーの検証はこのクレートの関心事ではない）。
 
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
 use wasd_ast::Program;
 use wasd_lexer::Lexer;
 use wasd_parser::Parser;
@@ -28,4 +31,35 @@ pub fn compile(source: &str) -> PCodeModule {
     CodeGenerator::new()
         .generate(&program)
         .expect("codegen should succeed")
+}
+
+/// `PMachine::with_output`へ渡せる、キャプチャ可能な`Write`実装。
+/// `Arc<Mutex<Vec<u8>>>`を介して`PMachine`実行後もバッファの内容を読める
+/// （`PMachine`自体は出力先を所有してしまう`Box<dyn Write>`として受け取る
+/// ため、`PMachine`の外からも中身を覗けるようにこの`Arc`越しの共有にして
+/// ある。`WriteLn`の出力をテストで検証するために使う）。
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct CapturedOutput(Arc<Mutex<Vec<u8>>>);
+
+#[allow(dead_code)]
+impl CapturedOutput {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// これまでに書き込まれた内容をUTF-8文字列として返す。
+    pub fn as_string(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).expect("output should be valid UTF-8")
+    }
+}
+
+impl Write for CapturedOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

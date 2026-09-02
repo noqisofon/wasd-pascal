@@ -304,3 +304,114 @@ fn nested_control_structures_execute_correctly() {
     vm.run().expect("program should run without error");
     assert_eq!(vm.global(0), Some(0));
 }
+
+/// Step 14, テスト方針1: `WriteLn(整数式)`が正しい値を出力すること。
+#[test]
+fn writeln_prints_an_integer_value() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR x: INTEGER;
+        BEGIN
+            x := 42;
+            WriteLn(x)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "42\n");
+}
+
+/// テスト方針2: `WriteLn(Boolean式)`が`true`/`false`を出力すること。
+#[test]
+fn writeln_prints_a_boolean_value() {
+    for (flag, expected) in [("TRUE", "true\n"), ("FALSE", "false\n")] {
+        let module = common::compile(&format!(
+            r#"
+            PROGRAM P;
+            VAR flag: BOOLEAN;
+            BEGIN
+                flag := {flag};
+                WriteLn(flag)
+            END.
+            "#
+        ));
+
+        let output = common::CapturedOutput::new();
+        let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+        vm.run().expect("program should run without error");
+        assert_eq!(output.as_string(), expected, "flag = {flag}");
+    }
+}
+
+/// テスト方針3: 引数なしの`WriteLn`が改行のみ出力すること。
+#[test]
+fn writeln_with_no_arguments_prints_only_a_newline() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "\n");
+}
+
+/// テスト方針4: 複数回の`WriteLn`呼び出しが順序通り出力されること。
+#[test]
+fn multiple_writeln_calls_print_in_order() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn(1);
+            WriteLn(2);
+            WriteLn(3)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "1\n2\n3\n");
+}
+
+/// テスト方針5: `PROCEDURE`内から`WriteLn`を呼び出しても正しく動作し、
+/// `CXG`が`CPG`/`RPU`と混在しても活性化レコードの整合性が保たれること。
+#[test]
+fn writeln_works_from_inside_a_procedure_body() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR result: INTEGER;
+
+        PROCEDURE ShowDouble(n: INTEGER);
+        VAR doubled: INTEGER;
+        BEGIN
+            doubled := n * 2;
+            WriteLn(doubled)
+        END;
+
+        BEGIN
+            result := 21;
+            ShowDouble(result);
+            WriteLn(result)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "42\n21\n");
+    assert_eq!(vm.global(0), Some(21));
+}

@@ -16,6 +16,7 @@ use wasd_lexer::Lexer;
 use wasd_parser::Parser;
 use wasd_pcode::{
     Address, CodeAddress, CodeGenerator, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
 };
 
 fn parse_program(source: &str) -> Program {
@@ -99,11 +100,14 @@ fn if_then_else_generates_fjp_and_ujp_with_correctly_patched_targets() {
         vec![
             op(UnconfirmedOp::Lod(Level(0), Address(0))), // x
             op(UnconfirmedOp::Ldc(0)),
-            op(UnconfirmedOp::Grt),
-            op(UnconfirmedOp::Fjp(CodeAddress(7))), // -> else branch (index 7)
+            // `x > 0` = `NOT (x <= 0)` (LEQI + NOT; `>` doesn't exist as an
+            // opcode, `crate::codegen::CodeGenerator::emit_binop`のドキュメント参照)
+            op(UnconfirmedOp::Leq),
+            op(UnconfirmedOp::Not),
+            op(UnconfirmedOp::Fjp(CodeAddress(8))), // -> else branch (index 8)
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Str(Level(0), Address(0))),
-            op(UnconfirmedOp::Ujp(CodeAddress(9))), // -> past else branch (STP)
+            op(UnconfirmedOp::Ujp(CodeAddress(10))), // -> past else branch (STP)
             op(UnconfirmedOp::Ldc(2)),
             op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Stp),
@@ -135,8 +139,9 @@ fn if_then_without_else_only_emits_a_single_forward_jump() {
         vec![
             op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(0)),
-            op(UnconfirmedOp::Grt),
-            op(UnconfirmedOp::Fjp(CodeAddress(6))), // -> STP, right after THEN body
+            op(UnconfirmedOp::Leq), // `x > 0` = NOT (x <= 0)
+            op(UnconfirmedOp::Not),
+            op(UnconfirmedOp::Fjp(CodeAddress(7))), // -> STP, right after THEN body
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Str(Level(0), Address(0))),
             op(UnconfirmedOp::Stp),
@@ -168,8 +173,9 @@ fn while_loop_generates_backward_and_forward_jumps() {
         vec![
             op(UnconfirmedOp::Lod(Level(0), Address(0))), // loop start (index 0)
             op(UnconfirmedOp::Ldc(0)),
-            op(UnconfirmedOp::Grt),
-            op(UnconfirmedOp::Fjp(CodeAddress(9))), // -> STP, past the loop
+            op(UnconfirmedOp::Leq), // `x > 0` = NOT (x <= 0)
+            op(UnconfirmedOp::Not),
+            op(UnconfirmedOp::Fjp(CodeAddress(10))), // -> STP, past the loop
             op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Sbi),
@@ -275,17 +281,19 @@ fn nested_if_inside_while_resolves_labels_independently() {
         vec![
             op(UnconfirmedOp::Lod(Level(0), Address(0))), // outer IF condition (index 0)
             op(UnconfirmedOp::Ldc(0)),
-            op(UnconfirmedOp::Grt),
-            op(UnconfirmedOp::Fjp(CodeAddress(13))), // outer IF -> STP
-            op(UnconfirmedOp::Lod(Level(0), Address(0))), // inner WHILE condition (loop start, index 4)
+            op(UnconfirmedOp::Leq), // `x > 0` = NOT (x <= 0)
+            op(UnconfirmedOp::Not),
+            op(UnconfirmedOp::Fjp(CodeAddress(15))), // outer IF -> STP
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // inner WHILE condition (loop start, index 5)
             op(UnconfirmedOp::Ldc(0)),
-            op(UnconfirmedOp::Grt),
-            op(UnconfirmedOp::Fjp(CodeAddress(13))), // inner WHILE -> STP
+            op(UnconfirmedOp::Leq), // `x > 0` = NOT (x <= 0)
+            op(UnconfirmedOp::Not),
+            op(UnconfirmedOp::Fjp(CodeAddress(15))), // inner WHILE -> STP
             op(UnconfirmedOp::Lod(Level(0), Address(0))),
             op(UnconfirmedOp::Ldc(1)),
             op(UnconfirmedOp::Sbi),
             op(UnconfirmedOp::Str(Level(0), Address(0))),
-            op(UnconfirmedOp::Ujp(CodeAddress(4))), // inner WHILE -> back to loop start
+            op(UnconfirmedOp::Ujp(CodeAddress(5))), // inner WHILE -> back to loop start
             op(UnconfirmedOp::Stp),
         ]
     );
@@ -634,4 +642,142 @@ fn array_typed_variables_are_reported_as_an_error_without_panicking() {
         diagnostics.iter().any(|d| d.message.contains("ARRAY")),
         "diagnostics: {diagnostics:?}"
     );
+}
+
+/// 7. `WriteLn(整数式)`が`CXG <KERNEL_SEGMENT>, <BUILTIN_WRITELN_INT>`を
+///    発行すること（Step 14）。
+#[test]
+fn writeln_with_integer_argument_emits_cxg_writeln_int() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR x: INTEGER;
+        BEGIN
+            x := 42;
+            WriteLn(x)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Ldc(42)),
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_INT)),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `WriteLn(Boolean式)`が`BUILTIN_WRITELN_BOOL`を呼ぶこと。
+#[test]
+fn writeln_with_boolean_argument_emits_cxg_writeln_bool() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR flag: BOOLEAN;
+        BEGIN
+            flag := TRUE;
+            WriteLn(flag)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+    let ops = opcodes(&module);
+
+    assert!(
+        ops.contains(&cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_BOOL))),
+        "expected a WriteLn(BOOLEAN) call, got {ops:?}"
+    );
+}
+
+/// 引数なしの`WriteLn`が`BUILTIN_WRITELN_NONE`を呼ぶこと（改行のみ出力）。
+#[test]
+fn writeln_with_no_arguments_emits_cxg_writeln_none() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        BEGIN
+            WriteLn
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_NONE)),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `WriteLn(a, b)`（複数引数）は今回のスコープ外としてエラー報告される
+/// こと（パニックしない）。
+#[test]
+fn writeln_with_multiple_arguments_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR a, b: INTEGER;
+        BEGIN
+            WriteLn(a, b)
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics =
+        result.expect_err("multi-argument WriteLn must be rejected, not codegen'd");
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("WriteLn")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// 8. `<`/`>`は一次資料に存在しないため、`GEQI`/`LEQI`+`NOT`で合成される
+///    こと（Step 10のUNCONFIRMED解消、Step 14でCONFIRMEDに更新）。
+#[test]
+fn less_than_and_greater_than_are_synthesized_from_geqi_leqi_and_not() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR a, b, x, y: INTEGER;
+        BEGIN
+            IF a < b THEN
+                x := 1;
+            IF a > b THEN
+                y := 1
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+    let ops = opcodes(&module);
+
+    // `a < b` -> GEQI + NOT (in that order, adjacent).
+    let geq_not = ops
+        .windows(2)
+        .any(|w| w == [op(UnconfirmedOp::Geq), op(UnconfirmedOp::Not)]);
+    assert!(geq_not, "expected GEQI immediately followed by NOT for `<`, got {ops:?}");
+    // `a > b` -> LEQI + NOT (in that order, adjacent).
+    let leq_not = ops
+        .windows(2)
+        .any(|w| w == [op(UnconfirmedOp::Leq), op(UnconfirmedOp::Not)]);
+    assert!(leq_not, "expected LEQI immediately followed by NOT for `>`, got {ops:?}");
 }

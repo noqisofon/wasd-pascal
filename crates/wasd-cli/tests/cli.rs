@@ -160,6 +160,17 @@ fn run_executes_procedures_and_functions_including_recursion_and_var_params() {
 }
 
 #[test]
+fn run_executes_writeln_demo_and_prints_output() {
+    wasdc()
+        .arg("run")
+        .arg(example("writeln_demo.pas"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("55\ntrue\n\n"))
+        .stdout(predicate::str::contains("OK: program ran to completion"));
+}
+
+#[test]
 fn run_reports_out_of_scope_constructs_without_panicking() {
     wasdc()
         .arg("run")

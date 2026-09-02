@@ -11,9 +11,9 @@
 //! `wasd_pcode::opcode`モジュール（Step 11/12で実装済み）を確認したところ、
 //! 実際に発行されるオペコードはそれとは異なる、より簡略化されたセット
 //! （[`wasd_pcode::UnconfirmedOp`]の`Ldc`/`Lod`/`Str`/`Lda`/`Ind`/`Sti`/
-//! `Adi`/`Sbi`/`Mpi`/`Dvi`/`Mod`/`Ngi`/`Equ`/`Neq`/`Les`/`Leq`/`Grt`/`Geq`/
+//! `Adi`/`Sbi`/`Mpi`/`Dvi`/`Mod`/`Ngi`/`Equ`/`Neq`/`Leq`/`Geq`/
 //! `And`/`Ior`/`Not`/`Ujp`/`Fjp`/`Stp`、および[`wasd_pcode::ConfirmedOp`]の
-//! `Cpl`/`Cpg`/`Cpi`/`Scpi1`/`Scpi2`/`Rpu`）だった
+//! `Cpl`/`Cpg`/`Cpi`/`Scpi1`/`Scpi2`/`Rpu`/`Cxg`）だった
 //! （`crates/wasd-pcode/src/opcode.rs`のドキュメント参照。特に
 //! `LOD`/`STR`/`LDA`はグローバル用・ローカル用に分かれておらず、レベル差
 //! [`wasd_pcode::Level`]を取る汎用形1本で統一されている）。
@@ -115,6 +115,31 @@
 //! も参照。ただし実機バイナリでの検証ではなく、あくまで本プロジェクトの
 //! 簡略化されたIR・本クレートのインタプリタ実装内での自己無矛盾性の
 //! 検証である点に注意）。
+//!
+//! # Step 14: `WriteLn`向けのKERNELセグメント組み込みエミュレーション
+//!
+//! 一次資料（SofTech Microsystems, *UCSD p-System and UCSD Pascal Version
+//! IV: Internal Architecture Guide*, Section III.1-III.2）によれば、
+//! `WriteLn`/`ReadLn`のような言語レベルのI/O呼び出しはp-machineの専用
+//! オペコードではなく、コンパイラ+OSがKERNELユニット（全コンパイル単位から
+//! `segment 1`として常にアクセス可能）の`UNITWRITE`/`UNITREAD`ルーチン
+//! 呼び出しに変換する、という階層構造になっている（`wasd_pcode::builtin`
+//! モジュールドキュメント参照）。
+//!
+//! 本格的なRSP/IO・BIOS階層の完全再現は本プロジェクトの当面のスコープを
+//! 大きく超えるため、[`PMachine::call_external`]/[`PMachine::call_builtin_kernel`]
+//! は「`CXG`でKERNELセグメントへ呼び出す」という形だけを借りた**意図的な
+//! 簡略化**として実装した: 正式な`UNITWRITE`のパラメータディスクリプタ等は
+//! 一切再現せず、`wasd-pcode`独自の簡易procedure番号
+//! （`BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`/`BUILTIN_WRITELN_NONE`）を
+//! 見て、対応する出力をRustの`Write`実装へ直接書き込むだけの単純な
+//! エミュレーションを行う。KERNEL以外のセグメント（正式なUNIT呼び出し）は
+//! 今回のスコープ外として`RuntimeError::UnimplementedOpcode`を返す。
+//!
+//! テスト可能性のため、[`PMachine`]の出力先は[`PMachine::with_output`]で
+//! 任意の`Box<dyn std::io::Write>`へ差し替え可能にした（[`PMachine::new`]は
+//! 標準出力に固定で書き込む従来の簡易実装のまま）。これはタスク依頼が
+//! 明示的に許可した「テスト可能性のための正当な変更」に該当する。
 
 mod error;
 mod machine;

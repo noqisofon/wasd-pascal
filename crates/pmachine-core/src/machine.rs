@@ -3,8 +3,12 @@
 //! `crates/pmachine-core/src/lib.rs`のモジュールドキュメント参照。
 
 use std::collections::HashMap;
+use std::io::Write;
 
-use wasd_pcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp};
+use wasd_pcode::{
+    Address, CodeAddress, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
+};
 
 use crate::error::RuntimeError;
 
@@ -75,12 +79,27 @@ pub struct PMachine {
     /// グローバルデータ領域のワード数（`stack[0..global_data_words]`）。
     global_data_words: u16,
     halted: bool,
+    /// `WriteLn`のKERNEL組み込みエミュレーション（[`Self::call_builtin_kernel`]）
+    /// が書き込む出力先。`crates/pmachine-core`実装指示の「テスト方針」の
+    /// 「出力先を注入可能にする」に従い、`Box<dyn Write>`として注入可能に
+    /// してある（[`Self::new`]は標準出力へ、[`Self::with_output`]は任意の
+    /// `Write`実装へ書き込む。テストは後者でキャプチャする）。
+    output: Box<dyn Write>,
 }
 
 impl PMachine {
     /// `wasd-pcode`が生成した[`PCodeModule`]を読み込み、実行準備の
     /// 整った状態を作る。グローバルデータ領域はゼロ初期化される。
+    /// `WriteLn`の出力先はホストの標準出力（[`std::io::stdout`]）。
+    /// テスト等で出力をキャプチャしたい場合は[`Self::with_output`]を使う。
     pub fn new(module: PCodeModule) -> Self {
+        Self::with_output(module, Box::new(std::io::stdout()))
+    }
+
+    /// [`Self::new`]と同様だが、`WriteLn`の出力先を任意の[`Write`]実装へ
+    /// 差し替える。テストで出力をキャプチャする際に使う
+    /// （`crates/pmachine-core/tests/interpreter.rs`参照）。
+    pub fn with_output(module: PCodeModule, output: Box<dyn Write>) -> Self {
         let PCodeModule {
             instructions,
             global_data_words,
@@ -101,6 +120,7 @@ impl PMachine {
             routine_table,
             global_data_words,
             halted: false,
+            output,
         }
     }
 
@@ -194,7 +214,69 @@ impl PMachine {
                 self.call(target, static_link)
             }
             ConfirmedOp::Rpu(b) => self.exec_rpu(b),
+            ConfirmedOp::Cxg(segment, proc) => self.call_external(segment, proc),
         }
+    }
+
+    /// `CXG <seg>, <proc>`: 外部セグメント`seg`のプロシージャ`proc`を呼ぶ。
+    ///
+    /// # 簡略化: KERNELセグメント以外は未実装
+    ///
+    /// 本クレートは正式なUNITのp-code生成・実行をサポートしない
+    /// （[`crate`]モジュールドキュメント、`wasd_pcode::opcode::ConfirmedOp::Cxg`
+    /// のドキュメント参照）。`seg`がKERNELセグメント
+    /// （[`wasd_pcode::KERNEL_SEGMENT`]、値は1）の場合のみ組み込み
+    /// エミュレーション（[`Self::call_builtin_kernel`]）へ委譲する。それ以外の
+    /// セグメント番号は未実装として`RuntimeError::UnimplementedOpcode`を返す。
+    fn call_external(&mut self, segment: u8, proc: u8) -> Result<(), RuntimeError> {
+        if segment == KERNEL_SEGMENT {
+            self.call_builtin_kernel(proc)
+        } else {
+            Err(RuntimeError::UnimplementedOpcode(format!(
+                "external segment {segment} is not supported (only the KERNEL segment, {}, is \
+                 emulated)",
+                KERNEL_SEGMENT
+            )))
+        }
+    }
+
+    /// KERNELセグメントの組み込みエミュレーション。
+    ///
+    /// # 簡略化: 正式なRSP/IO（`UNITWRITE`等）の再現ではない
+    ///
+    /// `wasd_pcode::builtin`モジュールドキュメント参照。一次資料が示す
+    /// 正式な`UNITWRITE`呼び出し規約（パラメータディスクリプタ等）は一切
+    /// 再現しない。ここでは`wasd-pcode`が独自に割り当てた簡易procedure番号
+    /// （`BUILTIN_WRITELN_*`）を見て、対応する`WriteLn`の出力動作を
+    /// [`Self::output`]へ直接書き込むだけの単純なエミュレーションを行う。
+    ///
+    /// 通常の`PROCEDURE`/`FUNCTION`呼び出し（`CPL`/`CPG`/`CPI`）とは異なり、
+    /// 活性化レコード（マーク・スタック等）を一切組み立てない・`RPU`で
+    /// 戻ることもない点に注意（[`wasd_pcode::opcode::ConfirmedOp::Cxg`]の
+    /// ドキュメント参照）。呼び出し前にスタックへ積まれた引数（あれば）を
+    /// そのまま`pop`で消費し、呼び出し命令の直後（`self.ipc`は
+    /// [`Self::step`]が呼び出し前に既に前進させてある）へ制御が戻るのみ。
+    fn call_builtin_kernel(&mut self, proc: u8) -> Result<(), RuntimeError> {
+        match proc {
+            BUILTIN_WRITELN_INT => {
+                let value = self.pop()?;
+                self.write_output(format_args!("{value}\n"))
+            }
+            BUILTIN_WRITELN_BOOL => {
+                let value = self.pop_bool()?;
+                self.write_output(format_args!("{value}\n"))
+            }
+            BUILTIN_WRITELN_NONE => self.write_output(format_args!("\n")),
+            _ => Err(RuntimeError::UnimplementedOpcode(format!(
+                "unknown KERNEL procedure number {proc}"
+            ))),
+        }
+    }
+
+    fn write_output(&mut self, args: std::fmt::Arguments<'_>) -> Result<(), RuntimeError> {
+        self.output
+            .write_fmt(args)
+            .map_err(|err| RuntimeError::Io(err.to_string()))
     }
 
     /// 現在のフレームから静的リンクを`hops`回辿った先のフレームを返す。
@@ -448,9 +530,7 @@ impl PMachine {
             }
             UnconfirmedOp::Equ => self.cmp(|a, b| a == b),
             UnconfirmedOp::Neq => self.cmp(|a, b| a != b),
-            UnconfirmedOp::Les => self.cmp(|a, b| a < b),
             UnconfirmedOp::Leq => self.cmp(|a, b| a <= b),
-            UnconfirmedOp::Grt => self.cmp(|a, b| a > b),
             UnconfirmedOp::Geq => self.cmp(|a, b| a >= b),
             UnconfirmedOp::And => {
                 let b = self.pop_bool()?;

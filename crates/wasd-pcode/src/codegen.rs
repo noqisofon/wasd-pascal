@@ -5,12 +5,14 @@
 //! `INTEGER`/`BOOLEAN`型の変数・定数、算術演算（`+ - * DIV MOD`）、比較演算、
 //! 論理演算（`AND OR NOT`）、代入文、`IF`/`WHILE`/`REPEAT UNTIL`/`FOR`に
 //! よる制御構造、`BEGIN...END`の複合文、`PROGRAM ... BEGIN ... END.`
-//! 全体構造、および`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の
-//! 呼び出しを扱う。
+//! 全体構造、`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の呼び出し、
+//! および組み込み手続き`WriteLn`（引数0個または1個、`INTEGER`/`BOOLEAN`の
+//! みサポート。[`CodeGenerator::gen_writeln_call`]参照）を扱う。
 //!
-//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、組み込み
-//! 手続きは意味解析を通過済みのASTに含まれ得るが、本クレートの責務では
-//! **ない**。遭遇した場合はパニックせず、「未対応機能」の
+//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、`WriteLn`
+//! 以外の組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数
+//! 引数の`WriteLn`は意味解析を通過済みのASTに含まれ得るが、本クレートの
+//! 責務では**ない**。遭遇した場合はパニックせず、「未対応機能」の
 //! [`wasd_ast::Diagnostic`]を積んでコード生成のみ諦める（呼び出し元は
 //! レキサ・パーサー・意味解析と同様、`Result::Err`として診断の集合を
 //! 受け取る）。
@@ -111,6 +113,9 @@ use wasd_ast::{
     ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
 };
 
+use crate::builtin::{
+    BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, KERNEL_SEGMENT,
+};
 use crate::ir::{Instruction, PCodeModule, RoutineMeta};
 use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};
 
@@ -119,10 +124,32 @@ use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, Unconfirme
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingJump(usize);
 
+/// 式・変数・定数・`FUNCTION`戻り値の「種類」。本クレートのスコープは
+/// `INTEGER`/`BOOLEAN`の2型のみなので、`wasd_sema::Type`のような一般的な
+/// 型表現ではなく、この最小限の2値enumで済ませる。`WriteLn(expr)`が
+/// `BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`のどちらを呼ぶべきかを
+/// 決めるためだけに使う（[`CodeGenerator::infer_expr_kind`]参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    Int,
+    Bool,
+}
+
+/// `TypeExpr`をこのクレートのスコープが対応する[`ValueKind`]へ変換する。
+/// `INTEGER`/`BOOLEAN`以外（このクレートのスコープ外の型）は`None`。
+fn value_kind_of(ty: &TypeExpr) -> Option<ValueKind> {
+    match ty {
+        TypeExpr::Integer(_) => Some(ValueKind::Int),
+        TypeExpr::Boolean(_) => Some(ValueKind::Bool),
+        _ => None,
+    }
+}
+
 /// グローバル変数1件の情報。
 #[derive(Debug, Clone, Copy)]
 struct VarSlot {
     address: Address,
+    kind: ValueKind,
 }
 
 /// `CONST`宣言の値。今回のスコープでは`INTEGER`/`BOOLEAN`のみ。
@@ -132,6 +159,15 @@ enum ConstValue {
     Bool(bool),
 }
 
+impl ConstValue {
+    fn kind(self) -> ValueKind {
+        match self {
+            ConstValue::Int(_) => ValueKind::Int,
+            ConstValue::Bool(_) => ValueKind::Bool,
+        }
+    }
+}
+
 /// 活性化レコード内の1スロット（ローカル変数または仮引数）の情報。
 /// `by_ref`が真の場合、そのスロットに格納されているのは値ではなく
 /// 呼び出し元の変数のアドレスである（`VAR`仮引数）。
@@ -139,6 +175,7 @@ enum ConstValue {
 struct FrameSlot {
     address: Address,
     by_ref: bool,
+    kind: ValueKind,
 }
 
 /// 識別子1つの参照先が解決した結果。ロード/ストア/アドレス取得の
@@ -165,6 +202,12 @@ struct RoutineInfo {
     is_func: bool,
     /// `FUNCTION`の場合のみ、戻り値スロットのアドレス。
     return_address: Option<Address>,
+    /// `FUNCTION`の場合のみ意味を持つ、戻り値の種類（`WriteLn(Foo())`の
+    /// ような呼び出しで`BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`の
+    /// どちらを使うか決めるために使う。[`CodeGenerator::infer_expr_kind`]
+    /// 参照）。`PROCEDURE`（`is_func`が偽）の場合は値に意味がない
+    /// （`ValueKind::Int`をダミーとして入れる）。
+    return_kind: ValueKind,
     /// `RPU`に渡す`b`の計算に使う、ローカル変数・一時変数領域の
     /// ワード数（[`crate::codegen`]モジュールドキュメントの`emit_rpu`
     /// 参照）。
@@ -319,8 +362,7 @@ impl CodeGenerator {
 
     fn declare_vars(&mut self, var_decls: &[VarDecl]) {
         for decl in var_decls {
-            let supported = matches!(decl.ty, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
-            if !supported {
+            let Some(kind) = value_kind_of(&decl.ty) else {
                 self.error(
                     decl.ty.span(),
                     format!(
@@ -330,10 +372,11 @@ impl CodeGenerator {
                     ),
                 );
                 continue;
-            }
+            };
             for name in &decl.names {
                 let address = self.alloc_slot();
-                self.vars.insert(normalize(&name.name), VarSlot { address });
+                self.vars
+                    .insert(normalize(&name.name), VarSlot { address, kind });
             }
         }
     }
@@ -354,8 +397,7 @@ impl CodeGenerator {
     fn build_params(&mut self, params: &[ParamDecl], param_base: u16) -> Vec<(String, FrameSlot)> {
         let mut result = Vec::new();
         for p in params {
-            let supported = matches!(p.ty, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
-            if !supported {
+            let Some(kind) = value_kind_of(&p.ty) else {
                 self.error(
                     p.ty.span(),
                     format!(
@@ -365,10 +407,11 @@ impl CodeGenerator {
                     ),
                 );
                 continue;
-            }
+            };
             let slot = FrameSlot {
                 address: Address(param_base + result.len() as u16),
                 by_ref: p.by_ref,
+                kind,
             };
             result.push((normalize(&p.name.name), slot));
         }
@@ -385,8 +428,7 @@ impl CodeGenerator {
     ) -> u16 {
         let mut count: u16 = 0;
         for decl in var_decls {
-            let supported = matches!(decl.ty, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
-            if !supported {
+            let Some(kind) = value_kind_of(&decl.ty) else {
                 self.error(
                     decl.ty.span(),
                     format!(
@@ -396,11 +438,12 @@ impl CodeGenerator {
                     ),
                 );
                 continue;
-            }
+            };
             for name in &decl.names {
                 let slot = FrameSlot {
                     address: Address(5 + count),
                     by_ref: false,
+                    kind,
                 };
                 locals.insert(normalize(&name.name), slot);
                 count += 1;
@@ -419,6 +462,7 @@ impl CodeGenerator {
         var_decls: &[VarDecl],
         body: &Block,
         is_func: bool,
+        return_kind: ValueKind,
     ) {
         let key = normalize(&name.name);
         if self.routines.contains_key(&key) {
@@ -452,6 +496,7 @@ impl CodeGenerator {
                 params,
                 is_func,
                 return_address,
+                return_kind,
                 data_size,
                 declared_local_words,
                 locals,
@@ -461,15 +506,23 @@ impl CodeGenerator {
 
     fn register_procs(&mut self, procs: &[ProcDecl]) {
         for p in procs {
-            self.register_routine(&p.name, &p.params, &p.var_decls, &p.body, false);
+            // `PROCEDURE`に戻り値はないため`return_kind`はダミー
+            // （`RoutineInfo::return_kind`のドキュメント参照）。
+            self.register_routine(
+                &p.name,
+                &p.params,
+                &p.var_decls,
+                &p.body,
+                false,
+                ValueKind::Int,
+            );
         }
     }
 
     fn register_funcs(&mut self, funcs: &[FuncDecl]) {
         for f in funcs {
-            let return_type_supported =
-                matches!(f.return_type, TypeExpr::Integer(_) | TypeExpr::Boolean(_));
-            if !return_type_supported {
+            let return_kind = value_kind_of(&f.return_type);
+            if return_kind.is_none() {
                 self.error(
                     f.return_type.span(),
                     format!(
@@ -479,7 +532,14 @@ impl CodeGenerator {
                     ),
                 );
             }
-            self.register_routine(&f.name, &f.params, &f.var_decls, &f.body, true);
+            self.register_routine(
+                &f.name,
+                &f.params,
+                &f.var_decls,
+                &f.body,
+                true,
+                return_kind.unwrap_or(ValueKind::Int),
+            );
         }
     }
 
@@ -926,13 +986,20 @@ impl CodeGenerator {
         self.patch_jump(exit_loop, self.here());
     }
 
-    /// 手続き呼び出し文。組み込み手続き（`Write`/`WriteLn`/`Read`/
-    /// `ReadLn`/`New`/`Dispose`）は引き続きこのクレートのスコープ外
-    /// （I/O・ヒープ確保のp-codeは別ステップ）としてエラー報告する。
-    /// それ以外の名前は、ユーザー定義の`PROCEDURE`として解決を試みる。
+    /// 手続き呼び出し文。組み込み手続きのうち`WriteLn`のみ、
+    /// [`Self::gen_writeln_call`]（[`crate::opcode::ConfirmedOp::Cxg`]
+    /// 経由の簡略化されたKERNEL呼び出し）として実際に動作する。それ以外の
+    /// 組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）は引き続き
+    /// このクレートのスコープ外としてエラー報告する。それ以外の名前は、
+    /// ユーザー定義の`PROCEDURE`として解決を試みる。
     fn gen_proc_call(&mut self, name: &Identifier, args: &[Expr], span: Span) {
-        const BUILTINS: &[&str] = &["write", "writeln", "read", "readln", "new", "dispose"];
         let key = normalize(&name.name);
+        if key == "writeln" {
+            self.gen_writeln_call(args, span);
+            return;
+        }
+
+        const BUILTINS: &[&str] = &["write", "read", "readln", "new", "dispose"];
         if BUILTINS.contains(&key.as_str()) {
             self.error(
                 span,
@@ -972,6 +1039,127 @@ impl CodeGenerator {
                 }
             }
         }
+    }
+
+    /// `WriteLn`呼び出し文のコード生成。
+    ///
+    /// # 簡略化: 正式なUNITWRITE呼び出し規約の再現ではない
+    ///
+    /// [`crate::opcode::ConfirmedOp::Cxg`]・[`crate::builtin`]モジュール
+    /// ドキュメント参照。ここでは「KERNELセグメントへの`CXG`呼び出し」と
+    /// いう形だけを一次資料の階層構造から借り、実際のパラメータ渡しは
+    /// 「出力する値（あれば）1ワードをスタックへ積んでおくだけ」という、
+    /// 本クレート独自の単純化された規約を使う。
+    ///
+    /// - 引数なし（`WriteLn`）: 値を積まずに`BUILTIN_WRITELN_NONE`を呼ぶ
+    ///   （改行のみ出力）。
+    /// - 引数1つ（`WriteLn(expr)`）: `expr`を評価してスタックへ積み、
+    ///   その式の種類（[`Self::infer_expr_kind`]）に応じて
+    ///   `BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`のいずれかを呼ぶ。
+    ///   `INTEGER`/`BOOLEAN`以外（`REAL`/`STRING`等、今回のスコープ外）と
+    ///   推論された場合はエラーを報告する。
+    /// - 引数2つ以上: 今回のスコープ外としてエラーを報告する
+    ///   （タスク依頼: 「複数引数`WriteLn(a, b, c)`は今回はサポートしなくて
+    ///   よい」）。
+    fn gen_writeln_call(&mut self, args: &[Expr], span: Span) {
+        match args {
+            [] => {
+                self.emit(
+                    ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_NONE).into(),
+                    span,
+                );
+            }
+            [arg] => {
+                let kind = self.infer_expr_kind(arg);
+                self.gen_expr(arg);
+                let proc = match kind {
+                    Some(ValueKind::Int) => BUILTIN_WRITELN_INT,
+                    Some(ValueKind::Bool) => BUILTIN_WRITELN_BOOL,
+                    None => {
+                        self.error(
+                            arg.span(),
+                            "WriteLn only supports INTEGER/BOOLEAN arguments in this step's \
+                             minimal codegen",
+                        );
+                        BUILTIN_WRITELN_INT
+                    }
+                };
+                self.emit(ConfirmedOp::Cxg(KERNEL_SEGMENT, proc).into(), span);
+            }
+            _ => {
+                self.error(
+                    span,
+                    "WriteLn with more than one argument is out of scope for this step's \
+                     minimal codegen (only 0 or 1 argument(s) are supported)",
+                );
+                for arg in args {
+                    self.gen_expr(arg);
+                }
+            }
+        }
+    }
+
+    /// 式の「種類」（[`ValueKind`]）を推論する。`WriteLn(expr)`が
+    /// `BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`のどちらを使うべきかを
+    /// 決めるためだけに使う、本クレートのスコープ（`INTEGER`/`BOOLEAN`の
+    /// 2型のみ）に限定した簡易な型推論。`wasd-sema`が既に行った型検査を
+    /// 再現するものではない（本クレートは意味解析を経たASTを受け取る前提。
+    /// [`crate`]モジュールドキュメント参照）。推論できない式（このクレートの
+    /// スコープ外の式形、または`REAL`/`STRING`等）は`None`を返す。
+    fn infer_expr_kind(&self, expr: &Expr) -> Option<ValueKind> {
+        match expr {
+            Expr::IntLiteral(..) | Expr::HexIntLiteral(..) => Some(ValueKind::Int),
+            Expr::BoolLiteral(..) => Some(ValueKind::Bool),
+            Expr::Identifier(ident) => self.lookup_kind(&normalize(&ident.name)),
+            Expr::BinaryOp { op, .. } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
+                    Some(ValueKind::Int)
+                }
+                BinOp::Eq
+                | BinOp::NotEq
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::LtEq
+                | BinOp::GtEq
+                | BinOp::And
+                | BinOp::Or => Some(ValueKind::Bool),
+                BinOp::Div => None,
+            },
+            Expr::UnaryOp { op, .. } => match op {
+                UnOp::Neg => Some(ValueKind::Int),
+                UnOp::Not => Some(ValueKind::Bool),
+            },
+            Expr::Paren(inner, _) => self.infer_expr_kind(inner),
+            Expr::FuncCall { name, .. } => {
+                let info = self.routines.get(&normalize(&name.name))?;
+                info.is_func.then_some(info.return_kind)
+            }
+            _ => None,
+        }
+    }
+
+    /// 識別子1つ（正規化済みの名前）の種類を、[`Self::resolve_var`]と同じ
+    /// 優先順位（ローカルスコープ→グローバル変数→定数→引数なし`FUNCTION`）
+    /// で解決する。[`Self::infer_expr_kind`]の`Expr::Identifier`腕からのみ
+    /// 使う。
+    fn lookup_kind(&self, key: &str) -> Option<ValueKind> {
+        if let Some(scope) = &self.current_scope {
+            if let Some(slot) = scope.locals.get(key) {
+                return Some(slot.kind);
+            }
+        }
+        if let Some(slot) = self.vars.get(key) {
+            return Some(slot.kind);
+        }
+        if let Some(value) = self.consts.get(key) {
+            return Some(value.kind());
+        }
+        if let Some(info) = self.routines.get(key) {
+            if info.is_func && info.params.is_empty() {
+                return Some(info.return_kind);
+            }
+        }
+        None
     }
 
     /// `FUNCTION`呼び出し式。呼び出し後、戻り値1ワードがスタックへ
@@ -1206,31 +1394,51 @@ impl CodeGenerator {
         }
     }
 
+    /// # CONFIRMED: `<`/`>`は`GEQI`/`LEQI`+`NOT`で合成する
+    ///
+    /// 一次資料（[`crate::opcode::UnconfirmedOp::Equ`]のドキュメント参照。
+    /// Section II.4.2.2.13）には`EQUI`/`NEQI`/`LEQI`/`GEQI`のみが確認でき、
+    /// strictな`<`/`>`に対応するオペコードは存在しない。そのため:
+    /// - `a < b` は `NOT (a >= b)` として、通常通り`lhs`→`rhs`の順で評価し
+    ///   `GEQI`を発行した後に`NOT`を追加する（オペランドの並び順自体は
+    ///   `>=`/`<=`と同じ。追加で必要になるのは否定のみ）。
+    /// - `a > b` は `NOT (a <= b)` として、同様に`LEQI`+`NOT`で合成する。
+    ///
+    /// （なお「オペランドの順序を入れ替えるだけで`GEQI`から`<`が得られる」
+    /// という単純化は数学的に誤り: `b >= a`は`a <= b`と同値であり、
+    /// `a == b`の境界で`a < b`と食い違う。そのため本実装は常に`NOT`を
+    /// 追加する、上記の正しい合成を採用する）。
     fn emit_binop(&mut self, op: BinOp, span: Span) {
-        let opcode = match op {
-            BinOp::Add => UnconfirmedOp::Adi,
-            BinOp::Sub => UnconfirmedOp::Sbi,
-            BinOp::Mul => UnconfirmedOp::Mpi,
-            BinOp::IntDiv => UnconfirmedOp::Dvi,
-            BinOp::Mod => UnconfirmedOp::Mod,
-            BinOp::Eq => UnconfirmedOp::Equ,
-            BinOp::NotEq => UnconfirmedOp::Neq,
-            BinOp::Lt => UnconfirmedOp::Les,
-            BinOp::Gt => UnconfirmedOp::Grt,
-            BinOp::LtEq => UnconfirmedOp::Leq,
-            BinOp::GtEq => UnconfirmedOp::Geq,
-            BinOp::And => UnconfirmedOp::And,
-            BinOp::Or => UnconfirmedOp::Ior,
-            BinOp::Div => {
-                self.error(
-                    span,
-                    "real division ('/') is out of scope for this step's minimal codegen (only \
-                     INTEGER/BOOLEAN are supported)",
-                );
-                UnconfirmedOp::Ldc(0)
-            }
+        if matches!(op, BinOp::Div) {
+            self.error(
+                span,
+                "real division ('/') is out of scope for this step's minimal codegen (only \
+                 INTEGER/BOOLEAN are supported)",
+            );
+            self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            return;
+        }
+
+        let (opcode, negate) = match op {
+            BinOp::Add => (UnconfirmedOp::Adi, false),
+            BinOp::Sub => (UnconfirmedOp::Sbi, false),
+            BinOp::Mul => (UnconfirmedOp::Mpi, false),
+            BinOp::IntDiv => (UnconfirmedOp::Dvi, false),
+            BinOp::Mod => (UnconfirmedOp::Mod, false),
+            BinOp::Eq => (UnconfirmedOp::Equ, false),
+            BinOp::NotEq => (UnconfirmedOp::Neq, false),
+            BinOp::Lt => (UnconfirmedOp::Geq, true),
+            BinOp::Gt => (UnconfirmedOp::Leq, true),
+            BinOp::LtEq => (UnconfirmedOp::Leq, false),
+            BinOp::GtEq => (UnconfirmedOp::Geq, false),
+            BinOp::And => (UnconfirmedOp::And, false),
+            BinOp::Or => (UnconfirmedOp::Ior, false),
+            BinOp::Div => unreachable!("handled above"),
         };
         self.emit(opcode.into(), span);
+        if negate {
+            self.emit(UnconfirmedOp::Not.into(), span);
+        }
     }
 }
 

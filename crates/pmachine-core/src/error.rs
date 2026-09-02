@@ -26,11 +26,12 @@ pub enum RuntimeError {
     /// エラー」と明記されている（`crates/pmachine-core`実装指示のタスク3
     /// 参照）。
     DivisionByZero,
-    /// 未実装の命令に遭遇した（今回のスコープ外の命令等）。本クレートは
+    /// 未実装の命令・機能に遭遇した（今回のスコープ外の命令等）。本クレートは
     /// [`wasd_pcode::Opcode`]の全バリアントを網羅的にmatchするため、
-    /// 現在の実装ではこの変種が実際に返ることはない。将来
-    /// [`wasd_pcode::Opcode`]にバリアントが追加され、本クレートの対応が
-    /// 追いついていない場合に備えて用意してある。
+    /// オペコードのバリアント自体が原因でこの変種が返ることはないが、
+    /// `CXG`がKERNEL以外のセグメントを呼び出そうとした場合や、KERNEL
+    /// エミュレーションが未知のprocedure番号を渡された場合（`crate::machine`の
+    /// `call_external`/`call_builtin_kernel`参照）にも同じ変種を使う。
     UnimplementedOpcode(String),
     /// `IPC`が命令列の範囲外を指した（`STP`に到達せず命令列の終端を
     /// 越えた場合。コード生成器が必ず末尾に`STP`を発行する前提が崩れて
@@ -51,6 +52,11 @@ pub enum RuntimeError {
     /// ルーチン表が矛盾していることを示す（通常は起こらないはずの内部
     /// エラー）。
     UnknownRoutine,
+    /// `CXG`が呼び出したKERNELの組み込みエミュレーション（`WriteLn`）が、
+    /// 出力先（[`crate::PMachine`]に注入された`Box<dyn Write>`）への書き込みに
+    /// 失敗した。ホストの標準出力が閉じられている等、通常は起こらないはずの
+    /// I/Oエラーを報告するために用意してある。
+    Io(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -70,6 +76,7 @@ impl fmt::Display for RuntimeError {
             RuntimeError::UnknownRoutine => {
                 write!(f, "call target has no matching routine metadata")
             }
+            RuntimeError::Io(message) => write!(f, "I/O error: {message}"),
         }
     }
 }

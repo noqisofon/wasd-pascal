@@ -50,6 +50,22 @@
 /// 検証してはいない）。虚偽の「独立に確認済み」という表示を避けるため、
 /// この経緯をここに明記する。
 ///
+/// # 2026-09-02（Step 14）: `CXG`の追加、比較命令・ジャンプ命令・`RPU`のさらなる確認
+///
+/// `WriteLn`の実装方針を調査するタスク依頼で、Section II.4.2.2の命令表
+/// （全命令一覧）とSection III.1-III.2（I/O階層）が原文引用付きで新たに
+/// 提示された。これにより[`ConfirmedOp::Cxg`]を追加し、[`UnconfirmedOp::Equ`]
+/// （比較命令）・[`CodeAddress`]（ジャンプ命令のオフセット解釈）・
+/// [`ConfirmedOp::Rpu`]（`b`パラメータ）に残っていたUNCONFIRMED事項を
+/// 解消できた（各バリアントのドキュメント参照）。
+///
+/// ## このセッションも一次資料に直接あたってはいない
+///
+/// 上記と同じ注記が今回も当てはまる: このセッション自身が`archive.org`等の
+/// 一次資料ホストへ`WebFetch`等で直接アクセスして検証したわけではなく、
+/// タスク依頼の記述として提示された原文引用（Section II.4.2.2.13/17/18、
+/// III.1-III.2）をそのまま採用した。独立検証ではない旨をここに明記する。
+///
 /// 加えて、これらのオペコード番号の値そのもの（144等）はIR上のデータとしては
 /// 保持しない。[`crate`]のドキュメントの通り、実バイナリへのエンコード
 /// （オペコード番号をバイト列へ落とす処理）は本クレートのスコープ外
@@ -107,16 +123,23 @@ pub enum ConfirmedOp {
     /// pop する。加えて`b`ワード分スタックを切り詰める（関数の戻り値が
     /// ある場合、それは切り詰め対象の範囲より上に積まれているため残る）。
     ///
-    /// # `b`の計算式: 方針Aで実行検証済み（CONFIRMED、Step 13）
+    /// # `b`の計算式: 方針AがCONFIRMED（一次資料原文 + Step 13の実行検証の両方）
     ///
-    /// `b`が正確に何を表すか（「パラメータ領域+ローカル変数領域の合計
-    /// ワード数」に相当すると推測されるが、正確な計算式は一次資料からは
-    /// 完全には読み取れなかった）は[`crate::codegen::CodeGenerator`]の
-    /// `emit_rpu`のドキュメント参照。この命令バリアント自体（オペコード
-    /// 番号・大まかなセマンティクス）はタスク依頼の記述の通り確認済みと
-    /// して扱っていたが、コード生成器が実際に計算して渡す`b`の値
-    /// （方針A: `b` = `DATASIZE` + パラメータ領域のワード数）については、
-    /// 長らく未確認のままだった。
+    /// 一次資料原文（Section II.4.2.2.18）に明確な記述がある:
+    ///
+    /// ```text
+    /// RPU  150 B  <activation>:<func>
+    ///     Return from Procedure. Restore state of calling procedure from MSCW
+    ///     and discard. Pop MSCW from Stack. Cut back an additional B words from
+    ///     Stack, leaving function value, if appropriate.
+    /// ```
+    ///
+    /// つまり: (1) MSCW（5ワード）をスタックからpopし、(2) さらに`B`ワード分
+    /// スタックを切り詰め、(3) `FUNCTION`の場合は戻り値だけが残るよう
+    /// 切り詰める。`B`は「ローカル変数＋パラメータ領域の合計ワード数」
+    /// （活性化レコードのMSCW以外の部分）に相当する。これは
+    /// [`crate::codegen::CodeGenerator`]の`emit_rpu`が採用する方針A
+    /// （`b` = `DATASIZE` + パラメータ領域のワード数）と一致する。
     ///
     /// Step 13で`pmachine-core`（p-machineインタプリタ）を実装し、
     /// `PROCEDURE`/`FUNCTION`呼び出しを実際に実行した上で、呼び出し前後の
@@ -133,6 +156,40 @@ pub enum ConfirmedOp {
     /// スタック制御ワードは`pmachine-core`では実データとして`stack`上には
     /// 確保せず、別テーブルとして持たせる簡略化を採用している）。
     Rpu(u16),
+    /// `CXG <seg>, <proc>`: Call Global External Procedure。オペコード148。
+    /// 現在実行中のセグメントとは異なるセグメント`seg`の、そのセグメント
+    /// 内でグローバルな（lexレベル1の）プロシージャ`proc`を呼ぶ。
+    ///
+    /// # CONFIRMED: オペコード番号・大まかなセマンティクス
+    ///
+    /// SofTech Microsystems, *UCSD p-System and UCSD Pascal Version IV:
+    /// Internal Architecture Guide* (First edition, March 1981), Section
+    /// II.4.2.2.18で確認済み。
+    ///
+    /// # 本クレートでの用途: `WriteLn`向けの簡略化したKERNEL呼び出し
+    ///
+    /// 一次資料（Section III.1-III.2）によれば、`WriteLn`/`ReadLn`のような
+    /// 言語レベルのI/O呼び出しはp-machineの専用オペコードではなく、
+    /// コンパイラ+OSがKERNELユニット（全コンパイル単位から`segment 1`として
+    /// 常にアクセス可能）の`UNITWRITE`/`UNITREAD`ルーチン呼び出しに変換する、
+    /// という階層構造になっている。本クレートは`WriteLn`をこの`CXG`命令で
+    /// KERNELセグメント（[`crate::builtin::KERNEL_SEGMENT`]）内の簡易
+    /// procedure番号（[`crate::builtin`]モジュールドキュメント参照）を
+    /// 呼び出す形で表現する。
+    ///
+    /// ただし、正式な`UNITWRITE`呼び出しが本来必要とするパラメータ
+    /// ディスクリプタ等の呼び出し規約は一切再現しておらず、あくまで
+    /// 「セグメント番号+procedure番号を指定して呼ぶ」という`CXG`の形だけを
+    /// 借りた簡略化である点に注意（[`crate::builtin`]モジュール
+    /// ドキュメント、および`pmachine-core`の`call_builtin_kernel`ドキュメント
+    /// 参照）。呼び出し先はKERNELの組み込みエミュレーションのみであり、
+    /// 通常の`PROCEDURE`/`FUNCTION`のような活性化レコード（マーク・
+    /// スタック・ローカル変数領域等）は一切組み立てない・`RPU`で戻ることも
+    /// ない、という点で[`Cpl`]/[`Cpg`]/[`Cpi`]とは実行モデルが大きく異なる
+    /// （`pmachine-core`側の実装判断。呼び出し前にスタックへ積んだ引数を
+    /// そのままKERNELエミュレーションが消費し、呼び出し命令の直後へ制御が
+    /// 戻るのみ）。
+    Cxg(u8, u8),
 }
 
 /// データ領域中の1ワードのアドレス（ワード単位のオフセット）。
@@ -170,14 +227,33 @@ pub struct Level(pub u8);
 
 /// p-code命令列中の1命令の位置（命令列のインデックス）。
 ///
-/// # UNCONFIRMED: 分岐命令のオフセットの基準点・エンコーディング
+/// # CONFIRMED: 分岐命令は単純な相対バイトオフセット加算方式（JTAB等の間接テーブルは存在しない）
 ///
-/// 実機の`UJP`/`FJP`が分岐先をどう符号化するか（命令列先頭からのバイト
-/// オフセットか、分岐命令自身の直後からの相対オフセットか等）は未確認。
-/// このIRでは、そのバイトレベルのエンコーディングを決定する前段階の
-/// 抽象として、単に`Vec<Instruction>`中のインデックス（命令番号）を
-/// 分岐先として保持する。実際のバイト列へのエンコードは、今回のスコープ
-/// 外である「実バイナリ生成」ステップで、一次資料を確認した上で行うこと。
+/// 一次資料（SofTech Microsystems, *UCSD p-System and UCSD Pascal Version
+/// IV: Internal Architecture Guide*, Section II.4.2.2.17）に、分岐命令の
+/// 原文が以下の通り確認できた:
+///
+/// ```text
+/// UJP  138 SB  <>:<>       Unconditional Jump. Jump by byte offset SB.
+/// FJP  212 SB  <Bool>:<>   False Jump. Jump by byte offset SB if TOS is false.
+/// TJP  241 SB  <Bool>:<>   True Jump. Jump by byte offset SB if TOS is true.
+/// JPL  139 W   <>:<>       Unconditional Long Jump. Jump W bytes from current location.
+/// FJPL 213 W   <Bool>:<>   False Long Jump. Jump W bytes from current location if TOS is false.
+/// ```
+///
+/// 「Jump by byte offset SB」「Jump W bytes from current location」という
+/// 記述のみで、二次資料（markbessey.blog等）が示唆していたような`JTAB`
+/// （間接ジャンプテーブル）方式への言及は一切ない。単純な相対オフセット
+/// 加算方式という、以前からこのIRが採用していた解釈がCONFIRMEDとなった。
+///
+/// ただし、これはあくまで「オフセットの意味論（正負を問わず単純加算）」が
+/// 確認できたということであり、本IRの`CodeAddress`が実バイト列オフセット
+/// ではなく`Vec<Instruction>`中のインデックス（命令番号）を分岐先として
+/// 保持するという抽象化自体は、実バイナリ生成が今回のスコープ外である
+/// ことに変わりないため、意図的に維持している。実際のバイト列へのエン
+/// コード（`SB`/`W`のバイト幅、命令自身の直後からのオフセットかどうかの
+/// 厳密な起点等）は、今回のスコープ外である「実バイナリ生成」ステップで
+/// 改めて確認すること。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CodeAddress(pub u32);
 
@@ -196,12 +272,17 @@ pub struct CodeAddress(pub u32);
 ///   後続バイト列か）
 /// - `LOD`/`STR`が本来持つはずの「レベル差」オペランド（[`Address`]の
 ///   ドキュメント参照）
-/// - 比較命令（`EQU`/`NEQ`/`LES`/`LEQ`/`GRT`/`GEQ`）が実機ではオペランド
-///   型ごとに別々のオペコード番号を持つ（例: `EQUI`/`EQUR`/`EQUB`等）
-///   ことが一般的に知られているが、本実装はスコープがINTEGER/BOOLEANの
-///   2型のみであり、かつ両者ともp-machine上では1ワードの値として
-///   同じ表現になると仮定し、型ごとに分けず単一のバリアントで代表させて
-///   いる（この簡略化自体もUNCONFIRMED）。
+/// - 比較命令（`EQU`/`NEQ`/`LEQ`/`GEQ`）が実機ではオペランド型ごとに
+///   別々のオペコード番号を持つ（例: `EQUI`/`EQUR`/`EQUB`等）ことが一般的に
+///   知られているが、本実装はスコープがINTEGER/BOOLEANの2型のみであり、
+///   かつ両者ともp-machine上では1ワードの値として同じ表現になると仮定し、
+///   型ごとに分けず単一のバリアントで代表させている（この簡略化自体も
+///   UNCONFIRMED。ただし`EQUI`/`NEQI`/`LEQI`/`GEQI`というINTEGER版の
+///   オペコード番号自体はCONFIRMED。[`Leq`]/[`Geq`]のドキュメント参照）。
+///   なお、`<`/`>`（strictな「より小さい」「より大きい」）に対応する
+///   オペコードは一次資料に**存在しない**（CONFIRMED。[`Leq`]/[`Geq`]の
+///   ドキュメント参照）。本実装はこれらを`LEQI`/`GEQI`と`LNOT`相当の
+///   [`Not`]の組み合わせで合成する。
 /// - 論理演算の正確なニーモニック表記（`IOR`か`LOR`か等。ここでは`IOR`を
 ///   採用しているが未確認）。
 /// - `BOOLEAN`の`TRUE`/`FALSE`のワード表現（ここでは`TRUE = 1`/
@@ -295,16 +376,35 @@ pub enum UnconfirmedOp {
     /// `NGI`: 整数の符号反転（negate integer、単項マイナス）。
     Ngi,
     /// `EQU`: 等しい。
+    ///
+    /// # CONFIRMED: `EQUI`/`NEQI`/`LEQI`/`GEQI`のオペコード番号
+    ///
+    /// 一次資料（SofTech Microsystems, *UCSD p-System and UCSD Pascal
+    /// Version IV: Internal Architecture Guide*, Section II.4.2.2.13）に
+    /// INTEGER比較命令の一覧が確認できた:
+    ///
+    /// ```text
+    /// EQUI 176  TOS-1 = TOS
+    /// NEQI 177  TOS-1 <> TOS
+    /// LEQI 178  TOS-1 <= TOS
+    /// GEQI 179  TOS-1 >= TOS
+    /// ```
+    ///
+    /// **`<`/`>`（strictな「より小さい」「より大きい」）に対応するオペコード
+    /// はこの一覧に存在しない。** これはCONFIRMEDな事実である
+    /// （[`crate::codegen::CodeGenerator::emit_binop`]のドキュメント参照:
+    /// `a < b`は`NOT (a >= b)`として`GEQI`+`LNOT`相当の[`Not`]の組み合わせで、
+    /// `a > b`は`NOT (a <= b)`として`LEQI`+[`Not`]の組み合わせで、それぞれ
+    /// 合成する）。本バリアント自体のオペコード番号（176相当）・型ごとの
+    /// 分離（`EQUI`のようなINTEGER専用の型サフィックス）は本IRのデータ
+    /// としては保持しない簡略化を採用している（[`ConfirmedOp`]のドキュメント
+    /// 「加えて、これらのオペコード番号の値そのもの...」の節と同じ方針）。
     Equ,
-    /// `NEQ`: 等しくない。
+    /// `NEQ`: 等しくない。[`Equ`]のドキュメント参照（`NEQI` 177、CONFIRMED）。
     Neq,
-    /// `LES`: より小さい。
-    Les,
-    /// `LEQ`: 以下。
+    /// `LEQ`: 以下。[`Equ`]のドキュメント参照（`LEQI` 178、CONFIRMED）。
     Leq,
-    /// `GRT`: より大きい。
-    Grt,
-    /// `GEQ`: 以上。
+    /// `GEQ`: 以上。[`Equ`]のドキュメント参照（`GEQI` 179、CONFIRMED）。
     Geq,
     /// `AND`: 論理積。
     And,

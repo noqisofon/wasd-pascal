@@ -48,6 +48,7 @@ fn format_confirmed(op: &ConfirmedOp) -> String {
         ConfirmedOp::Scpi1(target) => format!("SCPI1 {}", target.0),
         ConfirmedOp::Scpi2(target) => format!("SCPI2 {}", target.0),
         ConfirmedOp::Rpu(b) => format!("RPU {b}"),
+        ConfirmedOp::Cxg(seg, proc) => format!("CXG {seg},{proc}"),
     }
 }
 
@@ -67,9 +68,7 @@ fn format_unconfirmed(op: &UnconfirmedOp) -> String {
         UnconfirmedOp::Ngi => "NGI".to_string(),
         UnconfirmedOp::Equ => "EQU".to_string(),
         UnconfirmedOp::Neq => "NEQ".to_string(),
-        UnconfirmedOp::Les => "LES".to_string(),
         UnconfirmedOp::Leq => "LEQ".to_string(),
-        UnconfirmedOp::Grt => "GRT".to_string(),
         UnconfirmedOp::Geq => "GEQ".to_string(),
         UnconfirmedOp::And => "AND".to_string(),
         UnconfirmedOp::Ior => "IOR".to_string(),

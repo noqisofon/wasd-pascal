@@ -54,10 +54,11 @@ enum Command {
         emit_pcode: bool,
     },
     /// レキサ〜semaまで実行し、成功すればp-codeを生成して
-    /// `pmachine-core`で実行する。`WriteLn`等の実際の入出力は未実装
-    /// （`crates/wasd-pcode/src/codegen.rs`の`gen_proc_call`のドキュメント
-    /// 参照）なので、実行結果はグローバル変数のスナップショットとして
-    /// デバッグ表示するのみに留める。
+    /// `pmachine-core`で実行する。Step 14から`WriteLn`（INTEGER/BOOLEAN・
+    /// 0/1引数のみ）は実際に標準出力へ出力される
+    /// （`crates/wasd-pcode/src/codegen.rs`の`gen_writeln_call`のドキュメント
+    /// 参照）。それ以外の組み込み手続きは引き続き未実装。加えて、実行結果
+    /// はグローバル変数のスナップショットとしてもデバッグ表示する。
     Run {
         file: PathBuf,
         /// 使用するdialect。デフォルトはISO 7185準拠の標準Pascal。
