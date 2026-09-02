@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wasd_driver::{
-    compile, compile_to_pcode, locate, CompileOptions, Diagnostic, Dialect, Severity,
+    compile, compile_to_pcode, locate, run_program, CompileOptions, Diagnostic, Dialect, Severity,
 };
 
 /// UCSD Pascal風のPascal処理系 `wasdc`。
@@ -53,6 +53,17 @@ enum Command {
         #[arg(long)]
         emit_pcode: bool,
     },
+    /// レキサ〜semaまで実行し、成功すればp-codeを生成して
+    /// `pmachine-core`で実行する。`WriteLn`等の実際の入出力は未実装
+    /// （`crates/wasd-pcode/src/codegen.rs`の`gen_proc_call`のドキュメント
+    /// 参照）なので、実行結果はグローバル変数のスナップショットとして
+    /// デバッグ表示するのみに留める。
+    Run {
+        file: PathBuf,
+        /// 使用するdialect。デフォルトはISO 7185準拠の標準Pascal。
+        #[arg(long = "std", value_enum, default_value_t = DialectArg::Iso7185)]
+        std: DialectArg,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -89,6 +100,7 @@ fn main() -> ExitCode {
             std,
             emit_pcode,
         } => run_compile(&file, std.into(), emit_pcode),
+        Command::Run { file, std } => run_run(&file, std.into()),
     }
 }
 
@@ -156,6 +168,39 @@ fn run_compile(file: &Path, dialect: Dialect, emit_pcode: bool) -> ExitCode {
     }
 
     exit_code_for(&result.diagnostics)
+}
+
+fn run_run(file: &Path, dialect: Dialect) -> ExitCode {
+    let source = match read_source(file) {
+        Ok(source) => source,
+        Err(code) => return code,
+    };
+
+    let options = CompileOptions::new(dialect).with_source_path(file.to_path_buf());
+    let result = run_program(&source, &options);
+
+    print_diagnostics(&source, file, &result.diagnostics);
+
+    if !result.executed {
+        println!("<not run: compilation failed or produced no PROGRAM to generate from>");
+        return exit_code_for(&result.diagnostics);
+    }
+
+    match &result.runtime_error {
+        Some(err) => println!("runtime error: {err}"),
+        None => println!("OK: program ran to completion"),
+    }
+
+    println!("globals (debug):");
+    for (addr, value) in result.globals.iter().enumerate() {
+        println!("  [{addr}] = {value}");
+    }
+
+    if result.runtime_error.is_some() {
+        ExitCode::from(1)
+    } else {
+        exit_code_for(&result.diagnostics)
+    }
 }
 
 /// 診断を`rustc`風の体裁で標準出力へ表示する。1件もなければ簡潔な

@@ -1,0 +1,15 @@
+[package]
+name = "pmachine-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "p-machine interpreter: executes p-code (IR) produced by wasd-pcode."
+
+[dependencies]
+wasd-pcode.workspace = true
+
+[dev-dependencies]
+wasd-ast.workspace = true
+wasd-lexer.workspace = true
+wasd-parser.workspace = true

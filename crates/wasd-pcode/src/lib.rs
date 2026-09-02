@@ -27,5 +27,5 @@ pub mod opcode;
 pub mod text;
 
 pub use codegen::CodeGenerator;
-pub use ir::{Instruction, PCodeModule};
+pub use ir::{Instruction, PCodeModule, RoutineMeta};
 pub use opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};

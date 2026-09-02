@@ -12,3 +12,4 @@ wasd-lexer.workspace = true
 wasd-parser.workspace = true
 wasd-sema.workspace = true
 wasd-pcode.workspace = true
+pmachine-core.workspace = true
