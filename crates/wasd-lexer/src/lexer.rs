@@ -34,7 +34,10 @@ impl<'src> Lexer<'src> {
 
             let start = self.pos;
             let Some(c) = self.peek_char() else {
-                tokens.push(Token::new(TokenKind::Eof, Span::new(start as u32, start as u32)));
+                tokens.push(Token::new(
+                    TokenKind::Eof,
+                    Span::new(start as u32, start as u32),
+                ));
                 break;
             };
 
@@ -86,7 +89,8 @@ impl<'src> Lexer<'src> {
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
-        self.diagnostics.push(Diagnostic::new(span, Severity::Error, message));
+        self.diagnostics
+            .push(Diagnostic::new(span, Severity::Error, message));
     }
 
     // --- 空白・コメント ---
@@ -307,7 +311,8 @@ impl<'src> Lexer<'src> {
 
         // 小数部: '.'の直後が数字の場合のみ小数部として消費する。
         // `1..10`のような範囲演算子`..`と衝突しないための判定。
-        if self.peek_char() == Some('.') && matches!(self.peek_char_at(1), Some(d) if d.is_ascii_digit())
+        if self.peek_char() == Some('.')
+            && matches!(self.peek_char_at(1), Some(d) if d.is_ascii_digit())
         {
             is_real = true;
             self.bump(); // '.'
@@ -558,10 +563,7 @@ mod tests {
         let kinds = kinds("'it''s'");
         assert_eq!(
             kinds,
-            vec![
-                TokenKind::StringLiteral("it's".to_string()),
-                TokenKind::Eof,
-            ]
+            vec![TokenKind::StringLiteral("it's".to_string()), TokenKind::Eof,]
         );
     }
 

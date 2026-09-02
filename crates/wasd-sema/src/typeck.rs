@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use wasd_ast as ast;
-use wasd_ast::{Dialect, Diagnostic, Identifier, Severity, Span};
+use wasd_ast::{Diagnostic, Dialect, Identifier, Severity, Span};
 
 use crate::dialect_check;
 use crate::symbol_table::{ParamSignature, SymbolInfo, SymbolKind, SymbolTable};
@@ -112,7 +112,8 @@ impl SemaContext {
     /// 呼び出し元は診断の有無に関わらずASTの残りの意味解析を継続すること
     /// （LSPで他のエラーも同時に見せるため。Step 3のドキュメント参照）。
     fn check_dialect_gate(&mut self, span: Span, feature: &str, required: Dialect) {
-        if let Some(diag) = dialect_check::check_dialect_gate(self.dialect, span, feature, required) {
+        if let Some(diag) = dialect_check::check_dialect_gate(self.dialect, span, feature, required)
+        {
             self.diagnostics.push(diag);
         }
     }
@@ -256,12 +257,20 @@ impl SemaContext {
     /// そのため無名`RECORD`（`TYPE`宣言を経ないもの）は、たとえ
     /// フィールド構成が完全に同一でも、書かれた箇所が異なれば別の型として
     /// 扱われる（`next_anon_id`で連番の合成名を割り当てるため）。
-    fn resolve_record_type(&mut self, explicit_name: Option<&str>, fields: &[ast::FieldDecl]) -> Type {
+    fn resolve_record_type(
+        &mut self,
+        explicit_name: Option<&str>,
+        fields: &[ast::FieldDecl],
+    ) -> Type {
         let identity = match explicit_name {
             Some(name) => name.to_string(),
             None => {
                 self.next_anon_id += 1;
-                format!("{}{}", crate::types::ANONYMOUS_RECORD_PREFIX, self.next_anon_id)
+                format!(
+                    "{}{}",
+                    crate::types::ANONYMOUS_RECORD_PREFIX,
+                    self.next_anon_id
+                )
             }
         };
         let key = identity.to_ascii_lowercase();
@@ -360,10 +369,8 @@ impl SemaContext {
             }
             if let ast::TypeExpr::Record { .. } = &decl.ty {
                 let key = decl.name.name.to_ascii_lowercase();
-                self.record_registry.insert(
-                    key.clone(),
-                    RecordInfo { fields: Vec::new() },
-                );
+                self.record_registry
+                    .insert(key.clone(), RecordInfo { fields: Vec::new() });
                 self.type_table
                     .insert(key, Type::Record(decl.name.name.clone()));
             }
@@ -620,7 +627,9 @@ impl SemaContext {
             } => {
                 self.check_for_statement(var, start, end, body);
             }
-            ast::Statement::Repeat { body, until_cond, .. } => {
+            ast::Statement::Repeat {
+                body, until_cond, ..
+            } => {
                 for stmt in body {
                     self.check_statement(stmt);
                 }
@@ -850,7 +859,9 @@ impl SemaContext {
         let value_ty = self.infer_expr_type(value);
         match target {
             ast::Expr::Identifier(ident) => self.check_assignment_to_identifier(ident, value_ty),
-            ast::Expr::IndexAccess { .. } | ast::Expr::FieldAccess { .. } | ast::Expr::Deref { .. } => {
+            ast::Expr::IndexAccess { .. }
+            | ast::Expr::FieldAccess { .. }
+            | ast::Expr::Deref { .. } => {
                 // 配列要素・レコードフィールド・デリファレンスは、基点となる
                 // 式（配列/レコード/ポインタ）さえ解決できれば常に左辺値で
                 // あるため、`FOR`ループ変数のような特別扱いは不要
@@ -1124,7 +1135,12 @@ impl SemaContext {
     /// 呼び出し（`PROCEDURE`/`FUNCTION`いずれも共通）の実引数を検査する:
     /// 引数の個数、各引数の型（`VAR`引数は同一型のみ、値引数は代入互換で可）、
     /// `VAR`引数には変数（左辺値）しか渡せないこと。
-    fn check_call_args(&mut self, callee_name: &Identifier, params: &[ParamSignature], args: &[ast::Expr]) {
+    fn check_call_args(
+        &mut self,
+        callee_name: &Identifier,
+        params: &[ParamSignature],
+        args: &[ast::Expr],
+    ) {
         if args.len() != params.len() {
             self.diagnostics.push(Diagnostic::new(
                 callee_name.span,
@@ -1232,8 +1248,12 @@ impl SemaContext {
             ast::Expr::Paren(inner, _) => self.infer_expr_type(inner),
             ast::Expr::FuncCall { name, args, .. } => self.check_func_call(name, args),
             ast::Expr::NilLiteral(_) => Type::Nil,
-            ast::Expr::IndexAccess { array, index, .. } => self.infer_index_access_type(array, index),
-            ast::Expr::FieldAccess { record, field, .. } => self.infer_field_access_type(record, field),
+            ast::Expr::IndexAccess { array, index, .. } => {
+                self.infer_index_access_type(array, index)
+            }
+            ast::Expr::FieldAccess { record, field, .. } => {
+                self.infer_field_access_type(record, field)
+            }
             ast::Expr::Deref { pointer, .. } => self.infer_deref_type(pointer),
             // `Expr`は`#[non_exhaustive]`。集合式など今後追加される
             // バリアントは、追加時にここを拡張するまでの間`Type::Error`とする。
@@ -1294,10 +1314,11 @@ impl SemaContext {
             Type::Record(name) => {
                 let key = name.to_ascii_lowercase();
                 let lower_field = field.name.to_ascii_lowercase();
-                let found = self
-                    .record_registry
-                    .get(&key)
-                    .and_then(|info| info.fields.iter().find(|f| f.name.to_ascii_lowercase() == lower_field));
+                let found = self.record_registry.get(&key).and_then(|info| {
+                    info.fields
+                        .iter()
+                        .find(|f| f.name.to_ascii_lowercase() == lower_field)
+                });
                 match found {
                     Some(f) => f.ty.clone(),
                     None => {
@@ -1599,7 +1620,9 @@ fn pointer_eq_compatible(op: ast::BinOp, lhs: &Type, rhs: &Type) -> bool {
     }
     match (lhs, rhs) {
         (Type::Pointer(_), Type::Pointer(_)) => lhs == rhs,
-        (Type::Pointer(_), Type::Nil) | (Type::Nil, Type::Pointer(_)) | (Type::Nil, Type::Nil) => true,
+        (Type::Pointer(_), Type::Nil) | (Type::Nil, Type::Pointer(_)) | (Type::Nil, Type::Nil) => {
+            true
+        }
         _ => false,
     }
 }
@@ -1657,7 +1680,6 @@ fn bin_op_symbol(op: ast::BinOp) -> &'static str {
         Or => "OR",
     }
 }
-
 
 /// `CASE`ラベルの重複検出用キー。型の種類ごとに接頭辞を分けることで、
 /// 異なる型のリテラル同士（例えば整数の`1`と実数の`1.0`）を誤って
@@ -2072,9 +2094,7 @@ mod tests {
         );
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
-        assert!(errs[0]
-            .message
-            .contains("cannot be called as a statement"));
+        assert!(errs[0].message.contains("cannot be called as a statement"));
     }
 
     /// `PROCEDURE`を式として使おうとするとエラーになること。
@@ -2277,8 +2297,7 @@ mod tests {
     /// `start`式がBOOLEANだとエラーになること。
     #[test]
     fn for_loop_start_must_be_integer() {
-        let diags =
-            check("PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := TRUE TO 10 DO i := i END.");
+        let diags = check("PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := TRUE TO 10 DO i := i END.");
         let errs = errors(&diags);
         assert!(
             errs.iter().any(|e| e.message.contains("start value")),
@@ -2289,8 +2308,7 @@ mod tests {
     /// `end`式がBOOLEANだとエラーになること。
     #[test]
     fn for_loop_end_must_be_integer() {
-        let diags =
-            check("PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 1 TO TRUE DO i := i END.");
+        let diags = check("PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 1 TO TRUE DO i := i END.");
         let errs = errors(&diags);
         assert!(
             errs.iter().any(|e| e.message.contains("end value")),
@@ -2314,9 +2332,8 @@ mod tests {
     /// （ループ変数の禁止はループ本体内に限定される）。
     #[test]
     fn assigning_to_the_loop_variable_after_the_loop_is_allowed() {
-        let diags = check(
-            "PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 1 TO 10 DO i := i; i := 0 END.",
-        );
+        let diags =
+            check("PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 1 TO 10 DO i := i; i := 0 END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0]
@@ -2341,9 +2358,8 @@ mod tests {
     /// 正しく書かれたREPEAT UNTIL文でエラーが出ないこと。
     #[test]
     fn well_typed_repeat_statement_has_no_diagnostics() {
-        let diags = check(
-            "PROGRAM Foo; VAR i: INTEGER; BEGIN i := 0; REPEAT i := i + 1 UNTIL i = 10 END.",
-        );
+        let diags =
+            check("PROGRAM Foo; VAR i: INTEGER; BEGIN i := 0; REPEAT i := i + 1 UNTIL i = 10 END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -2430,9 +2446,8 @@ mod tests {
     /// セレクタがREALだとエラーになること（順序型ではないため）。
     #[test]
     fn case_selector_must_be_ordinal_type() {
-        let diags = check(
-            "PROGRAM Foo; VAR x: REAL; y: INTEGER; BEGIN CASE x OF 1: y := 1 END END.",
-        );
+        let diags =
+            check("PROGRAM Foo; VAR x: REAL; y: INTEGER; BEGIN CASE x OF 1: y := 1 END END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("ordinal type"));
@@ -2441,9 +2456,7 @@ mod tests {
     /// ラベルの型がセレクタの型と一致しない場合エラーになること。
     #[test]
     fn case_label_type_must_match_selector_type() {
-        let diags = check(
-            "PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF TRUE: y := 1 END END.",
-        );
+        let diags = check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF TRUE: y := 1 END END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));
@@ -2452,9 +2465,8 @@ mod tests {
     /// 同じ値のラベルが複数の分岐に重複して出現するとエラーになること。
     #[test]
     fn duplicate_case_labels_are_rejected() {
-        let diags = check(
-            "PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1; 1: y := 2 END END.",
-        );
+        let diags =
+            check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1; 1: y := 2 END END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Duplicate CASE label"));
@@ -2463,8 +2475,7 @@ mod tests {
     /// 同じ分岐内でのラベルの重複（`1, 1: ...`）もエラーになること。
     #[test]
     fn duplicate_case_labels_within_the_same_branch_are_rejected() {
-        let diags =
-            check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1, 1: y := 1 END END.");
+        let diags = check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1, 1: y := 1 END END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Duplicate CASE label"));
@@ -2473,8 +2484,7 @@ mod tests {
     /// 各分岐の本体の型エラーも検出されること。
     #[test]
     fn type_errors_inside_case_branch_body_are_reported() {
-        let diags =
-            check("PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := TRUE END END.");
+        let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := TRUE END END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));
@@ -2484,8 +2494,7 @@ mod tests {
     /// 出ないこと（方針: 非網羅性は診断しない）。
     #[test]
     fn non_exhaustive_case_statement_is_not_diagnosed() {
-        let diags =
-            check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1 END END.");
+        let diags = check("PROGRAM Foo; VAR x, y: INTEGER; BEGIN CASE x OF 1: y := 1 END END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -2562,10 +2571,7 @@ mod tests {
     /// STRING[n]型: `Dialect::Ucsd`では正常に受理される。
     #[test]
     fn string_n_type_is_accepted_under_ucsd_dialect() {
-        let diags = check_with_dialect(
-            "PROGRAM Foo; VAR s: STRING[10]; BEGIN END.",
-            Dialect::Ucsd,
-        );
+        let diags = check_with_dialect("PROGRAM Foo; VAR s: STRING[10]; BEGIN END.", Dialect::Ucsd);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -2583,9 +2589,7 @@ mod tests {
     /// 型エラーは引き続き検出される（エラー耐性）。
     #[test]
     fn string_n_type_dialect_error_does_not_suppress_other_errors() {
-        let diags = check(
-            "PROGRAM Foo; VAR s: STRING[10]; x: INTEGER; BEGIN x := TRUE END.",
-        );
+        let diags = check("PROGRAM Foo; VAR s: STRING[10]; x: INTEGER; BEGIN x := TRUE END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 2, "diagnostics: {diags:?}");
         assert!(errs.iter().any(|d| d.message.contains("STRING")));
@@ -2640,10 +2644,7 @@ mod tests {
     /// 警告・エラーいずれも出ない。
     #[test]
     fn known_compiler_directive_is_accepted_under_ucsd_dialect_without_warning() {
-        let diags = check_with_dialect(
-            "PROGRAM Foo; BEGIN (*$I foo.pas*) END.",
-            Dialect::Ucsd,
-        );
+        let diags = check_with_dialect("PROGRAM Foo; BEGIN (*$I foo.pas*) END.", Dialect::Ucsd);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -2667,7 +2668,10 @@ mod tests {
             "PROGRAM Foo; BEGIN (*$R4*) END.",
         ] {
             let diags = check_with_dialect(src, Dialect::Ucsd);
-            assert!(diags.is_empty(), "unexpected diagnostics for {src:?}: {diags:?}");
+            assert!(
+                diags.is_empty(),
+                "unexpected diagnostics for {src:?}: {diags:?}"
+            );
         }
     }
 
@@ -2675,10 +2679,7 @@ mod tests {
     /// 警告になる（エラーにはしない。UNCONFIRMEDの方針）。
     #[test]
     fn unknown_compiler_directive_is_warned_about_under_ucsd_dialect() {
-        let diags = check_with_dialect(
-            "PROGRAM Foo; BEGIN (*$Q mystery*) END.",
-            Dialect::Ucsd,
-        );
+        let diags = check_with_dialect("PROGRAM Foo; BEGIN (*$Q mystery*) END.", Dialect::Ucsd);
         assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
         assert!(
             diags
@@ -2821,14 +2822,14 @@ mod tests {
         );
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
-        assert!(errs[0].message.contains("array index must be of type INTEGER"));
+        assert!(errs[0]
+            .message
+            .contains("array index must be of type INTEGER"));
     }
 
     #[test]
     fn array_element_type_mismatch_is_reported() {
-        let diags = check(
-            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[1] := TRUE END.",
-        );
+        let diags = check("PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[1] := TRUE END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));
@@ -2846,9 +2847,7 @@ mod tests {
     /// （タスク文書: 「範囲チェックは今回はコンパイル時定数に対してのみ行う」）。
     #[test]
     fn literal_out_of_bounds_array_index_is_reported() {
-        let diags = check(
-            "PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[20] := 1 END.",
-        );
+        let diags = check("PROGRAM Foo; VAR a: ARRAY [1..10] OF INTEGER; BEGIN a[20] := 1 END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("out of bounds"));
@@ -2878,9 +2877,7 @@ mod tests {
     /// 代入可能であること（タスク文書: 配列は構造的型付け）。
     #[test]
     fn structurally_identical_array_types_are_assignment_compatible() {
-        let diags = check(
-            "PROGRAM Foo; VAR a, b: ARRAY [1..5] OF INTEGER; BEGIN a := b END.",
-        );
+        let diags = check("PROGRAM Foo; VAR a, b: ARRAY [1..5] OF INTEGER; BEGIN a := b END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -2939,7 +2936,9 @@ mod tests {
         let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x.field := 1 END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
-        assert!(errs[0].message.contains("cannot access field of non-record type"));
+        assert!(errs[0]
+            .message
+            .contains("cannot access field of non-record type"));
     }
 
     #[test]
@@ -3073,7 +3072,9 @@ mod tests {
         let diags = check("PROGRAM Foo; VAR x: INTEGER; BEGIN x^ := 1 END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
-        assert!(errs[0].message.contains("cannot dereference non-pointer type"));
+        assert!(errs[0]
+            .message
+            .contains("cannot dereference non-pointer type"));
     }
 
     #[test]
@@ -3122,9 +3123,7 @@ mod tests {
 
     #[test]
     fn pointers_of_the_same_type_are_comparable() {
-        let diags = check(
-            "PROGRAM Foo; VAR p, q: ^INTEGER; b: BOOLEAN; BEGIN b := p = q END.",
-        );
+        let diags = check("PROGRAM Foo; VAR p, q: ^INTEGER; b: BOOLEAN; BEGIN b := p = q END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -3133,9 +3132,8 @@ mod tests {
     /// ルールを比較にも一貫して適用する）。
     #[test]
     fn pointers_of_different_pointee_types_are_not_comparable() {
-        let diags = check(
-            "PROGRAM Foo; VAR p: ^INTEGER; q: ^BOOLEAN; b: BOOLEAN; BEGIN b := p = q END.",
-        );
+        let diags =
+            check("PROGRAM Foo; VAR p: ^INTEGER; q: ^BOOLEAN; b: BOOLEAN; BEGIN b := p = q END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));
@@ -3145,9 +3143,7 @@ mod tests {
     /// （ISO 7185はポインタの大小比較を定義しない）。
     #[test]
     fn pointers_do_not_support_ordering_comparisons() {
-        let diags = check(
-            "PROGRAM Foo; VAR p, q: ^INTEGER; b: BOOLEAN; BEGIN b := p < q END.",
-        );
+        let diags = check("PROGRAM Foo; VAR p, q: ^INTEGER; b: BOOLEAN; BEGIN b := p < q END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));
@@ -3161,9 +3157,7 @@ mod tests {
 
     #[test]
     fn assigning_pointer_of_different_pointee_type_is_an_error() {
-        let diags = check(
-            "PROGRAM Foo; VAR p: ^INTEGER; q: ^BOOLEAN; BEGIN p := q END.",
-        );
+        let diags = check("PROGRAM Foo; VAR p: ^INTEGER; q: ^BOOLEAN; BEGIN p := q END.");
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "diagnostics: {diags:?}");
         assert!(errs[0].message.contains("Type mismatch"));

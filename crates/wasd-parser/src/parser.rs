@@ -37,7 +37,7 @@ use wasd_ast::{
     BinOp, Block, CaseBranch, CompilationUnit, ConstDecl, Diagnostic, Expr, FieldDecl,
     ForDirection, FuncDecl, FuncSignature, Identifier, ImplementationSection, InterfaceSection,
     Literal, ParamDecl, ProcDecl, ProcSignature, Program, Severity, Span, Statement, TypeDecl,
-    TypeExpr, Unit, UnOp, VarDecl,
+    TypeExpr, UnOp, Unit, VarDecl,
 };
 use wasd_lexer::{Token, TokenKind};
 
@@ -371,7 +371,10 @@ impl Parser {
                     if negate {
                         self.error(start, "unary '-' cannot be applied to a boolean literal");
                     }
-                    Literal::Bool(lower == "true", Span::new(start.start, self.previous_span().end))
+                    Literal::Bool(
+                        lower == "true",
+                        Span::new(start.start, self.previous_span().end),
+                    )
                 } else {
                     self.error(
                         start,
@@ -383,7 +386,10 @@ impl Parser {
                 }
             }
             other => {
-                self.error(start, format!("expected a literal value, found {}", describe(&other)));
+                self.error(
+                    start,
+                    format!("expected a literal value, found {}", describe(&other)),
+                );
                 if !matches!(other, TokenKind::Semicolon | TokenKind::Eof) {
                     self.advance();
                 }
@@ -445,8 +451,12 @@ impl Parser {
 
         let span = self.peek_span();
         let ty = match self.peek().clone() {
-            TokenKind::Array => self.parse_array_type(if packed { packed_span } else { span }, packed),
-            TokenKind::Record => self.parse_record_type(if packed { packed_span } else { span }, packed),
+            TokenKind::Array => {
+                self.parse_array_type(if packed { packed_span } else { span }, packed)
+            }
+            TokenKind::Record => {
+                self.parse_record_type(if packed { packed_span } else { span }, packed)
+            }
             TokenKind::Caret => self.parse_pointer_type(span),
             TokenKind::Identifier(name) => {
                 self.advance();
@@ -475,7 +485,10 @@ impl Parser {
         };
 
         if packed && !matches!(ty, TypeExpr::Array { .. } | TypeExpr::Record { .. }) {
-            self.error(packed_span, "'PACKED' can only be applied to ARRAY or RECORD types");
+            self.error(
+                packed_span,
+                "'PACKED' can only be applied to ARRAY or RECORD types",
+            );
         }
         ty
     }
@@ -607,7 +620,10 @@ impl Parser {
                         describe(&other)
                     ),
                 );
-                if !matches!(other, TokenKind::RBracket | TokenKind::Semicolon | TokenKind::Eof) {
+                if !matches!(
+                    other,
+                    TokenKind::RBracket | TokenKind::Semicolon | TokenKind::Eof
+                ) {
                     self.advance();
                 }
                 80
@@ -615,7 +631,10 @@ impl Parser {
         };
 
         let close = self.expect_and_span(&TokenKind::RBracket, "']'");
-        TypeExpr::StringN(len, Span::new(type_start.start, close.end.max(type_start.end)))
+        TypeExpr::StringN(
+            len,
+            Span::new(type_start.start, close.end.max(type_start.end)),
+        )
     }
 
     /// `PROCEDURE name(params); [VAR ...] BEGIN ... END;`
@@ -841,7 +860,10 @@ impl Parser {
 
             other => {
                 let span = self.peek_span();
-                self.error(span, format!("expected statement, found {}", describe(&other)));
+                self.error(
+                    span,
+                    format!("expected statement, found {}", describe(&other)),
+                );
                 None
             }
         }
@@ -883,7 +905,11 @@ impl Parser {
     /// `;`区切りの文の並びを、`terminator`（`BEGIN...END`なら`END`、
     /// `REPEAT...UNTIL`なら`UNTIL`）の手前までパースする。`terminator`
     /// 自体は消費せず、呼び出し元が消費する。
-    fn parse_statement_sequence(&mut self, terminator: &TokenKind, terminator_desc: &str) -> Vec<Statement> {
+    fn parse_statement_sequence(
+        &mut self,
+        terminator: &TokenKind,
+        terminator_desc: &str,
+    ) -> Vec<Statement> {
         let mut statements = Vec::new();
         loop {
             // 連続するセミコロン（空文）を読み飛ばす。
@@ -1133,10 +1159,18 @@ impl Parser {
             self.advance();
             let value = self.parse_expr();
             let span = Span::new(designator.span().start, value.span().end);
-            Some(Statement::Assignment { target: designator, value, span })
+            Some(Statement::Assignment {
+                target: designator,
+                value,
+                span,
+            })
         } else if matches!(designator, Expr::Identifier(_)) {
             let span = name.span;
-            Some(Statement::ProcCall { name, args: vec![], span })
+            Some(Statement::ProcCall {
+                name,
+                args: vec![],
+                span,
+            })
         } else {
             let span = self.peek_span();
             let found = describe(self.peek());
@@ -1428,7 +1462,10 @@ impl Parser {
                 Expr::Paren(Box::new(inner), Span::new(span.start, close.end))
             }
             other => {
-                self.error(span, format!("expected expression, found {}", describe(&other)));
+                self.error(
+                    span,
+                    format!("expected expression, found {}", describe(&other)),
+                );
                 // 明らかに式の一部になり得ない同期用トークンは消費せずに
                 // 呼び出し元へ戻す（無限ループ防止と、上位の同期処理に委ねるため）。
                 if !matches!(
@@ -1562,7 +1599,8 @@ impl Parser {
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
-        self.diagnostics.push(Diagnostic::new(span, Severity::Error, message));
+        self.diagnostics
+            .push(Diagnostic::new(span, Severity::Error, message));
     }
 }
 
@@ -1773,7 +1811,8 @@ mod tests {
     /// テスト対象(4a): 加減算より乗除算が強く結合する（`1 + 2 * 3`）。
     #[test]
     fn respects_additive_and_multiplicative_precedence() {
-        let (program, diags) = parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := 1 + 2 * 3 END.");
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := 1 + 2 * 3 END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -1824,10 +1863,7 @@ mod tests {
                     assert!(matches!(rhs.as_ref(), Expr::Identifier(id) if id.name == "c"));
                     assert!(matches!(
                         lhs.as_ref(),
-                        Expr::BinaryOp {
-                            op: BinOp::And,
-                            ..
-                        }
+                        Expr::BinaryOp { op: BinOp::And, .. }
                     ));
                 }
                 other => panic!("expected OR at the top, got {other:?}"),
@@ -1874,7 +1910,10 @@ mod tests {
             END.
         "#;
         let (program, diags) = parse_source(src);
-        assert!(!diags.is_empty(), "expected at least one diagnostic for GOTO");
+        assert!(
+            !diags.is_empty(),
+            "expected at least one diagnostic for GOTO"
+        );
         let program = program.expect("parser should still produce a Program despite the error");
         assert_eq!(program.body.statements.len(), 1);
         match &program.body.statements[0] {
@@ -1900,7 +1939,10 @@ mod tests {
             END.
         "#;
         let (program, diags) = parse_source(src);
-        assert!(!diags.is_empty(), "expected at least one diagnostic for the stray UNTIL");
+        assert!(
+            !diags.is_empty(),
+            "expected at least one diagnostic for the stray UNTIL"
+        );
         assert!(
             program.is_some(),
             "parser should still produce a Program despite the error"
@@ -1944,9 +1986,8 @@ mod tests {
     /// `FOR ... DOWNTO ... DO`が正しくパースされること。
     #[test]
     fn parses_for_downto_statement() {
-        let (program, diags) = parse_source(
-            "PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 10 DOWNTO 1 DO i := i END.",
-        );
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR i: INTEGER; BEGIN FOR i := 10 DOWNTO 1 DO i := i END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2003,7 +2044,9 @@ mod tests {
         let program = program.expect("should parse a Program");
 
         match &program.body.statements[1] {
-            Statement::Repeat { body, until_cond, .. } => {
+            Statement::Repeat {
+                body, until_cond, ..
+            } => {
                 assert_eq!(body.len(), 2);
                 assert!(matches!(
                     until_cond,
@@ -2020,8 +2063,9 @@ mod tests {
     /// `REPEAT`の本体が1文だけの場合もパースできること。
     #[test]
     fn parses_repeat_until_with_single_statement() {
-        let (program, diags) =
-            parse_source("PROGRAM Foo; VAR i: INTEGER; BEGIN i := 0; REPEAT i := i + 1 UNTIL i = 1 END.");
+        let (program, diags) = parse_source(
+            "PROGRAM Foo; VAR i: INTEGER; BEGIN i := 0; REPEAT i := i + 1 UNTIL i = 1 END.",
+        );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2052,7 +2096,9 @@ mod tests {
         let program = program.expect("should parse a Program");
 
         match &program.body.statements[0] {
-            Statement::Case { selector, branches, .. } => {
+            Statement::Case {
+                selector, branches, ..
+            } => {
                 assert!(matches!(selector, Expr::Identifier(id) if id.name == "x"));
                 assert_eq!(branches.len(), 2);
                 assert_eq!(branches[0].labels.len(), 2);
@@ -2074,9 +2120,8 @@ mod tests {
     /// 末尾のセミコロン（最後の分岐の後の`;`）を許容すること。
     #[test]
     fn parses_case_statement_with_trailing_semicolon() {
-        let (program, diags) = parse_source(
-            "PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1; END END.",
-        );
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1; END END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2186,13 +2231,7 @@ mod tests {
         match &func.body.statements[0] {
             Statement::Assignment { target, value, .. } => {
                 assert!(matches!(target, Expr::Identifier(id) if id.name == "Square"));
-                assert!(matches!(
-                    value,
-                    Expr::BinaryOp {
-                        op: BinOp::Mul,
-                        ..
-                    }
-                ));
+                assert!(matches!(value, Expr::BinaryOp { op: BinOp::Mul, .. }));
             }
             other => panic!("expected an Assignment, got {other:?}"),
         }
@@ -2201,9 +2240,8 @@ mod tests {
     /// 関数呼び出し式`Foo(1, 2)`が`Expr::FuncCall`としてパースされること。
     #[test]
     fn parses_function_call_expression() {
-        let (program, diags) = parse_source(
-            "PROGRAM Foo; VAR x: INTEGER; BEGIN x := Add(1, 2) END.",
-        );
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := Add(1, 2) END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2380,9 +2418,8 @@ mod tests {
     /// こと（既存の挙動が壊れていないことのリグレッション確認）。
     #[test]
     fn case_statement_without_otherwise_has_none() {
-        let (program, diags) = parse_source(
-            "PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1 END END.",
-        );
+        let (program, diags) =
+            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN CASE x OF 1: x := 1 END END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2396,8 +2433,7 @@ mod tests {
     /// 値が正しくデコードされること。
     #[test]
     fn parses_hex_literal_expression() {
-        let (program, diags) =
-            parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := $FF END.");
+        let (program, diags) = parse_source("PROGRAM Foo; VAR x: INTEGER; BEGIN x := $FF END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2424,8 +2460,7 @@ mod tests {
     /// `Statement::CompilerDirective`としてパースされること。
     #[test]
     fn parses_compiler_directive_statement() {
-        let (program, diags) =
-            parse_source("PROGRAM Foo; BEGIN (*$I foo.pas*) END.");
+        let (program, diags) = parse_source("PROGRAM Foo; BEGIN (*$I foo.pas*) END.");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let program = program.expect("should parse a Program");
 
@@ -2550,7 +2585,9 @@ mod tests {
                     match array.as_ref() {
                         Expr::IndexAccess { array, index, .. } => {
                             assert!(matches!(index.as_ref(), Expr::IntLiteral(1, _)));
-                            assert!(matches!(array.as_ref(), Expr::Identifier(id) if id.name == "a"));
+                            assert!(
+                                matches!(array.as_ref(), Expr::Identifier(id) if id.name == "a")
+                            );
                         }
                         other => panic!("expected a nested IndexAccess, got {other:?}"),
                     }

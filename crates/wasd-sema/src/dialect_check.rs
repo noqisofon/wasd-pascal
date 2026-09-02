@@ -12,7 +12,7 @@
 //! （`SemaContext::check_dialect_gate`はここの[`check_dialect_gate`]を
 //! 薄くラップしたもの）。
 
-use wasd_ast::{Dialect, Diagnostic, Severity, Span};
+use wasd_ast::{Diagnostic, Dialect, Severity, Span};
 
 /// UCSD拡張構文が`dialect`のもとで許可されているかを判定する。
 ///
@@ -51,7 +51,9 @@ mod tests {
     #[test]
     fn returns_none_when_dialect_matches_requirement() {
         let span = Span::new(0, 4);
-        assert!(check_dialect_gate(Dialect::Ucsd, span, "UNIT declarations", Dialect::Ucsd).is_none());
+        assert!(
+            check_dialect_gate(Dialect::Ucsd, span, "UNIT declarations", Dialect::Ucsd).is_none()
+        );
     }
 
     #[test]

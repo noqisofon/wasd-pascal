@@ -95,27 +95,27 @@ pub enum TokenKind {
     StringLiteral(String),
 
     // --- 記号 ---
-    Assign,     // :=
-    Le,         // <=
-    Ge,         // >=
-    Ne,         // <>
-    DotDot,     // ..
-    Plus,       // +
-    Minus,      // -
-    Star,       // *
-    Slash,      // /
-    Eq,         // =
-    Lt,         // <
-    Gt,         // >
-    LParen,     // (
-    RParen,     // )
-    LBracket,   // [
-    RBracket,   // ]
-    Dot,        // .
-    Comma,      // ,
-    Semicolon,  // ;
-    Colon,      // :
-    Caret,      // ^
+    Assign,    // :=
+    Le,        // <=
+    Ge,        // >=
+    Ne,        // <>
+    DotDot,    // ..
+    Plus,      // +
+    Minus,     // -
+    Star,      // *
+    Slash,     // /
+    Eq,        // =
+    Lt,        // <
+    Gt,        // >
+    LParen,    // (
+    RParen,    // )
+    LBracket,  // [
+    RBracket,  // ]
+    Dot,       // .
+    Comma,     // ,
+    Semicolon, // ;
+    Colon,     // :
+    Caret,     // ^
 
     /// UCSD拡張: コンパイラディレクティブ `(*$I foo.pas*)` のようなコメント風構文。
     /// 通常コメントとは区別し、`name`（`$`直後の英数字の並び。例: `"I"`）と
@@ -127,7 +127,10 @@ pub enum TokenKind {
     /// `args`とする実装にしている。単一文字のディレクティブコード
     /// （`$I`, `$U`, `$S`など）を想定した設計であり、将来一次資料で
     /// 異なる文法が確認された場合は要修正。
-    CompilerDirective { name: String, args: String },
+    CompilerDirective {
+        name: String,
+        args: String,
+    },
 
     /// ソース終端を表す番兵トークン。`wasd-parser`が先読みしやすいように含める。
     Eof,

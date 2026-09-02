@@ -29,8 +29,12 @@ pub enum SymbolKind {
     Var,
     Const,
     /// 仮引数。`by_ref`は`VAR`引数（参照渡し）かどうか。
-    Param { by_ref: bool },
-    Proc { params: Vec<ParamSignature> },
+    Param {
+        by_ref: bool,
+    },
+    Proc {
+        params: Vec<ParamSignature>,
+    },
     Func {
         params: Vec<ParamSignature>,
         return_type: Type,
