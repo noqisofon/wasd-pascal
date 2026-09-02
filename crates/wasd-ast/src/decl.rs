@@ -265,7 +265,21 @@ pub enum TypeExpr {
     Boolean(Span),
     Char(Span),
     /// UCSD拡張: `STRING[n]`（`n`は最大長）。
-    StringN(usize, Span),
+    ///
+    /// # Step 16: `n`の型を`u8`にした理由
+    ///
+    /// `n`（最大長）は0-255の範囲に制約される（[`crate::decl`]モジュール外、
+    /// `crates/wasd-parser/src/parser.rs`の`parse_string_n_type`のドキュメント
+    /// 参照）。この制約自体は、STRING[n]のメモリレイアウトが「先頭1バイト＝
+    /// 長さ、続く最大`n`バイトが文字データ」（長さフィールドが1バイトである
+    /// こと）を前提とした場合の論理的帰結であり、その前提自体はUCSD
+    /// p-System固有の一次資料では確認できていない（`docs/research/
+    /// ucsd-pascal-primary-sources.md`の「Step 16セッション」節、UNCONFIRMED
+    /// 項目1参照）。一般的なPascal系実装の慣習としては広く確認されている
+    /// レイアウトであり、この前提のもとでは`n`が`u8`に収まることは
+    /// 一次資料の確認を要さない単純な算術的帰結（1バイトの長さフィールドが
+    /// 表現できる最大値は255）である。
+    StringN(u8, Span),
     /// `TYPE`セクションで宣言された型名への参照（未解決）。
     Named(Identifier),
     /// `ARRAY [low..high] OF element`（`PACKED`修飾を含む）。

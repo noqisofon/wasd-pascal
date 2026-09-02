@@ -97,3 +97,46 @@ pub const BUILTIN_WRITELN_NONE: u8 = 3;
 /// それを暗黙に約束している点に注意（[`crate::codegen::CodeGenerator::gen_writeln_call`]
 /// 参照）。
 pub const BUILTIN_WRITELN_STRING: u8 = 4;
+
+/// `WriteLn(STRING[n]変数)`に対応する、wasd-pcode独自の簡易procedure番号。
+/// [`BUILTIN_WRITELN_INT`]と同様UNCONFIRMED。
+///
+/// # Step 16: `STRING[n]`変数の中身をランタイムで読む
+///
+/// [`BUILTIN_WRITELN_STRING`]（文字列リテラル）とは異なり、`STRING[n]`
+/// 変数の中身はコンパイル時には分からない（実行時に代入された値による）。
+/// そのため、コンパイル時に確定する`string_pool`インデックスではなく、
+/// 変数自身の**アドレス**（[`crate::opcode::UnconfirmedOp::Lda`]で積む）を
+/// スタックへ積んでこのprocedureを呼ぶ（
+/// [`crate::codegen::CodeGenerator::gen_writeln_call`]参照）。
+///
+/// 呼び出された側（`pmachine-core`の`call_builtin_kernel`）は、popした
+/// アドレスの指す1ワードを「長さ」として読み、続く「長さ」ワード分を
+/// 文字コード（1ワード=1文字）として読んで出力する。
+///
+/// # メモリレイアウト: 「1ワード=1文字」という単純化（UNCONFIRMED）
+///
+/// UCSD Pascalの`STRING[n]`は一次資料の慣習として「先頭1バイト＝長さ、
+/// 続く最大`n`バイトが文字データ」という**バイト単位**のレイアウトを持つと
+/// 理解しているが、UCSD p-System固有の一次資料での確証は得られていない
+/// （`docs/research/ucsd-pascal-primary-sources.md`のStep 16セッション節
+/// 参照。archive.org等の一次資料ホストへのアクセスがすべてネットワーク
+/// egressプロキシにブロックされ、直接確認できなかった）。
+///
+/// 加えて、p-machineは16ビットワード単位でアドレッシングする
+/// （[`crate::opcode::Address`]のドキュメント参照）ため、本クレートの
+/// 既存の`LOD`/`STR`は1ワード単位でしか読み書きできず、1ワードに2文字を
+/// 詰める本来のバイトパッキング（未確認）や、ワード内の特定バイトだけを
+/// 読み書きする命令は一切実装していない。新規命令を安易に創作しない
+/// という方針（`crates/wasd-pcode/src/opcode.rs`モジュールドキュメント
+/// 参照）のもと、既存の`LDC`/`LOD`/`STR`/`LDA`だけで実装できる
+/// 「長さ1ワード + 文字ごとに1ワード（`max_len`ワード分を常に確保）」
+/// という単純化されたレイアウトを採用する。これは実際のUCSD p-System
+/// のバイト単位レイアウトを再現するものでは**ない**（本クレートが既に
+/// 採用している「`WriteLn`はKERNELへの簡略化されたCXG呼び出しとして
+/// 表現するが、正式なUNITWRITE呼び出し規約は再現しない」という方針と
+/// 同じ種類の意図的な簡略化）。
+///
+/// この結果、`STRING[n]`変数1個が占めるワード数は`1 + n`
+/// （[`crate::codegen::CodeGenerator`]の`declare_vars`参照）。
+pub const BUILTIN_WRITELN_STRVAR: u8 = 5;

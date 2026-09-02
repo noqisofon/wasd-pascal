@@ -207,6 +207,34 @@ fn run_reports_out_of_scope_constructs_without_panicking() {
         .stdout(predicate::str::contains("<not run:"));
 }
 
+/// Step 16: `string_test.pas`（`STRING[80]`変数へ文字列リテラルを代入し
+/// `WriteLn`する）は、`ucsd_unit.pas`と同様UCSD拡張構文を使うため
+/// `--std=ucsd`が必要。
+#[test]
+fn check_succeeds_on_string_test_with_std_ucsd() {
+    wasdc()
+        .arg("check")
+        .arg(example("string_test.pas"))
+        .arg("--std=ucsd")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK: no errors found"));
+}
+
+/// Step 16のゴール: `wasdc run --std=ucsd examples/string_test.pas`が実際に
+/// `Hello, world!`と出力すること。
+#[test]
+fn run_executes_string_test_and_prints_hello_world() {
+    wasdc()
+        .arg("run")
+        .arg(example("string_test.pas"))
+        .arg("--std=ucsd")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hello, world!\n"))
+        .stdout(predicate::str::contains("OK: program ran to completion"));
+}
+
 #[test]
 fn missing_file_exits_with_io_error_code() {
     wasdc()

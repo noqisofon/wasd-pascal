@@ -6,10 +6,15 @@
 //! 論理演算（`AND OR NOT`）、代入文、`IF`/`WHILE`/`REPEAT UNTIL`/`FOR`による
 //! 制御構造、`BEGIN...END`の複合文、`PROGRAM ... BEGIN ... END.`全体構造、
 //! および`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の呼び出し
-//! （値引数・`VAR`引数・再帰呼び出し・関数の戻り値を含む）を扱う。
-//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、組み込み
-//! 手続き、`PROCEDURE`内`PROCEDURE`のような多段のネストは別ステップに回す
-//! （[`codegen::CodeGenerator`]のドキュメント参照）。
+//! （値引数・`VAR`引数・再帰呼び出し・関数の戻り値を含む）を扱う。Step 16
+//! からはUCSD拡張の`STRING[n]`型（`PROGRAM`直下のグローバル`VAR`宣言のみ、
+//! 文字列リテラルの代入と`WriteLn`への直接渡しのみ）も扱う
+//! （[`codegen::CodeGenerator::gen_string_literal_assignment`]・
+//! [`builtin::BUILTIN_WRITELN_STRVAR`]参照）。
+//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、`STRING[n]`
+//! のローカル変数・仮引数、文字列演算（比較・連結・部分アクセス等）、
+//! `WriteLn`以外の組み込み手続き、`PROCEDURE`内`PROCEDURE`のような多段の
+//! ネストは別ステップに回す（[`codegen::CodeGenerator`]のドキュメント参照）。
 //!
 //! p-machine命令セットの実バイナリ実行（p-machine本体）は別クレート
 //! （`pmachine-core`、未着手）を想定しており、本クレートはそれに向けた
@@ -29,7 +34,7 @@ pub mod text;
 
 pub use builtin::{
     BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
-    KERNEL_SEGMENT,
+    BUILTIN_WRITELN_STRVAR, KERNEL_SEGMENT,
 };
 pub use codegen::CodeGenerator;
 pub use ir::{Instruction, PCodeModule, RoutineMeta};

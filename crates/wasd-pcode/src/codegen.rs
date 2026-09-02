@@ -118,7 +118,7 @@ use wasd_ast::{
 
 use crate::builtin::{
     BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
-    KERNEL_SEGMENT,
+    BUILTIN_WRITELN_STRVAR, KERNEL_SEGMENT,
 };
 use crate::ir::{Instruction, PCodeModule, RoutineMeta};
 use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, UnconfirmedOp};
@@ -129,27 +129,48 @@ use crate::opcode::{Address, CodeAddress, ConfirmedOp, Level, Opcode, Unconfirme
 struct PendingJump(usize);
 
 /// 式・変数・定数・`FUNCTION`戻り値の「種類」。本クレートのスコープは
-/// `INTEGER`/`BOOLEAN`の2型のみなので、`wasd_sema::Type`のような一般的な
-/// 型表現ではなく、この最小限の2値enumで済ませる。`WriteLn(expr)`が
-/// `BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`のどちらを呼ぶべきかを
-/// 決めるためだけに使う（[`CodeGenerator::infer_expr_kind`]参照）。
+/// `INTEGER`/`BOOLEAN`/`STRING[n]`（Step 16から）のみなので、
+/// `wasd_sema::Type`のような一般的な型表現ではなく、この最小限のenumで
+/// 済ませる。`WriteLn(expr)`が`BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`/
+/// `BUILTIN_WRITELN_STRVAR`のどれを呼ぶべきかを決めるためだけに使う
+/// （[`CodeGenerator::infer_expr_kind`]参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueKind {
     Int,
     Bool,
+    /// UCSD拡張`STRING[n]`（Step 16）。`u8`は宣言された最大長
+    /// （`wasd_ast::TypeExpr::StringN`のドキュメント参照）。`INTEGER`/
+    /// `BOOLEAN`と異なり1ワードの値ではなく、`1 + max_len`ワードを占める
+    /// 複合的な変数を指す点に注意（[`word_size_of`]、
+    /// [`CodeGenerator::declare_vars`]参照）。
+    StringN(u8),
 }
 
 /// `TypeExpr`をこのクレートのスコープが対応する[`ValueKind`]へ変換する。
-/// `INTEGER`/`BOOLEAN`以外（このクレートのスコープ外の型）は`None`。
+/// `INTEGER`/`BOOLEAN`/`STRING[n]`以外（このクレートのスコープ外の型）は
+/// `None`。
 fn value_kind_of(ty: &TypeExpr) -> Option<ValueKind> {
     match ty {
         TypeExpr::Integer(_) => Some(ValueKind::Int),
         TypeExpr::Boolean(_) => Some(ValueKind::Bool),
+        TypeExpr::StringN(n, _) => Some(ValueKind::StringN(*n)),
         _ => None,
     }
 }
 
-/// グローバル変数1件の情報。
+/// [`ValueKind`]の値が占めるワード数。`INTEGER`/`BOOLEAN`は1ワード、
+/// `STRING[n]`は`1 + n`ワード（先頭1ワードが長さ、続く`n`ワードが
+/// 文字データ。[`crate::builtin::BUILTIN_WRITELN_STRVAR`]のドキュメント
+/// 「メモリレイアウト」参照）。
+fn word_size_of(kind: ValueKind) -> u16 {
+    match kind {
+        ValueKind::Int | ValueKind::Bool => 1,
+        ValueKind::StringN(max_len) => 1 + max_len as u16,
+    }
+}
+
+/// グローバル変数1件の情報。`address`は`STRING[n]`の場合、先頭ワード
+/// （長さ）のアドレスを指す（[`word_size_of`]参照）。
 #[derive(Debug, Clone, Copy)]
 struct VarSlot {
     address: Address,
@@ -378,24 +399,31 @@ impl CodeGenerator {
                     decl.ty.span(),
                     format!(
                         "VAR type '{}' is out of scope for this step's minimal codegen (only \
-                         INTEGER/BOOLEAN are supported)",
+                         INTEGER/BOOLEAN/STRING[n] are supported)",
                         describe_type(&decl.ty)
                     ),
                 );
                 continue;
             };
             for name in &decl.names {
-                let address = self.alloc_slot();
+                let address = self.alloc_words(word_size_of(kind));
                 self.vars
                     .insert(normalize(&name.name), VarSlot { address, kind });
             }
         }
     }
 
-    fn alloc_slot(&mut self) -> Address {
+    /// グローバルデータ領域から`words`ワード分を確保し、先頭アドレスを
+    /// 返す（`STRING[n]`のような複数ワードを占める変数向け。
+    /// [`Self::alloc_slot`]は`words = 1`の場合の薄いラッパー）。
+    fn alloc_words(&mut self, words: u16) -> Address {
         let address = Address(self.next_address);
-        self.next_address += 1;
+        self.next_address += words;
         address
+    }
+
+    fn alloc_slot(&mut self) -> Address {
+        self.alloc_words(1)
     }
 
     // ---- PROCEDURE/FUNCTION宣言の登録 ----
@@ -419,6 +447,20 @@ impl CodeGenerator {
                 );
                 continue;
             };
+            // Step 16: `STRING[n]`はPROGRAM直下のグローバル`VAR`のみサポート
+            // する（`crate::builtin::BUILTIN_WRITELN_STRVAR`のドキュメント、
+            // `crate`モジュールドキュメント参照）。仮引数は活性化レコード
+            // 内に1ワードのスロットしか持たない前提（`FrameSlot`のドキュメント
+            // 参照）のため、複数ワードを占める`STRING[n]`はここではまだ
+            // 扱えない。
+            if matches!(kind, ValueKind::StringN(_)) {
+                self.error(
+                    p.ty.span(),
+                    "STRING[n] parameters are out of scope for this step's minimal codegen \
+                     (only PROGRAM-level global STRING[n] variables are supported)",
+                );
+                continue;
+            }
             let slot = FrameSlot {
                 address: Address(param_base + result.len() as u16),
                 by_ref: p.by_ref,
@@ -450,6 +492,17 @@ impl CodeGenerator {
                 );
                 continue;
             };
+            // Step 16: `build_params`と同じ理由で、`STRING[n]`のローカル
+            // 変数（`PROCEDURE`/`FUNCTION`本体内の`VAR`宣言）はまだ
+            // サポートしない。
+            if matches!(kind, ValueKind::StringN(_)) {
+                self.error(
+                    decl.ty.span(),
+                    "STRING[n] local variables are out of scope for this step's minimal \
+                     codegen (only PROGRAM-level global STRING[n] variables are supported)",
+                );
+                continue;
+            }
             for name in &decl.names {
                 let slot = FrameSlot {
                     address: Address(5 + count),
@@ -872,9 +925,14 @@ impl CodeGenerator {
         }
 
         match self.resolve_var(&key) {
-            Some(resolved) => {
-                self.gen_store_resolved(resolved, span, |g| g.gen_expr(value));
-            }
+            Some(resolved) => match self.lookup_kind(&key) {
+                Some(ValueKind::StringN(max_len)) => {
+                    self.gen_string_literal_assignment(resolved, max_len, value, span);
+                }
+                _ => {
+                    self.gen_store_resolved(resolved, span, |g| g.gen_expr(value));
+                }
+            },
             None => {
                 if let Some(info) = self.routines.get(&key) {
                     if info.is_func {
@@ -899,6 +957,76 @@ impl CodeGenerator {
                 }
                 self.gen_expr(value);
             }
+        }
+    }
+
+    /// `s := 'literal';`（`s`が`STRING[max_len]`）のコード生成。
+    ///
+    /// # スコープ: 文字列リテラルの代入のみ
+    ///
+    /// タスクのスコープ（このステップでは文字列演算・変数間代入は対象外。
+    /// `crate`モジュールドキュメント参照）に従い、右辺が文字列リテラル
+    /// でない場合（他の`STRING[n]`変数からの代入等）はスコープ外として
+    /// エラー報告のみ行う。
+    ///
+    /// # 生成する命令列: 長さワード + 文字ごとに1ワード
+    ///
+    /// [`crate::builtin::BUILTIN_WRITELN_STRVAR`]のドキュメント「メモリ
+    /// レイアウト」で説明した単純化されたレイアウト（1ワード=1文字）に
+    /// 従い、まず長さをアドレス（`resolved.address`）へ`STR`し、続けて
+    /// 各文字コードを`resolved.address + 1 + i`へ`STR`する。新規オペコードは
+    /// 一切必要とせず、既存の`LDC`/`STR`のみで表現できる。
+    fn gen_string_literal_assignment(
+        &mut self,
+        resolved: ResolvedVar,
+        max_len: u8,
+        value: &Expr,
+        span: Span,
+    ) {
+        if resolved.by_ref {
+            self.error(
+                span,
+                "assigning to a STRING[n] VAR parameter is out of scope for this step's \
+                 minimal codegen",
+            );
+            return;
+        }
+        let Expr::StringLiteral(text, lit_span) = value else {
+            self.error(
+                value.span(),
+                "assigning a value other than a string literal to a STRING[n] variable is out \
+                 of scope for this step's minimal codegen",
+            );
+            return;
+        };
+
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() > max_len as usize {
+            self.error(
+                *lit_span,
+                format!(
+                    "string literal of length {} does not fit in STRING[{max_len}]",
+                    chars.len()
+                ),
+            );
+            return;
+        }
+
+        self.emit(UnconfirmedOp::Ldc(chars.len() as i16).into(), *lit_span);
+        self.emit(
+            UnconfirmedOp::Str(resolved.level, resolved.address).into(),
+            span,
+        );
+        for (i, ch) in chars.iter().enumerate() {
+            // UNCONFIRMED: ASCII範囲（0..=127）のみ想定。それを超える文字
+            // コードのp-machine上での扱いは一次資料未確認（このクレートの
+            // 他の箇所と同様、本ステップのスコープ外）。
+            self.emit(UnconfirmedOp::Ldc(*ch as i16).into(), *lit_span);
+            let char_address = Address(resolved.address.0 + 1 + i as u16);
+            self.emit(
+                UnconfirmedOp::Str(resolved.level, char_address).into(),
+                span,
+            );
         }
     }
 
@@ -1069,8 +1197,13 @@ impl CodeGenerator {
     ///   を（[`Self::emit_ldc_int`]で、簡略化した自前のプロトコルとして）
     ///   スタックへ積み、`BUILTIN_WRITELN_STRING`を呼ぶ（
     ///   [`crate::builtin::BUILTIN_WRITELN_STRING`]のドキュメント参照）。
-    /// - 引数1つ（文字列リテラル以外の`WriteLn(expr)`）: `expr`を評価して
-    ///   スタックへ積み、その式の種類（[`Self::infer_expr_kind`]）に応じて
+    /// - 引数1つ（文字列リテラル以外の`WriteLn(expr)`）で`STRING[n]`変数の
+    ///   場合（Step 16）: `expr`を評価する（`gen_expr`で値をスタックへ積む）
+    ///   のではなく、変数自身の**アドレス**を積んで`BUILTIN_WRITELN_STRVAR`
+    ///   を呼ぶ（[`Self::gen_writeln_string_var`]、
+    ///   [`crate::builtin::BUILTIN_WRITELN_STRVAR`]のドキュメント参照）。
+    /// - 引数1つ（それ以外の`WriteLn(expr)`）: `expr`を評価してスタックへ
+    ///   積み、その式の種類（[`Self::infer_expr_kind`]）に応じて
     ///   `BUILTIN_WRITELN_INT`/`BUILTIN_WRITELN_BOOL`のいずれかを呼ぶ。
     ///   `INTEGER`/`BOOLEAN`以外（`REAL`等、今回のスコープ外）と推論された
     ///   場合はエラーを報告する。
@@ -1093,17 +1226,23 @@ impl CodeGenerator {
                     span,
                 );
             }
+            [arg] if matches!(self.infer_expr_kind(arg), Some(ValueKind::StringN(_))) => {
+                self.gen_writeln_string_var(arg, span);
+            }
             [arg] => {
                 let kind = self.infer_expr_kind(arg);
                 self.gen_expr(arg);
                 let proc = match kind {
                     Some(ValueKind::Int) => BUILTIN_WRITELN_INT,
                     Some(ValueKind::Bool) => BUILTIN_WRITELN_BOOL,
+                    Some(ValueKind::StringN(_)) => {
+                        unreachable!("STRING[n] arguments are handled by the previous match arm")
+                    }
                     None => {
                         self.error(
                             arg.span(),
-                            "WriteLn only supports INTEGER/BOOLEAN/string literal arguments in \
-                             this step's minimal codegen",
+                            "WriteLn only supports INTEGER/BOOLEAN/STRING[n]/string literal \
+                             arguments in this step's minimal codegen",
                         );
                         BUILTIN_WRITELN_INT
                     }
@@ -1119,6 +1258,51 @@ impl CodeGenerator {
                 for arg in args {
                     self.gen_expr(arg);
                 }
+            }
+        }
+    }
+
+    /// `WriteLn(s)`（`s`が`STRING[n]`変数）のコード生成（Step 16）。
+    ///
+    /// `s`自体の値ではなく**アドレス**（[`Self::gen_address_of_resolved`]）
+    /// をスタックへ積んでから`BUILTIN_WRITELN_STRVAR`を呼ぶ。呼び出された
+    /// 側（`pmachine-core`）がそのアドレスから長さ＋文字データを読み出す
+    /// （[`crate::builtin::BUILTIN_WRITELN_STRVAR`]のドキュメント参照）。
+    ///
+    /// スコープ: 単純な変数参照のみ（[`Self::gen_var_arg`]と同じ制限）。
+    /// `VAR`仮引数（`by_ref`）は`STRING[n]`仮引数自体が今回のスコープ外
+    /// （[`Self::build_params`]参照）なので到達しないはずだが、念のため
+    /// 防御的にエラー報告する。
+    fn gen_writeln_string_var(&mut self, arg: &Expr, span: Span) {
+        let Expr::Identifier(ident) = arg else {
+            self.error(
+                arg.span(),
+                "WriteLn(STRING[n]) only supports a simple variable reference in this step's \
+                 minimal codegen",
+            );
+            return;
+        };
+        let key = normalize(&ident.name);
+        match self.resolve_var(&key) {
+            Some(resolved) if !resolved.by_ref => {
+                self.gen_address_of_resolved(resolved, span);
+                self.emit(
+                    ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRVAR).into(),
+                    span,
+                );
+            }
+            Some(_) => {
+                self.error(
+                    ident.span,
+                    "WriteLn(STRING[n]) for a VAR parameter is out of scope for this step's \
+                     minimal codegen",
+                );
+            }
+            None => {
+                self.error(
+                    ident.span,
+                    format!("'{}' is not a known variable in this scope", ident.name),
+                );
             }
         }
     }

@@ -17,7 +17,7 @@ use wasd_parser::Parser;
 use wasd_pcode::{
     Address, CodeAddress, CodeGenerator, ConfirmedOp, Level, Opcode, PCodeModule, UnconfirmedOp,
     BUILTIN_WRITELN_BOOL, BUILTIN_WRITELN_INT, BUILTIN_WRITELN_NONE, BUILTIN_WRITELN_STRING,
-    KERNEL_SEGMENT,
+    BUILTIN_WRITELN_STRVAR, KERNEL_SEGMENT,
 };
 
 fn parse_program(source: &str) -> Program {
@@ -845,4 +845,161 @@ fn less_than_and_greater_than_are_synthesized_from_geqi_leqi_and_not() {
         .windows(2)
         .any(|w| w == [op(UnconfirmedOp::Leq), op(UnconfirmedOp::Not)]);
     assert!(leq_not, "expected LEQI immediately followed by NOT for `>`, got {ops:?}");
+}
+
+// ---- Step 16: STRING[n] ----
+
+/// `STRING[n]`型のグローバル`VAR`が`1 + n`ワード確保すること
+/// （`crate::builtin::BUILTIN_WRITELN_STRVAR`のドキュメント「メモリ
+/// レイアウト」参照: 先頭1ワードが長さ、続く`n`ワードが文字データ）。
+#[test]
+fn string_n_variable_reserves_one_plus_max_len_words() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR s: STRING[5];
+        BEGIN
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(module.global_data_words, 6);
+}
+
+/// `s := 'Hi';`（`s: STRING[5]`）が「長さを`Address(0)`へ`STR`、続けて
+/// 各文字コードを`Address(1)`, `Address(2)`, ...へ`STR`」という命令列に
+/// なること（`CodeGenerator::gen_string_literal_assignment`参照）。
+#[test]
+fn string_literal_assignment_generates_length_and_char_stores() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR s: STRING[5];
+        BEGIN
+            s := 'Hi'
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Ldc(2)), // length
+            op(UnconfirmedOp::Str(Level(0), Address(0))),
+            op(UnconfirmedOp::Ldc('H' as i16)),
+            op(UnconfirmedOp::Str(Level(0), Address(1))),
+            op(UnconfirmedOp::Ldc('i' as i16)),
+            op(UnconfirmedOp::Str(Level(0), Address(2))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `WriteLn(s)`（`s`が`STRING[n]`変数）が、値ではなく変数の**アドレス**
+/// （`LDA`）を積んでから`BUILTIN_WRITELN_STRVAR`を呼ぶこと
+/// （`crate::builtin::BUILTIN_WRITELN_STRVAR`ドキュメント参照）。
+#[test]
+fn writeln_with_string_n_variable_emits_lda_and_cxg_writeln_strvar() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR s: STRING[80];
+        BEGIN
+            s := 'Hello, world!';
+            WriteLn(s)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+    let ops = opcodes(&module);
+
+    assert!(
+        ops.contains(&op(UnconfirmedOp::Lda(Level(0), Address(0)))),
+        "expected LDA of the string variable's address, got {ops:?}"
+    );
+    assert!(
+        ops.contains(&cop(ConfirmedOp::Cxg(
+            KERNEL_SEGMENT,
+            BUILTIN_WRITELN_STRVAR
+        ))),
+        "expected a WriteLn(STRING[n]) call, got {ops:?}"
+    );
+    // The LDA must immediately precede the CXG call (no value push in between).
+    let lda_then_cxg = ops.windows(2).any(|w| {
+        w == [
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRVAR)),
+        ]
+    });
+    assert!(
+        lda_then_cxg,
+        "expected LDA immediately followed by CXG WRITELN_STRVAR, got {ops:?}"
+    );
+}
+
+/// 宣言された最大長を超える文字列リテラルの代入はスコープ外
+/// （コード生成エラー）として報告されること
+/// （`CodeGenerator::gen_string_literal_assignment`参照。`wasd-sema`が
+/// 通常はこれを型エラーとして先に検出するはずだが、本テストは
+/// 意味解析を経由しない`CodeGenerator`単体の防御的チェックを検証する）。
+#[test]
+fn string_literal_longer_than_max_len_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR s: STRING[4];
+        BEGIN
+            s := 'Hello'
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics =
+        result.expect_err("a string literal longer than the declared max length must be rejected");
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("STRING[4]")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `STRING[n]`のローカル変数（`PROCEDURE`/`FUNCTION`本体内の`VAR`宣言）は
+/// このステップのスコープ外としてエラー報告されること
+/// （`CodeGenerator::build_locals`参照。`PROGRAM`直下のグローバル`VAR`のみ
+/// サポートする）。
+#[test]
+fn string_n_local_variable_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Greet;
+        VAR s: STRING[10];
+        BEGIN
+        END;
+        BEGIN
+            Greet
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics =
+        result.expect_err("STRING[n] local variables must be rejected, not codegen'd");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("STRING[n] local variables")),
+        "diagnostics: {diagnostics:?}"
+    );
 }

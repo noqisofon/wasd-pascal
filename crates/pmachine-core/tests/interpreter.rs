@@ -456,3 +456,57 @@ fn writeln_works_from_inside_a_procedure_body() {
     assert_eq!(output.as_string(), "42\n21\n");
     assert_eq!(vm.global(0), Some(21));
 }
+
+/// Step 16のゴール: `STRING[n]`変数に文字列リテラルを代入し、`WriteLn`で
+/// 出力するプログラム（タスク依頼の動作確認用サンプルそのもの）が正しく
+/// 動くこと。
+#[test]
+fn string_n_variable_assignment_and_writeln_prints_the_assigned_value() {
+    let module = common::compile(
+        r#"
+        PROGRAM StringTest;
+        VAR
+            greeting: STRING[80];
+        BEGIN
+            greeting := 'Hello, world!';
+            WriteLn(greeting)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "Hello, world!\n");
+
+    // Word 0 is the string's length prefix; words 1.. hold one character
+    // code per word (crate::builtin::BUILTIN_WRITELN_STRVAR documentation,
+    // "memory layout" section).
+    assert_eq!(vm.global(0), Some(13));
+    assert_eq!(vm.global(1), Some('H' as i16));
+}
+
+/// Step 16: 複数の`STRING[n]`変数への再代入・出力が、それぞれ独立した
+/// 領域に格納され、互いに干渉しないこと。
+#[test]
+fn multiple_string_n_variables_do_not_interfere_with_each_other() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR
+            a: STRING[5];
+            b: STRING[10];
+        BEGIN
+            a := 'Hi';
+            b := 'World';
+            WriteLn(a);
+            WriteLn(b)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "Hi\nWorld\n");
+}
