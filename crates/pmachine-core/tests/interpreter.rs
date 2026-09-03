@@ -510,3 +510,99 @@ fn multiple_string_n_variables_do_not_interfere_with_each_other() {
     vm.run().expect("program should run without error");
     assert_eq!(output.as_string(), "Hi\nWorld\n");
 }
+
+// ---- Step 18: FUNCTION + 引数（値渡し、単一引数）----
+
+/// Step 18のゴール: タスク依頼の動作確認用サンプルそのもの。`FUNCTION`が
+/// `INTEGER`の値仮引数を受け取り戻り値を返すこと（`Double`）、`PROCEDURE`が
+/// `STRING[n]`の値仮引数を受け取ること（`PrintGreeting`）の両方が同じ
+/// プログラム内で正しく動くこと。
+#[test]
+fn function_and_procedure_with_value_parameters_sample_program_runs_correctly() {
+    let module = common::compile(
+        r#"
+        PROGRAM FuncTest;
+
+        FUNCTION Double(x: INTEGER): INTEGER;
+        BEGIN
+            Double := x * 2;
+        END;
+
+        PROCEDURE PrintGreeting(name: STRING[40]);
+        BEGIN
+            WriteLn(name);
+        END;
+
+        VAR
+            n: INTEGER;
+        BEGIN
+            n := Double(21);
+            WriteLn(n);
+            PrintGreeting('Hello from a parameter!');
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "42\nHello from a parameter!\n");
+    assert!(vm.is_halted());
+}
+
+/// Step 18: `STRING[n]`の値仮引数に、リテラルではなく別の`STRING[n]`変数を
+/// 渡した場合でも、呼び出し元の変数の中身が一時領域へコピーされ、正しく
+/// 出力されること（[`wasd_pcode`]の`CodeGenerator::gen_string_value_arg`
+/// が発行する`emit_string_copy_words`の実行結果を検証する）。
+#[test]
+fn string_n_value_parameter_accepts_a_variable_argument() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR
+            greeting: STRING[20];
+
+        PROCEDURE Announce(msg: STRING[20]);
+        BEGIN
+            WriteLn(msg)
+        END;
+
+        BEGIN
+            greeting := 'Hi there';
+            Announce(greeting)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "Hi there\n");
+}
+
+/// Step 18: `PROCEDURE`/`FUNCTION`の値仮引数として`STRING[n]`を複数回
+/// 異なる実引数で呼び出しても、それぞれ独立した一時領域へコピーされ、
+/// 互いに干渉しないこと（`CodeGenerator::gen_string_value_arg`が呼び出し
+/// ごとに新しい一時領域を`alloc_words`で確保する設計の検証）。
+#[test]
+fn string_n_value_parameter_calls_do_not_interfere_across_multiple_calls() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        PROCEDURE Announce(msg: STRING[10]);
+        BEGIN
+            WriteLn(msg)
+        END;
+
+        BEGIN
+            Announce('First');
+            Announce('Second')
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "First\nSecond\n");
+}
