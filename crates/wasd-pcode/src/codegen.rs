@@ -32,13 +32,32 @@
 //! 実行時チェックは行わない方針とも歩調を合わせる。`crates/wasd-sema/src/
 //! typeck.rs`の`infer_index_access_type`ドキュメント参照）。
 //!
-//! `CASE`、`UNIT`、レコード・ポインタ型、`REAL`/`CHAR`型、`WriteLn`
-//! 以外の組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数
-//! 引数の`WriteLn`は意味解析を通過済みのASTに含まれ得るが、本クレートの
-//! 責務では**ない**。遭遇した場合はパニックせず、「未対応機能」の
-//! [`wasd_ast::Diagnostic`]を積んでコード生成のみ諦める（呼び出し元は
-//! レキサ・パーサー・意味解析と同様、`Result::Err`として診断の集合を
-//! 受け取る）。
+//! Step 20からは、`TYPE Name = RECORD field1, field2: T1; ... END;`という
+//! `TYPE`宣言（レコード型のみ。他の種類の`TYPE`宣言——配列型・ポインタ型・
+//! 単純な型名の別名等——は引き続きスコープ外）、およびそのレコード型（＋
+//! `VAR`宣言に直接書かれた無名レコード型）を持つ`PROGRAM`直下のグローバル
+//! `VAR`変数についてもサポートする。フィールドの読み書き
+//! （`rec.field`、[`wasd_ast::Expr::FieldAccess`]）は、配列の添字アクセス
+//! （実行時に決まる値なので`LDA`+算術命令によるアドレス計算が必要だった。
+//! [`CodeGenerator::gen_array_element_address`]のドキュメント参照）とは
+//! 異なり、フィールドのオフセットが常にコンパイル時定数であるため、
+//! レコード変数のベースアドレスへオフセットを加算した絶対アドレスを
+//! そのまま[`UnconfirmedOp::Lod`]/[`UnconfirmedOp::Str`]のアドレス
+//! オペランドとして使うだけで完結する（[`CodeGenerator::resolve_field_access`]
+//! のドキュメント「設計判断」参照）。フィールドの型はStep 19までに対応済みの
+//! スカラー型（`INTEGER`/`BOOLEAN`/`STRING[n]`）のみで、配列・レコード・
+//! ポインタを要素とする複合的なフィールド、レコードを配列要素にする・
+//! レコードを引数として渡す・`variant record`（`CASE tag OF ... END`）・
+//! `WITH`文・`PROCEDURE`/`FUNCTION`内のローカルレコード変数はいずれも
+//! 引き続きスコープ外（`STRING[n]`/配列がまず`PROGRAM`直下のグローバル
+//! 変数のみサポートされた前例を踏襲。[`RecordLayout`]のドキュメント参照）。
+//!
+//! `CASE`、`UNIT`、ポインタ型、`REAL`/`CHAR`型、`WriteLn`以外の組み込み
+//! 手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数引数の`WriteLn`は
+//! 意味解析を通過済みのASTに含まれ得るが、本クレートの責務では**ない**。
+//! 遭遇した場合はパニックせず、「未対応機能」の[`wasd_ast::Diagnostic`]を
+//! 積んでコード生成のみ諦める（呼び出し元はレキサ・パーサー・意味解析と
+//! 同様、`Result::Err`として診断の集合を受け取る）。
 //!
 //! # PROCEDURE/FUNCTIONのネストについて
 //!
@@ -135,8 +154,9 @@
 use std::collections::HashMap;
 
 use wasd_ast::{
-    BinOp, Block, ConstDecl, Diagnostic, Expr, ForDirection, FuncDecl, Identifier, Literal,
-    ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeExpr, UnOp, VarDecl,
+    BinOp, Block, ConstDecl, Diagnostic, Expr, FieldDecl, ForDirection, FuncDecl, Identifier,
+    Literal, ParamDecl, ProcDecl, Program, Severity, Span, Statement, TypeDecl, TypeExpr, UnOp,
+    VarDecl,
 };
 
 use crate::builtin::{
@@ -169,6 +189,8 @@ enum ValueKind {
     StringN(u8),
     /// 配列型（Step 19）。[`ArrayKind`]のドキュメント参照。
     Array(ArrayKind),
+    /// レコード型（Step 20）。[`RecordKind`]のドキュメント参照。
+    Record(RecordKind),
 }
 
 /// 配列要素の種類。本ステップのスコープでは`INTEGER`/`BOOLEAN`のみ
@@ -219,6 +241,79 @@ impl ArrayKind {
     }
 }
 
+/// [`CodeGenerator::record_layouts`]中の1件を指すインデックス（Step 20）。
+///
+/// `ValueKind`（延いては[`VarSlot`]/[`FrameSlot`]）が`Copy`であり続ける
+/// ために、フィールド一覧そのもの（`Vec`で可変長）は`ValueKind`へ直接
+/// 埋め込まず、この軽量なインデックス経由で[`CodeGenerator::record_layouts`]
+/// を引く設計にしてある（[`crate::codegen`]モジュールの`string_pool`と
+/// 同じ「インデックスで間接参照する」パターン）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordId(usize);
+
+/// レコード型`ValueKind::Record`が持つ情報（Step 20）。
+///
+/// `total_words`は[`RecordLayout::total_words`]と同じ値をこの`Copy`な
+/// 構造体自身にも複製して持つ（[`word_size_of`]が`&CodeGenerator`を
+/// 経由せず`ValueKind`単体から占有ワード数を求められるようにするため。
+/// [`ArrayKind::element_count`]が`low`/`high`から自己完結的にワード数を
+/// 求められるのと同じ理由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordKind {
+    id: RecordId,
+    total_words: u16,
+}
+
+/// レコード型1件のうち、フィールド1つのレイアウト（Step 20）。
+#[derive(Debug, Clone)]
+struct RecordFieldLayout {
+    /// 正規化済み（小文字化済み）のフィールド名。
+    name: String,
+    /// レコード先頭からのオフセット（ワード単位）。
+    offset: u16,
+    kind: ValueKind,
+}
+
+/// レコード型1件のメモリレイアウト（Step 20）。
+///
+/// # 設計判断: フィールドオフセットは宣言順の単純な逐次積み上げ（UNCONFIRMED）
+///
+/// タスク依頼の指示、および一次資料の確認結果に基づく。このセッションでも
+/// 改めて一次資料（SofTech Microsystems, *UCSD p-System and UCSD Pascal
+/// Version IV: Internal Architecture Guide*）へのアクセスを`WebFetch`で
+/// 試みたが、`archive.org`は本セッションのサンドボックスのネットワーク
+/// 経路（agent proxy）で引き続き`EGRESS_BLOCKED`だった（`docs/research/
+/// ucsd-pascal-primary-sources.md`参照。同ドキュメントにもレコード型の
+/// メモリレイアウトに関する記述はない）。そのため、レコード型のメモリ
+/// レイアウト（ワード境界アラインメント・パディングの要否を含む）は
+/// **一次資料で確認できていない（UNCONFIRMED）**。本実装は「フィールド1の
+/// オフセットは0、フィールド2はフィールド1のサイズ分後ろ」という単純な
+/// 逐次積み上げを採用し、`packed`修飾の有無で挙動を変えない（タスク依頼が
+/// 明示的に指示する簡略化）。
+///
+/// # スコープ: フィールドは`INTEGER`/`BOOLEAN`/`STRING[n]`のみ
+///
+/// 配列・レコード・ポインタを要素とするフィールド（複合的なフィールド）は
+/// 今回のスコープ外（[`CodeGenerator::resolve_record_field_kind`]参照）。
+#[derive(Debug, Clone)]
+struct RecordLayout {
+    fields: Vec<RecordFieldLayout>,
+    /// レコード全体が占めるワード数（全フィールドのワード数の合計）。
+    total_words: u16,
+}
+
+/// [`CodeGenerator::resolve_record_type_expr`]の結果（Step 20）。
+enum RecordResolution {
+    /// `TypeExpr`はレコード型ではない（他の型として解決を続けてよい）。
+    NotRecord,
+    /// レコード型として解決できた。
+    Valid(RecordId),
+    /// レコード型として解決しようとしたが、フィールドの型・サイズ等で
+    /// エラーがあった（診断は既に発行済みなので、呼び出し元は追加の
+    /// 診断を出さずスキップしてよい）。
+    Invalid,
+}
+
 /// `TypeExpr`をこのクレートのスコープが対応する[`ValueKind`]へ変換する。
 /// `INTEGER`/`BOOLEAN`/`STRING[n]`以外（このクレートのスコープ外の型）は
 /// `None`。
@@ -248,11 +343,15 @@ fn value_kind_of(ty: &TypeExpr) -> Option<ValueKind> {
 /// 経由せず直接ワード数を求めている（16bitワード数に収まるかどうかの
 /// 診断を出す必要があるため）。ここでの`Array`腕は`ValueKind`の
 /// 網羅性のために存在し、想定される呼び出しでは実際には使われない。
+///
+/// レコード（Step 20）は`RecordKind::total_words`（[`RecordLayout::total_words`]
+/// の複製）をそのまま返す（[`RecordKind`]のドキュメント参照）。
 fn word_size_of(kind: ValueKind) -> u16 {
     match kind {
         ValueKind::Int | ValueKind::Bool => 1,
         ValueKind::StringN(max_len) => 1 + max_len as u16,
         ValueKind::Array(arr) => u16::try_from(arr.element_count()).unwrap_or(u16::MAX),
+        ValueKind::Record(rec) => rec.total_words,
     }
 }
 
@@ -384,6 +483,13 @@ pub struct CodeGenerator {
     /// （[`Self::gen_writeln_call`]、[`crate::ir::PCodeModule::string_pool`]
     /// のドキュメント参照）。
     string_pool: Vec<String>,
+    /// レコード型のレイアウトプール（Step 20）。`ValueKind::Record`が
+    /// 持つ[`RecordId`]でここを引く（[`RecordId`]のドキュメント参照）。
+    record_layouts: Vec<RecordLayout>,
+    /// `TYPE`セクションで宣言されたレコード型の名前(小文字正規化済み) ->
+    /// [`RecordId`]（Step 20）。`TypeExpr::Named`が指す型がレコード型で
+    /// あるかどうかの解決に使う（[`Self::resolve_record_type_expr`]参照）。
+    record_type_names: HashMap<String, RecordId>,
 }
 
 fn normalize(name: &str) -> String {
@@ -407,6 +513,8 @@ impl CodeGenerator {
         self.pending_calls.clear();
         self.current_scope = None;
         self.string_pool.clear();
+        self.record_layouts.clear();
+        self.record_type_names.clear();
 
         if !program.uses.is_empty() {
             self.error(
@@ -415,15 +523,9 @@ impl CodeGenerator {
                  codegen",
             );
         }
-        if !program.type_decls.is_empty() {
-            self.error(
-                program.span,
-                "TYPE declarations are out of scope for this step's minimal codegen (only \
-                 built-in INTEGER/BOOLEAN variables are supported)",
-            );
-        }
 
         self.declare_consts(&program.const_decls);
+        self.declare_type_decls(&program.type_decls);
         self.declare_vars(&program.var_decls);
 
         self.register_procs(&program.proc_decls);
@@ -497,12 +599,22 @@ impl CodeGenerator {
                 self.declare_array_vars(decl);
                 continue;
             }
+            match self.resolve_record_type_expr(&decl.ty) {
+                RecordResolution::Valid(id) => {
+                    self.declare_record_vars(decl, id);
+                    continue;
+                }
+                // フィールド型・サイズのエラーは`resolve_record_type_expr`が
+                // 既に報告済みなので、ここでは追加の診断を出さずスキップする。
+                RecordResolution::Invalid => continue,
+                RecordResolution::NotRecord => {}
+            }
             let Some(kind) = value_kind_of(&decl.ty) else {
                 self.error(
                     decl.ty.span(),
                     format!(
                         "VAR type '{}' is out of scope for this step's minimal codegen (only \
-                         INTEGER/BOOLEAN/STRING[n]/ARRAY are supported)",
+                         INTEGER/BOOLEAN/STRING[n]/ARRAY/RECORD are supported)",
                         describe_type(&decl.ty)
                     ),
                 );
@@ -513,6 +625,169 @@ impl CodeGenerator {
                 self.vars
                     .insert(normalize(&name.name), VarSlot { address, kind });
             }
+        }
+    }
+
+    /// `TYPE`セクション（Step 20）。`TYPE Name = RECORD ... END;`のみを
+    /// サポートし、[`Self::record_type_names`]へ登録する（そのレコード型を
+    /// 使う`VAR`宣言が[`Self::resolve_record_type_expr`]経由で
+    /// `TypeExpr::Named`を解決できるようにするため）。それ以外の種類の
+    /// `TYPE`宣言（配列型・ポインタ型・単純な型名の別名等）は引き続き
+    /// スコープ外としてエラー報告のみ行う（従来、`program.type_decls`が
+    /// 空でなければ即座にエラーにしていたのを、レコード型のみ許可する形に
+    /// 緩和した）。
+    fn declare_type_decls(&mut self, type_decls: &[TypeDecl]) {
+        for decl in type_decls {
+            match &decl.ty {
+                TypeExpr::Record { fields, span, .. } => {
+                    if let Some(layout) = self.build_record_layout(fields, *span) {
+                        let id = RecordId(self.record_layouts.len());
+                        self.record_layouts.push(layout);
+                        self.record_type_names
+                            .insert(normalize(&decl.name.name), id);
+                    }
+                }
+                other => {
+                    self.error(
+                        other.span(),
+                        format!(
+                            "TYPE '{}' = {}: only 'TYPE Name = RECORD ... END;' is supported by \
+                             this step's minimal codegen",
+                            decl.name.name,
+                            describe_type(other)
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `RECORD`型（`TYPE`宣言経由・`VAR`宣言中の無名レコードのいずれも）の
+    /// フィールド一覧から[`RecordLayout`]を組み立てる（Step 20。設計判断は
+    /// [`RecordLayout`]のドキュメント参照）。
+    ///
+    /// 重複フィールド名の検出は行わない: `wasd-sema`が既に検出済みであり
+    /// （`crates/wasd-sema/src/typeck.rs`の`resolve_record_fields_into`
+    /// 参照）、本クレートは意味解析成功後のASTのみを受け取る前提
+    /// （[`crate::codegen`]モジュールドキュメント参照）。
+    fn build_record_layout(
+        &mut self,
+        fields: &[FieldDecl],
+        record_span: Span,
+    ) -> Option<RecordLayout> {
+        let mut layout_fields = Vec::new();
+        // `u32`で積み上げ、最後に`u16`（p-machineの1ワードアドレス空間）へ
+        // 収まるか確認する（`Self::declare_array_vars`の要素数チェックと
+        // 同じ方針）。
+        let mut offset: u32 = 0;
+        let mut ok = true;
+        for field in fields {
+            let Some(kind) = self.resolve_record_field_kind(&field.ty) else {
+                ok = false;
+                continue;
+            };
+            let words = u32::from(word_size_of(kind));
+            for name in &field.names {
+                match u16::try_from(offset) {
+                    Ok(field_offset) => {
+                        layout_fields.push(RecordFieldLayout {
+                            name: normalize(&name.name),
+                            offset: field_offset,
+                            kind,
+                        });
+                    }
+                    Err(_) => {
+                        self.error(
+                            name.span,
+                            format!(
+                                "record field '{}' does not fit in this step's minimal codegen \
+                                 (offset exceeds a 16-bit word count)",
+                                name.name
+                            ),
+                        );
+                        ok = false;
+                    }
+                }
+                offset += words;
+            }
+        }
+        if !ok {
+            return None;
+        }
+        match u16::try_from(offset) {
+            Ok(total_words) => Some(RecordLayout {
+                fields: layout_fields,
+                total_words,
+            }),
+            Err(_) => {
+                self.error(
+                    record_span,
+                    "record has too many fields for this step's minimal codegen (total size \
+                     does not fit in a 16-bit word count)",
+                );
+                None
+            }
+        }
+    }
+
+    /// レコードフィールドの型を、本クレートのスコープが対応する
+    /// [`ValueKind`]へ解決する（Step 20）。フィールドの型はStep 19までに
+    /// 対応済みのスカラー型（`INTEGER`/`BOOLEAN`/`STRING[n]`）のみ
+    /// サポートする（タスク文書の「今回のスコープ」参照）。配列・レコード・
+    /// ポインタをフィールドとする複合構造はいずれもスコープ外。
+    fn resolve_record_field_kind(&mut self, ty: &TypeExpr) -> Option<ValueKind> {
+        match value_kind_of(ty) {
+            Some(kind) => Some(kind),
+            None => {
+                self.error(
+                    ty.span(),
+                    format!(
+                        "record field type '{}' is out of scope for this step's minimal \
+                         codegen (only INTEGER/BOOLEAN/STRING[n] fields are supported)",
+                        describe_type(ty)
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// `VAR`宣言の型が（`TYPE`宣言経由・無名のいずれかで）レコード型かどうかを
+    /// 判定する（Step 20）。
+    fn resolve_record_type_expr(&mut self, ty: &TypeExpr) -> RecordResolution {
+        match ty {
+            TypeExpr::Record { fields, span, .. } => {
+                match self.build_record_layout(fields, *span) {
+                    Some(layout) => {
+                        let id = RecordId(self.record_layouts.len());
+                        self.record_layouts.push(layout);
+                        RecordResolution::Valid(id)
+                    }
+                    None => RecordResolution::Invalid,
+                }
+            }
+            TypeExpr::Named(ident) => match self.record_type_names.get(&normalize(&ident.name)) {
+                Some(id) => RecordResolution::Valid(*id),
+                None => RecordResolution::NotRecord,
+            },
+            _ => RecordResolution::NotRecord,
+        }
+    }
+
+    /// レコード型の`VAR`宣言（グローバルのみ。Step 20）。
+    /// [`crate::codegen`]モジュールドキュメントの「スコープ」参照:
+    /// `STRING[n]`/配列と同じ前例に倣い、`PROGRAM`直下のグローバル変数の
+    /// みサポートする（`PROCEDURE`/`FUNCTION`のローカル変数・仮引数の位置に
+    /// 現れたレコード型は、この関数を経由せず従来通り[`Self::build_locals`]/
+    /// [`Self::build_params`]が使う[`value_kind_of`]が`None`を返すことで、
+    /// 自然に「スコープ外」の診断へ流れる）。
+    fn declare_record_vars(&mut self, decl: &VarDecl, id: RecordId) {
+        let total_words = self.record_layouts[id.0].total_words;
+        let kind = ValueKind::Record(RecordKind { id, total_words });
+        for name in &decl.names {
+            let address = self.alloc_words(total_words);
+            self.vars
+                .insert(normalize(&name.name), VarSlot { address, kind });
         }
     }
 
@@ -1082,11 +1357,34 @@ impl CodeGenerator {
                 self.emit(UnconfirmedOp::Sti.into(), span);
                 return;
             }
+            // Step 20: レコードフィールドへの代入（`rec.field := value`）。
+            // フィールドのアドレスは常にコンパイル時に確定するので、配列
+            // 要素（間接アドレッシング、`Sti`経由）とは異なり、
+            // `Self::gen_store_resolved`（直接記憶方式向け、`Str`のみ）へ
+            // そのまま流せる（`Self::resolve_field_access`のドキュメント
+            // 「設計判断」参照）。`STRING[n]`フィールドへの文字列リテラル
+            // 代入のみ、通常の変数と同じく専用のヘルパーを経由する。
+            Expr::FieldAccess { record, field, .. } => {
+                match self.resolve_field_access(record, field) {
+                    Some(resolved) => match self.field_kind(record, field) {
+                        Some(ValueKind::StringN(max_len)) => {
+                            self.gen_string_literal_assignment(resolved, max_len, value, span);
+                        }
+                        _ => {
+                            self.gen_store_resolved(resolved, span, |g| g.gen_expr(value));
+                        }
+                    },
+                    None => {
+                        self.gen_expr(value);
+                    }
+                }
+                return;
+            }
             _ => {
                 self.error(
                     target.span(),
-                    "assignment targets other than a simple variable or array element \
-                     (record/pointer lvalues) are out of scope for this step's minimal codegen",
+                    "assignment targets other than a simple variable, array element, or record \
+                     field (pointer lvalues) are out of scope for this step's minimal codegen",
                 );
                 return;
             }
@@ -1128,6 +1426,17 @@ impl CodeGenerator {
                         "whole-array assignment ('a := b' where both sides are arrays) is out \
                          of scope for this step's minimal codegen (only assigning to a single \
                          indexed element, 'a[i] := value', is supported)",
+                    );
+                    self.gen_expr(value);
+                }
+                // Step 20: 配列と同じ理由で、レコード全体の代入
+                // (`rec2 := rec1;`)もガードする。
+                Some(ValueKind::Record(_)) => {
+                    self.error(
+                        ident.span,
+                        "whole-record assignment ('a := b' where both sides are records) is \
+                         out of scope for this step's minimal codegen (only assigning to a \
+                         single field, 'a.field := value', is supported)",
                     );
                     self.gen_expr(value);
                 }
@@ -1241,6 +1550,129 @@ impl CodeGenerator {
         self.emit_ldc_int(arr.low, index_expr.span());
         self.emit(UnconfirmedOp::Sbi.into(), span);
         self.emit(UnconfirmedOp::Adi.into(), span);
+    }
+
+    /// レコードフィールドアクセス`record.field`を[`ResolvedVar`]として解決
+    /// する（Step 20）。読み込み（[`Self::gen_expr`]の`Expr::FieldAccess`腕）・
+    /// 書き込み（[`Self::gen_assignment`]の同腕）・`WriteLn(rec.field)`
+    /// （[`Self::gen_writeln_string_var`]）のいずれもこの関数を経由する。
+    ///
+    /// # 設計判断: 専用の間接アドレス計算命令を経由しない
+    ///
+    /// Step 19の配列添字（[`Self::gen_array_element_address`]）は添字が
+    /// 実行時に決まる値なので、`LDA`で先頭アドレスを積んでから`ADI`/`SBI`
+    /// で実行時にオフセットを加算する、という間接アドレッシングの命令列
+    /// （`IXA`相当の合成）が必要だった。一方、レコードのフィールド
+    /// （`rec.field`の`field`）は識別子であり式ではないので、そのオフセット
+    /// は常に**コンパイル時定数**である（[`RecordLayout`]のドキュメント
+    /// 参照）。
+    ///
+    /// このIRの[`UnconfirmedOp::Lod`]/[`UnconfirmedOp::Str`]は、そもそも
+    /// 「レベル差 + 絶対ワードアドレス」を直接オペランドに取れる設計に
+    /// なっている（グローバル変数への直接アクセスに使われているのと同じ
+    /// 命令。タスク依頼が示唆する「LDO等、ベース+定数オフセットを直接
+    /// 扱える命令」に相当）。そのため、レコード変数のベースアドレス
+    /// （[`Self::resolve_var`]が返す`ResolvedVar::address`。グローバル変数
+    /// なら`Self::vars`のアドレス、ローカル変数なら活性化レコード内の
+    /// オフセット）へフィールドのオフセットをコンパイル時に加算した結果を
+    /// そのまま新しい`ResolvedVar`として返すだけで完結し、Step 19の配列の
+    /// ような`Lda`+`Ind`/`Sti`の間接アドレッシングの命令列を経由する必要が
+    /// ない（呼び出し元は返された`ResolvedVar`を[`Self::gen_load_resolved`]/
+    /// [`Self::gen_store_resolved`]へそのまま渡すだけでよく、これらは
+    /// `indirect = false`の場合`Lod`/`Str`を1つ発行するだけなので、通常の
+    /// スカラー変数と全く同じコード量で済む）。
+    ///
+    /// UNCONFIRMED: 一次資料（SofTech Microsystems, *UCSD p-System and
+    /// UCSD Pascal Version IV: Internal Architecture Guide*）にレコード型の
+    /// メモリレイアウト・フィールドアクセス専用命令の記述は見当たらな
+    /// かった（`docs/research/ucsd-pascal-primary-sources.md`参照。この
+    /// セッションでも改めて`archive.org`への`WebFetch`を試みたが
+    /// `EGRESS_BLOCKED`だった）。上記の判断は一般的なPascal実装の理解
+    /// （フィールドオフセットはコンパイル時定数であり、ベースアドレスへの
+    /// 加算だけで済む）に基づく。
+    ///
+    /// # スコープ: 単純な識別子（グローバルのレコード変数）のみ
+    ///
+    /// `record`は単純な識別子のみサポートする。ネストしたフィールド
+    /// アクセス（レコード内レコード）・配列要素のフィールド・`VAR`仮引数と
+    /// して渡されたレコードはいずれも今回のスコープ外
+    /// （[`crate::codegen`]モジュールドキュメント参照）。診断は
+    /// 呼び出し元ではなくこの関数自身が発行し、`None`を返す
+    /// （[`Self::gen_array_element_address`]と異なりダミー値は積まない。
+    /// 呼び出し元がロード/ストアいずれの文脈かによって適切なダミー処理
+    /// （`Ldc(0)`を積む、あるいは値だけ評価してストアは諦める）が異なる
+    /// ため、ダミー処理の選択は呼び出し元に委ねる）。
+    fn resolve_field_access(
+        &mut self,
+        record_expr: &Expr,
+        field: &Identifier,
+    ) -> Option<ResolvedVar> {
+        let Expr::Identifier(ident) = record_expr else {
+            self.error(
+                record_expr.span(),
+                "record field access is only supported on a simple record variable (not a \
+                 nested field access, array element, or other expression) by this step's \
+                 minimal codegen",
+            );
+            return None;
+        };
+        let key = normalize(&ident.name);
+        let Some(ValueKind::Record(rec_kind)) = self.lookup_kind(&key) else {
+            self.error(
+                ident.span,
+                format!(
+                    "'{}' is not a known record variable in this scope",
+                    ident.name
+                ),
+            );
+            return None;
+        };
+        let Some(base) = self.resolve_var(&key) else {
+            unreachable!("lookup_kind and resolve_var share the same name resolution order");
+        };
+
+        let field_key = normalize(&field.name);
+        let field_offset = self.record_layouts[rec_kind.id.0]
+            .fields
+            .iter()
+            .find(|f| f.name == field_key)
+            .map(|f| f.offset);
+        let Some(offset) = field_offset else {
+            self.error(
+                field.span,
+                format!("record type has no field '{}'", field.name),
+            );
+            return None;
+        };
+
+        Some(ResolvedVar {
+            level: base.level,
+            address: Address(base.address.0 + offset),
+            // レコード変数自体を引数として渡すことは今回のスコープ外
+            // （[`crate::codegen`]モジュールドキュメント参照）なので、
+            // `base.indirect`は`Self::declare_record_vars`が組み立てる
+            // `VarSlot`が常に直接記憶方式である以上、常に偽である
+            // （`build_params`/`build_locals`がレコード型の仮引数・
+            // ローカル変数をそもそも受理しないため）。
+            indirect: false,
+        })
+    }
+
+    /// フィールドの種類（[`ValueKind`]）を、診断を出さずに解決する
+    /// （Step 20）。[`Self::infer_expr_kind`]の`Expr::FieldAccess`腕、および
+    /// [`Self::gen_assignment`]がSTRING[n]フィールドかどうかを判定する際に
+    /// 使う。
+    fn field_kind(&self, record_expr: &Expr, field: &Identifier) -> Option<ValueKind> {
+        let rec_kind = match self.infer_expr_kind(record_expr)? {
+            ValueKind::Record(rec) => rec,
+            _ => return None,
+        };
+        let field_key = normalize(&field.name);
+        self.record_layouts[rec_kind.id.0]
+            .fields
+            .iter()
+            .find(|f| f.name == field_key)
+            .map(|f| f.kind)
     }
 
     /// `s := 'literal';`（`s`が`STRING[max_len]`）のコード生成。
@@ -1570,11 +2002,12 @@ impl CodeGenerator {
                     Some(ValueKind::StringN(_)) => {
                         unreachable!("STRING[n] arguments are handled by the previous match arm")
                     }
-                    // Step 19: `WriteLn(arr)`（`arr`が配列全体）。`self.gen_expr(arg)`
-                    // （上）が既に`Self::gen_identifier_load`のガードで診断を
-                    // 出し、ダミー値を積んでいるため、ここでは追加の診断を
-                    // 出さずダミーの`proc`番号を選ぶだけでよい。
-                    Some(ValueKind::Array(_)) => BUILTIN_WRITELN_INT,
+                    // Step 19/20: `WriteLn(arr)`/`WriteLn(rec)`（配列・
+                    // レコード全体）。`self.gen_expr(arg)`（上）が既に
+                    // `Self::gen_identifier_load`のガードで診断を出し、
+                    // ダミー値を積んでいるため、ここでは追加の診断を出さず
+                    // ダミーの`proc`番号を選ぶだけでよい。
+                    Some(ValueKind::Array(_)) | Some(ValueKind::Record(_)) => BUILTIN_WRITELN_INT,
                     None => {
                         self.error(
                             arg.span(),
@@ -1615,30 +2048,43 @@ impl CodeGenerator {
     /// （`s`が直接記憶方式のグローバル`STRING[n]`変数であれば、代わりに
     /// `LDA`でアドレスを計算する）。いずれの場合も呼び出し側で`indirect`を
     /// 区別する必要はない。
+    ///
+    /// Step 20から、単純な変数参照に加えて`STRING[n]`フィールドへの
+    /// レコードフィールドアクセス（`WriteLn(rec.field)`）もサポートする
+    /// （[`Self::resolve_field_access`]参照。フィールドのアドレスも
+    /// コンパイル時に確定するため、単純な変数と同じ`ResolvedVar`の
+    /// 仕組みにそのまま乗る）。
     fn gen_writeln_string_var(&mut self, arg: &Expr, span: Span) {
-        let Expr::Identifier(ident) = arg else {
-            self.error(
-                arg.span(),
-                "WriteLn(STRING[n]) only supports a simple variable reference in this step's \
-                 minimal codegen",
-            );
-            return;
-        };
-        let key = normalize(&ident.name);
-        match self.resolve_var(&key) {
-            Some(resolved) => {
-                self.gen_address_of_resolved(resolved, span);
-                self.emit(
-                    ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRVAR).into(),
-                    span,
-                );
+        let resolved = match arg {
+            Expr::Identifier(ident) => {
+                let key = normalize(&ident.name);
+                match self.resolve_var(&key) {
+                    Some(resolved) => Some(resolved),
+                    None => {
+                        self.error(
+                            ident.span,
+                            format!("'{}' is not a known variable in this scope", ident.name),
+                        );
+                        None
+                    }
+                }
             }
-            None => {
+            Expr::FieldAccess { record, field, .. } => self.resolve_field_access(record, field),
+            _ => {
                 self.error(
-                    ident.span,
-                    format!("'{}' is not a known variable in this scope", ident.name),
+                    arg.span(),
+                    "WriteLn(STRING[n]) only supports a simple variable reference or a record \
+                     field access in this step's minimal codegen",
                 );
+                None
             }
+        };
+        if let Some(resolved) = resolved {
+            self.gen_address_of_resolved(resolved, span);
+            self.emit(
+                ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_STRVAR).into(),
+                span,
+            );
         }
     }
 
@@ -1691,6 +2137,9 @@ impl CodeGenerator {
                 Some(ValueKind::Array(arr)) => Some(arr.element.into()),
                 _ => None,
             },
+            // Step 20: `rec.field`の種類は、フィールドの種類そのもの
+            // （[`Self::field_kind`]参照）。
+            Expr::FieldAccess { record, field, .. } => self.field_kind(record, field),
             _ => None,
         }
     }
@@ -1937,9 +2386,23 @@ impl CodeGenerator {
                 self.gen_array_element_address(array, index, *span);
                 self.emit(UnconfirmedOp::Ind.into(), *span);
             }
-            Expr::FieldAccess { span, .. } => {
-                self.unsupported_expr(*span, "record field access");
-            }
+            // Step 20: レコードフィールドの読み込み（`rec.field`をrvalue
+            // として評価）。アドレス解決は代入文の左辺
+            // （`Self::gen_assignment`）と共通（`Self::resolve_field_access`
+            // 参照）。フィールドのオフセットはコンパイル時定数なので、
+            // 配列（`Ind`が必要）と異なり、解決済みの`ResolvedVar`を
+            // そのまま`Self::gen_load_resolved`へ渡すだけでよい
+            // （`Self::resolve_field_access`のドキュメント「設計判断」参照）。
+            Expr::FieldAccess {
+                record,
+                field,
+                span,
+            } => match self.resolve_field_access(record, field) {
+                Some(resolved) => self.gen_load_resolved(resolved, *span),
+                None => {
+                    self.emit(UnconfirmedOp::Ldc(0).into(), *span);
+                }
+            },
             Expr::Deref { span, .. } => {
                 self.unsupported_expr(*span, "pointer dereference");
             }
@@ -1972,21 +2435,39 @@ impl CodeGenerator {
         let key = normalize(&ident.name);
 
         if let Some(resolved) = self.resolve_var(&key) {
-            // Step 19: 配列全体を1ワードの値として読み込むことはできない
-            // （[`Self::gen_assignment`]の`Some(ValueKind::Array(_))`腕の
-            // ドキュメント参照。同じ理由でここもガードしないと、配列の
-            // 先頭要素だけを読む誤ったコードを黙って生成してしまう）。
-            if matches!(self.lookup_kind(&key), Some(ValueKind::Array(_))) {
-                self.error(
-                    ident.span,
-                    format!(
-                        "'{}' is an array; a whole array cannot be used as a value in this \
-                         step's minimal codegen (index it first, e.g. '{}[i]')",
-                        ident.name, ident.name
-                    ),
-                );
-                self.emit(UnconfirmedOp::Ldc(0).into(), ident.span);
-                return;
+            // Step 19/20: 配列・レコード全体を1ワードの値として読み込む
+            // ことはできない（[`Self::gen_assignment`]の
+            // `Some(ValueKind::Array(_))`/`Some(ValueKind::Record(_))`腕の
+            // ドキュメント参照。同じ理由でここもガードしないと、配列/
+            // レコードの先頭要素・フィールドだけを読む誤ったコードを
+            // 黙って生成してしまう）。
+            match self.lookup_kind(&key) {
+                Some(ValueKind::Array(_)) => {
+                    self.error(
+                        ident.span,
+                        format!(
+                            "'{}' is an array; a whole array cannot be used as a value in this \
+                             step's minimal codegen (index it first, e.g. '{}[i]')",
+                            ident.name, ident.name
+                        ),
+                    );
+                    self.emit(UnconfirmedOp::Ldc(0).into(), ident.span);
+                    return;
+                }
+                Some(ValueKind::Record(_)) => {
+                    self.error(
+                        ident.span,
+                        format!(
+                            "'{}' is a record; a whole record cannot be used as a value in \
+                             this step's minimal codegen (access a field first, e.g. \
+                             '{}.field')",
+                            ident.name, ident.name
+                        ),
+                    );
+                    self.emit(UnconfirmedOp::Ldc(0).into(), ident.span);
+                    return;
+                }
+                _ => {}
             }
             self.gen_load_resolved(resolved, ident.span);
             return;

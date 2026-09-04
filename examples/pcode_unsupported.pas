@@ -1,9 +1,12 @@
 PROGRAM UnsupportedFeatures;
 
-VAR
-    r: RECORD
+TYPE
+    Node = RECORD
         x: INTEGER
     END;
+
+VAR
+    p: ^Node;
 
 BEGIN
 END.
