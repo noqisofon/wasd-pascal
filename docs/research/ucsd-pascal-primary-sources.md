@@ -264,3 +264,70 @@ CONFIRMED事実からの類推規則に基づく判断であることを明記�
   （`crates/wasd-pcode/tests/codegen.rs`の
   `relaying_a_received_string_n_parameter_as_another_value_argument_is_an_error`
   参照）。
+
+## Step 21セッション（複数引数・任意数、配列・レコードの値仮引数）: 仮実装の記録
+
+Step 21のタスク依頼は、`FUNCTION`/`PROCEDURE`の仮引数を2つ以上（任意個数、
+型混在可）に一般化し、さらに配列・レコード型も仮引数として渡せるように
+することを求めていた。ここで扱う項目は一次資料未確認の推測ではなく、
+**タスク依頼で明示的に指示された意図的な簡略化（仮実装）**であるため、
+上記までの各セッション（UNCONFIRMED解消の試行）とは性質が異なる。
+
+### 判明した既存実装の状態: AST/パーサー/意味解析は既に一般化済みだった
+
+このセッションで着手前に既存実装を調査した結果、`wasd-ast`
+（`ProcDecl`/`FuncDecl`の`params: Vec<ParamDecl>`、`FuncCall`/`ProcCall`の
+`args: Vec<Expr>`）・`wasd-parser`（カンマ区切りの実引数リスト、
+セミコロン区切りの複数仮引数グループ、`VAR`仮引数の構文）・`wasd-sema`
+（`check_call_args`の引数個数・型チェック、`Type::Array`/`Type::Record`を
+含む任意の型を仮引数の型として許可する`type_from_type_expr`）は、いずれも
+既に任意個数・型混在の仮引数を扱える一般的な設計になっていた（Step 18の
+「単一引数」という説明はコード生成（`wasd-pcode`）側の実装状況を指しており、
+AST/パーサー/意味解析はその時点で既に将来の複数引数化を見越した設計に
+なっていたと見られる）。そのため今回の実装変更は`wasd-pcode`
+（コード生成）と`pmachine-core`（実行結果の検証）にほぼ限定された。
+
+### 配列・レコードの値仮引数: タスク依頼が指示する仮実装をそのまま採用
+
+タスク依頼の指示通り、配列・レコードを値仮引数として渡す際に**コピーを
+作らず、呼び出し元の実引数のアドレスをそのままパラメータ領域へ格納する**
+設計を採用した（`crates/wasd-pcode/src/codegen.rs`の
+`CodeGenerator::build_params`/`CodeGenerator::gen_array_or_record_value_arg`
+のドキュメント「UNCONFIRMED/TODO」参照）。これは一次資料の確認不足に
+よるUNCONFIRMEDではなく、タスク依頼が明示的に要求した意図的な簡略化で
+あることを、コード生成箇所のコメント（上記2箇所）とこの記録の両方に
+明記する。
+
+既知の制限（意図的なもの）: 呼び出された側での配列要素・レコード
+フィールドへの変更が、呼び出し元の実引数にも反映されてしまう（実質的に
+参照渡しのように振る舞う）。正しい値渡し意味論（コピー生成）は、将来の
+`VAR`パラメータの正式な構文・意味論の実装と合わせて別ステップで対応する
+予定。実際にこの副作用が観測されることを
+`crates/pmachine-core/tests/interpreter.rs`の
+`procedure_call_with_integer_boolean_string_and_array_parameters_mixed_runs_correctly`
+で確認済み（`Describe`呼び出し内で`arr[1] := 999`とした結果が、呼び出し元の
+`nums[1]`にもそのまま反映されることをアサートしている）。
+
+なお、Step 18で「`STRING[n]`の値仮引数はレコード・配列と同様にアドレスを
+積む」という類推規則を採用した際、実際のコード生成（`gen_string_value_arg`）
+は呼び出し元が新規の一時領域を確保し、そこへ実引数の内容を**コピー**して
+からそのアドレスを積む設計になっていた（正しい値渡し意味論を最初から
+満たしている）。そのため、`STRING[n]`は今回の「コピーを作らない」仮実装の
+対象では**ない**（値渡しとしての意味論は既に健全であり、変更していない）。
+配列・レコードだけがこの仮実装の対象である点に注意。
+
+### レコードフィールドアクセスの間接アドレッシング一般化
+
+Step 20時点の`CodeGenerator::resolve_field_access`は、レコード変数が常に
+直接記憶方式（`PROGRAM`直下のグローバル変数）であることを前提に、
+フィールドのオフセットをコンパイル時に静的加算していた。Step 21で
+レコードを仮引数として渡せるようになったことで、レコード変数のベース
+アドレス自体が実行時にしか分からない（仮引数のスロットに格納されている）
+ケースが生じたため、`ResolvedVar`に`offset`フィールド（間接参照時に実行時
+加算する追加オフセット）を追加し、`gen_load_resolved`/`gen_store_resolved`/
+`gen_address_of_resolved`がそれぞれ`indirect`かつ`offset != 0`の場合に
+`LDC <offset> ; ADI`を追加で発行するよう一般化した（配列添字アクセスの
+`LDA`+`ADI`パターンと同種の間接アドレッシングだが、フィールドオフセットは
+コンパイル時定数なので、非0の場合のみ`LDC`/`ADI`を発行する点が異なる）。
+詳細は`crates/wasd-pcode/src/codegen.rs`の`ResolvedVar`・
+`resolve_field_access`のドキュメントを参照。

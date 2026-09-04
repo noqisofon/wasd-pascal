@@ -576,14 +576,19 @@ fn local_and_global_variable_references_use_different_levels() {
     );
 }
 
-/// 今回のスコープ外の`PROCEDURE`/`FUNCTION`構文（配列型の仮引数）を
+/// 今回のスコープ外の`PROCEDURE`/`FUNCTION`構文（ポインタ型の仮引数）を
 /// 含むASTを渡した場合、パニックせず明確なエラーが返ること。
+///
+/// Step 21以前は配列型の仮引数がこのテストの題材だったが、Step 21から
+/// 配列・レコード型の仮引数がサポート対象になった
+/// （[`procedure_with_array_value_parameter_pushes_the_address_of_the_argument`]
+/// 等参照）ため、依然としてスコープ外のポインタ型に差し替えた。
 #[test]
 fn procedure_with_unsupported_parameter_type_is_reported_as_an_error_without_panicking() {
     let program = parse_program(
         r#"
         PROGRAM P;
-        PROCEDURE Foo(arr: ARRAY [1..10] OF INTEGER);
+        PROCEDURE Foo(p: ^INTEGER);
         BEGIN
         END;
         BEGIN
@@ -595,7 +600,7 @@ fn procedure_with_unsupported_parameter_type_is_reported_as_an_error_without_pan
     let diagnostics =
         result.expect_err("unsupported parameter types must be rejected, not codegen'd");
     assert!(
-        diagnostics.iter().any(|d| d.message.contains("ARRAY")),
+        diagnostics.iter().any(|d| d.message.contains("pointer")),
         "diagnostics: {diagnostics:?}"
     );
 }
@@ -1883,4 +1888,170 @@ fn string_n_record_field_assignment_and_writeln_are_supported() {
     expected.push(op(UnconfirmedOp::Stp));
 
     assert_eq!(opcodes(&module), expected);
+}
+
+// ---- Step 21: 複数引数（任意数）、配列・レコードの値仮引数 ----
+
+/// 3つの型混在（`INTEGER`/`BOOLEAN`/`INTEGER`）仮引数を持つ`PROCEDURE`
+/// 呼び出しが、呼び出し元では実引数を宣言順（左から右）で評価してスタックへ
+/// 積み、呼び出し先ではその並びに従ったオフセット（`5`, `6`, `7`）で
+/// 各仮引数を参照すること。`RPU`の`b`パラメータも仮引数3個分
+/// （`data_size(0) + 3`）になることを確認する（Step 18の単一引数の
+/// オフセット計算・RPU計算を複数引数へ一般化したことの検証）。
+#[test]
+fn procedure_call_with_three_mixed_type_parameters_pushes_arguments_left_to_right() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Foo(a: INTEGER; b: BOOLEAN; c: INTEGER);
+        BEGIN
+            a := a + c
+        END;
+        BEGIN
+            Foo(1, TRUE, 2)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Foo's body (entry = 0): a := a + c
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // a
+            op(UnconfirmedOp::Lod(Level(0), Address(7))), // c
+            op(UnconfirmedOp::Adi),
+            op(UnconfirmedOp::Str(Level(0), Address(5))), // a := ...
+            cop(ConfirmedOp::Rpu(3)),                     // data_size(0) + 3 params
+            // Foo(1, TRUE, 2) call: arguments pushed left to right
+            op(UnconfirmedOp::Ldc(1)), // -> a
+            op(UnconfirmedOp::Ldc(1)), // TRUE -> b
+            op(UnconfirmedOp::Ldc(2)), // -> c
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// 配列型の値仮引数（Step 21の仮実装）: 呼び出し元はコピーを作らず、
+/// 実引数のアドレスをそのまま積む（`STRING[n]`の値仮引数がコピーを作る
+/// ([`procedure_with_string_n_value_parameter_materializes_literal_argument`]
+/// 参照)のとは対照的）。呼び出し先の配列要素アクセスは、`VAR`仮引数の
+/// 配列と同じ間接アドレッシング（スロットから`LOD`でアドレスを読み、
+/// そこへ添字オフセットを加算する）になる
+/// （[`array_index_load_generates_lda_ldc_sbi_adi_ind`]の直接記憶方式版と
+/// 比較: ベースアドレス計算が`LDA`ではなく`LOD`になる点のみが異なる）。
+#[test]
+fn array_value_parameter_pushes_the_address_of_the_argument_without_copying() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR nums: ARRAY [1..3] OF INTEGER;
+        VAR x: INTEGER;
+        PROCEDURE Foo(arr: ARRAY [1..3] OF INTEGER);
+        BEGIN
+            x := arr[1]
+        END;
+        BEGIN
+            Foo(nums)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // nums: Address(0)..Address(3), x: Address(3)
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // Foo's body (entry = 0): x := arr[1]
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // arr's slot holds nums' address
+            op(UnconfirmedOp::Ldc(1)),                    // index literal 1
+            op(UnconfirmedOp::Ldc(1)),                    // low bound
+            op(UnconfirmedOp::Sbi),
+            op(UnconfirmedOp::Adi),
+            op(UnconfirmedOp::Ind),                       // arr[1]
+            op(UnconfirmedOp::Str(Level(1), Address(3))), // x := ...
+            cop(ConfirmedOp::Rpu(1)),
+            // Foo(nums) call: the caller pushes the ADDRESS of nums, not a copy of it
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// レコード型の値仮引数（Step 21の仮実装）経由でのフィールドアクセスは、
+/// 直接記憶方式のレコード変数（[`record_field_load_generates_a_single_lod_with_the_field_offset`]
+/// 等）とは異なり、フィールドのオフセットをコンパイル時に静的加算できない
+/// （スロットに格納されているのはレコード本体そのものではなくアドレス
+/// なので、加算は実行時に行う必要がある。[`ResolvedVar::offset`]の
+/// ドキュメント参照）。1番目のフィールド（オフセット0）は追加の`LDC`/`ADI`
+/// なしで`LOD`+`IND`のみ、2番目のフィールド（オフセット1）は`LOD`の後に
+/// `LDC 1`+`ADI`を挟んでから`IND`/`STI`する、という違いを1つのテストで
+/// 併せて確認する。
+#[test]
+fn record_value_parameter_field_access_uses_runtime_offset_when_indirect() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR hero: Character;
+        VAR x: INTEGER;
+        PROCEDURE ReadHp(ch: Character);
+        BEGIN
+            x := ch.hp
+        END;
+        PROCEDURE Revive(ch: Character);
+        BEGIN
+            ch.alive := TRUE
+        END;
+        BEGIN
+            ReadHp(hero);
+            Revive(hero)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // hero: Address(0)..Address(2) (hp=0, alive=1), x: Address(2)
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            // ReadHp's body (entry = 0): x := ch.hp (field offset 0: no LDC/ADI needed)
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ch's slot holds hero's address
+            op(UnconfirmedOp::Ind),                       // ch.hp (offset 0)
+            op(UnconfirmedOp::Str(Level(1), Address(2))), // x := ...
+            cop(ConfirmedOp::Rpu(1)),
+            // Revive's body (entry = ...): ch.alive := TRUE (field offset 1: runtime add)
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ch's slot holds hero's address
+            op(UnconfirmedOp::Ldc(1)),                    // + field offset 1 (alive)
+            op(UnconfirmedOp::Adi),
+            op(UnconfirmedOp::Ldc(1)), // TRUE
+            op(UnconfirmedOp::Sti),
+            cop(ConfirmedOp::Rpu(1)),
+            // ReadHp(hero) call: the caller pushes the ADDRESS of hero, not a copy of it
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            cop(ConfirmedOp::Cpg(CodeAddress(0))),
+            // Revive(hero) call: same, a fresh address computation
+            // (Revive's entry is CodeAddress(4): ReadHp's body occupies
+            // instructions 0..=3 -- Lod/Ind/Str/Rpu -- and Revive's own
+            // body starts right after)
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            cop(ConfirmedOp::Cpg(CodeAddress(4))),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
 }
