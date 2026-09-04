@@ -6,7 +6,9 @@
 //! 論理演算（`AND OR NOT`）、代入文、`IF`/`WHILE`/`REPEAT UNTIL`/`FOR`に
 //! よる制御構造、`BEGIN...END`の複合文、`PROGRAM ... BEGIN ... END.`
 //! 全体構造、`PROGRAM`直下に宣言された`PROCEDURE`/`FUNCTION`の呼び出し
-//! （単一の値仮引数または`VAR`仮引数。`INTEGER`/`BOOLEAN`/`STRING[n]`。
+//! （Step 18時点では単一の値仮引数または`VAR`仮引数のみ。`INTEGER`/
+//! `BOOLEAN`/`STRING[n]`。Step 21から任意個数の仮引数（型混在可）に一般化
+//! （[`CodeGenerator::build_params`]/[`CodeGenerator::gen_call_args`]参照）。
 //! Step 18から`FUNCTION`の戻り値も含む）、および組み込み手続き`WriteLn`
 //! （引数0個または1個。`INTEGER`/`BOOLEAN`に加え、Step 15から文字列
 //! リテラルの直接渡し（`WriteLn('...')`）も、Step 16から`STRING[n]`変数も
@@ -47,10 +49,27 @@
 //! のドキュメント「設計判断」参照）。フィールドの型はStep 19までに対応済みの
 //! スカラー型（`INTEGER`/`BOOLEAN`/`STRING[n]`）のみで、配列・レコード・
 //! ポインタを要素とする複合的なフィールド、レコードを配列要素にする・
-//! レコードを引数として渡す・`variant record`（`CASE tag OF ... END`）・
-//! `WITH`文・`PROCEDURE`/`FUNCTION`内のローカルレコード変数はいずれも
-//! 引き続きスコープ外（`STRING[n]`/配列がまず`PROGRAM`直下のグローバル
-//! 変数のみサポートされた前例を踏襲。[`RecordLayout`]のドキュメント参照）。
+//! `variant record`（`CASE tag OF ... END`）・`WITH`文・`PROCEDURE`/
+//! `FUNCTION`内のローカルレコード変数はいずれも引き続きスコープ外
+//! （`STRING[n]`/配列がまず`PROGRAM`直下のグローバル変数のみサポート
+//! された前例を踏襲。[`RecordLayout`]のドキュメント参照）。
+//!
+//! Step 21からは、`PROCEDURE`/`FUNCTION`の仮引数リストを任意個数
+//! （型混在可）に一般化し、さらに配列・レコード型も仮引数の型として
+//! 許可する（[`CodeGenerator::build_params`]参照）。
+//!
+//! **UNCONFIRMED/TODO（既知の制限）**: 配列・レコードの値仮引数は、
+//! 本来のPascalの値渡し意味論（呼び出し側でコピーを作成し、そのコピーの
+//! アドレスを渡す）ではなく、コピーを作らず元の変数のアドレスをそのまま
+//! 渡す**仮実装**である（`STRING[n]`の値仮引数がコピーを作るのとは対照的。
+//! [`CodeGenerator::gen_string_value_arg`]参照）。そのため、呼び出された
+//! 側での配列要素・レコードフィールドへの変更が呼び出し元にも反映されて
+//! しまう（実質的に参照渡しのように振る舞う）という既知の制限がある。
+//! これはタスク依頼で明示された意図的な単純化であり、正しい値渡し意味論
+//! （コピー生成）は、将来の`VAR`パラメータの正式な構文・意味論の実装と
+//! 合わせて別ステップで対応する予定（[`CodeGenerator::build_params`]/
+//! [`CodeGenerator::gen_array_or_record_value_arg`]のドキュメント、
+//! リポジトリの`README.md`「既知の制限」も参照）。
 //!
 //! `CASE`、`UNIT`、ポインタ型、`REAL`/`CHAR`型、`WriteLn`以外の組み込み
 //! 手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数引数の`WriteLn`は
@@ -85,12 +104,18 @@
 //! 2. ローカル変数・一時変数領域（`DATASIZE`ワード）: オフセット
 //!    `5..5+DATASIZE`
 //! 3. パラメータ領域: オフセット`5+DATASIZE..5+DATASIZE+P`
-//!    （`P`は仮引数のワード数。`VAR`仮引数はアドレスを1ワードで格納し、
-//!    それ以外の値仮引数のうち`INTEGER`/`BOOLEAN`は値そのものを1ワードで
-//!    格納する。`STRING[n]`の値仮引数（Step 18）は、レコード・配列の値
+//!    （`P`は仮引数の**個数**——Step 21から複数仮引数を、宣言順に
+//!    そのままパラメータ領域のオフセット順へ写す（[`CodeGenerator::build_params`]
+//!    参照）。仮引数はどの型であっても常にちょうど1ワードを占める:
+//!    `VAR`仮引数はアドレスを1ワードで格納し、それ以外の値仮引数のうち
+//!    `INTEGER`/`BOOLEAN`は値そのものを1ワードで格納する。`STRING[n]`の
+//!    値仮引数（Step 18）、および配列・レコードの値仮引数（Step 21。
+//!    仮実装でコピーを作らずアドレスを渡す。[`CodeGenerator::build_params`]
+//!    のドキュメント「UNCONFIRMED/TODO」参照）は、レコード・配列の値
 //!    パラメータに関するStep 12のCONFIRMED済みの規則からの類推
 //!    （[`CodeGenerator::gen_string_value_arg`]のドキュメント参照、
-//!    UNCONFIRMED）により、`VAR`仮引数と同様にアドレスを1ワードで格納する）
+//!    UNCONFIRMED）により、`VAR`仮引数と同様にアドレスを1ワードで格納する。
+//!    そのため`P`は単純に仮引数の個数と一致する）
 //! 4. 関数の戻り値領域（`FUNCTION`のみ、1ワード）: オフセット
 //!    `5+DATASIZE+P`
 //!
@@ -403,12 +428,30 @@ struct FrameSlot {
 /// 識別子1つの参照先が解決した結果。ロード/ストア/アドレス取得の
 /// いずれの操作にも必要な情報（レベル差・アドレス・スロットがアドレスを
 /// 格納しているかどうか）をまとめて持つ。
+///
+/// # `offset`フィールド（Step 21から）
+///
+/// `indirect`な参照（`VAR`仮引数、`STRING[n]`/配列/レコードの値仮引数）を
+/// 経由してレコードのフィールドへアクセスする場合、フィールドのオフセット
+/// はコンパイル時定数ではあるものの、`address`スロットに実際に格納されて
+/// いるのは「レコード本体のアドレス」であって「レコード本体そのもの」
+/// ではないため、単純に`address`へオフセットを足し込むことができない
+/// （`indirect`でない場合との違い。[`CodeGenerator::resolve_field_access`]
+/// のドキュメント参照）。そこで、`indirect`な参照については「スロットから
+/// 読んだアドレスへ、実行時に`offset`ワード分を加算してから間接
+/// アクセスする」という追加の情報として`offset`を持たせる
+/// （[`CodeGenerator::gen_load_resolved`]/[`CodeGenerator::gen_store_resolved`]/
+/// [`CodeGenerator::gen_address_of_resolved`]参照）。`indirect`が偽の場合、
+/// オフセットは常に`address`へ静的に加算済みなので`offset`は常に`0`。
 #[derive(Debug, Clone, Copy)]
 struct ResolvedVar {
     level: Level,
     address: Address,
     /// [`FrameSlot::indirect`]参照。
     indirect: bool,
+    /// `indirect`な参照でのみ意味を持つ、実行時に加算する追加オフセット
+    /// （ワード単位）。`indirect`が偽の場合は常に`0`。
+    offset: u16,
 }
 
 /// `PROCEDURE`/`FUNCTION`1件のメタデータ。宣言（呼び出し元から見える形の
@@ -791,21 +834,25 @@ impl CodeGenerator {
         }
     }
 
-    /// `ARRAY [low..high] OF element`のグローバル`VAR`宣言（Step 19）。
+    /// `TypeExpr::Array`をこのクレートのスコープが対応する[`ArrayKind`]へ
+    /// 解決する（Step 19、Step 21から[`Self::build_params`]でも再利用）。
     /// [`ArrayKind`]のドキュメント「スコープ」参照: 1次元・`INTEGER`/
-    /// `BOOLEAN`要素のみ。それ以外（多次元・その他の要素型）は診断のみ
-    /// 積んで宣言をスキップする（[`Self::declare_vars`]の既存の型と同じ
-    /// 「診断1件でも`generate`全体が`Err`になる」方針に乗るため、以降の
-    /// アドレス割り当てのズレは問題にならない）。
-    fn declare_array_vars(&mut self, decl: &VarDecl) {
+    /// `BOOLEAN`要素のみ。それ以外（多次元・その他の要素型・配列でない型）
+    /// は診断のみ積んで`None`を返す（[`Self::declare_vars`]の既存の型と
+    /// 同じ「診断1件でも`generate`全体が`Err`になる」方針に乗るため、以降の
+    /// アドレス割り当てのズレは問題にならない）。`ty`が`TypeExpr::Array`
+    /// ではない場合は、診断を出さず静かに`None`を返す（呼び出し元が他の
+    /// 型として解決を続けられるようにするため。[`Self::resolve_record_type_expr`]
+    /// と同じ設計）。
+    fn resolve_array_type_expr(&mut self, ty: &TypeExpr) -> Option<ArrayKind> {
         let TypeExpr::Array {
             index_type,
             element_type,
             span,
             ..
-        } = &decl.ty
+        } = ty
         else {
-            unreachable!("caller already matched TypeExpr::Array");
+            return None;
         };
 
         let element = match element_type.as_ref() {
@@ -821,7 +868,7 @@ impl CodeGenerator {
                         describe_type(other)
                     ),
                 );
-                return;
+                return None;
             }
         };
 
@@ -837,7 +884,7 @@ impl CodeGenerator {
                     "this array index range form is out of scope for this step's minimal \
                      codegen (only an INTEGER literal subrange 'low..high' is supported)",
                 );
-                return;
+                return None;
             }
         };
 
@@ -846,7 +893,7 @@ impl CodeGenerator {
         // 参照）なので`element_count()`は必ず正だが、要素数自体が16bitワード
         // 数に収まるとは限らない（例: `ARRAY [1..100000] OF INTEGER`）ため、
         // ここで明示的に診断する。
-        let Ok(words) = u16::try_from(arr.element_count()) else {
+        if u16::try_from(arr.element_count()).is_err() {
             self.error(
                 *span,
                 format!(
@@ -855,9 +902,18 @@ impl CodeGenerator {
                     arr.element_count()
                 ),
             );
+            return None;
+        }
+        Some(arr)
+    }
+
+    /// `ARRAY [low..high] OF element`のグローバル`VAR`宣言（Step 19）。
+    fn declare_array_vars(&mut self, decl: &VarDecl) {
+        let Some(arr) = self.resolve_array_type_expr(&decl.ty) else {
             return;
         };
         let kind = ValueKind::Array(arr);
+        let words = word_size_of(kind);
 
         for name in &decl.names {
             let address = self.alloc_words(words);
@@ -894,21 +950,65 @@ impl CodeGenerator {
     /// `STRING[n]`のローカル変数（`PROCEDURE`/`FUNCTION`本体内の`VAR`宣言）は
     /// 依然としてスコープ外（[`Self::build_locals`]参照）だが、仮引数は
     /// データそのものではなくアドレスしか持たないため、この制約に抵触しない。
+    ///
+    /// # UNCONFIRMED/TODO: 配列・レコード型の仮引数はStep 21から許可（仮実装）
+    ///
+    /// Step 21のタスク依頼に従い、配列・レコード型を仮引数の型として許可
+    /// する。ただし本来のPascalの値渡し意味論（呼び出し側でコピーを作成し、
+    /// そのコピーのアドレスを渡す）は実装せず、`STRING[n]`の値仮引数
+    /// （[`Self::gen_string_value_arg`]、コピーを作る）とは異なり、**コピーを
+    /// 作らず元の変数のアドレスをそのまま渡す**仮実装とする（意図的な
+    /// 単純化。タスク依頼の明示的な指示）。そのため`by_ref`（`VAR`）で
+    /// あるかどうかに関わらず、配列・レコード型の仮引数は常に
+    /// `indirect = true`（スロットにアドレスを格納）になる。結果として、
+    /// 呼び出された側での配列要素・レコードフィールドへの変更が呼び出し元
+    /// にも反映されてしまう（実質的に参照渡しのように振る舞う）という
+    /// 既知の制限がある。正しい値渡し意味論（コピー生成）は、将来の`VAR`
+    /// パラメータの正式な構文・意味論の実装と合わせて別ステップで対応する
+    /// 予定（呼び出し側のコード生成は[`Self::gen_array_or_record_value_arg`]、
+    /// リポジトリの`README.md`「既知の制限」も参照）。
     fn build_params(&mut self, params: &[ParamDecl], param_base: u16) -> Vec<(String, FrameSlot)> {
         let mut result = Vec::new();
         for p in params {
-            let Some(kind) = value_kind_of(&p.ty) else {
+            // `matches!`で先に`TypeExpr::Array`かどうかを判定してから
+            // `resolve_array_type_expr`を呼ぶ（`Self::declare_vars`と同じ
+            // パターン）: 不正な配列型（多次元・非対応要素型など）は
+            // `resolve_array_type_expr`が既に診断を出して`None`を返すため、
+            // それをさらにレコード・スカラーとして解決しようとして
+            // 二重に診断を出してしまうのを避ける。
+            let kind = if matches!(p.ty, TypeExpr::Array { .. }) {
+                match self.resolve_array_type_expr(&p.ty) {
+                    Some(arr) => Some(ValueKind::Array(arr)),
+                    None => continue,
+                }
+            } else {
+                match self.resolve_record_type_expr(&p.ty) {
+                    RecordResolution::Valid(id) => {
+                        let total_words = self.record_layouts[id.0].total_words;
+                        Some(ValueKind::Record(RecordKind { id, total_words }))
+                    }
+                    // フィールド型・サイズのエラーは`resolve_record_type_expr`が
+                    // 既に報告済みなので、ここでは追加の診断を出さずスキップする。
+                    RecordResolution::Invalid => continue,
+                    RecordResolution::NotRecord => value_kind_of(&p.ty),
+                }
+            };
+            let Some(kind) = kind else {
                 self.error(
                     p.ty.span(),
                     format!(
                         "parameter type '{}' is out of scope for this step's minimal codegen \
-                         (only INTEGER/BOOLEAN/STRING[n] are supported)",
+                         (only INTEGER/BOOLEAN/STRING[n]/ARRAY/RECORD are supported)",
                         describe_type(&p.ty)
                     ),
                 );
                 continue;
             };
-            let indirect = p.by_ref || matches!(kind, ValueKind::StringN(_));
+            let indirect = p.by_ref
+                || matches!(
+                    kind,
+                    ValueKind::StringN(_) | ValueKind::Array(_) | ValueKind::Record(_)
+                );
             let slot = FrameSlot {
                 address: Address(param_base + result.len() as u16),
                 by_ref: p.by_ref,
@@ -1128,6 +1228,7 @@ impl CodeGenerator {
                     level: Level(0),
                     address: slot.address,
                     indirect: slot.indirect,
+                    offset: 0,
                 });
             }
         }
@@ -1141,6 +1242,7 @@ impl CodeGenerator {
                 level,
                 address: slot.address,
                 indirect: false,
+                offset: 0,
             });
         }
         None
@@ -1158,6 +1260,7 @@ impl CodeGenerator {
                 level: Level(0),
                 address,
                 indirect: false,
+                offset: 0,
             }
         } else {
             let address = self.alloc_slot();
@@ -1165,29 +1268,45 @@ impl CodeGenerator {
                 level: Level(0),
                 address,
                 indirect: false,
+                offset: 0,
             }
+        }
+    }
+
+    /// `indirect`な`ResolvedVar`について、スロットから読んだアドレスへ
+    /// `offset`（コンパイル時定数、実行時に加算）を足し込む命令列を発行する
+    /// （`offset == 0`なら何も発行しない）。[`ResolvedVar::offset`]の
+    /// ドキュメント参照。呼び出し元は、スタック上に既にスロットの中身
+    /// （アドレス）が積まれている状態でこれを呼ぶ。
+    fn emit_indirect_offset(&mut self, offset: u16, span: Span) {
+        if offset != 0 {
+            self.emit_ldc_int(offset as i64, span);
+            self.emit(UnconfirmedOp::Adi.into(), span);
         }
     }
 
     /// 解決済みの変数を読み込み、スタックへ値を積む。`VAR`仮引数
     /// （`by_ref`）の場合は、スロットに格納されているアドレスをまず
-    /// [`UnconfirmedOp::Lod`]で読み、続けて[`UnconfirmedOp::Ind`]で
-    /// 参照先の値をデリファレンスする。
+    /// [`UnconfirmedOp::Lod`]で読み、（[`ResolvedVar::offset`]が非0なら
+    /// それを加算した上で）続けて[`UnconfirmedOp::Ind`]で参照先の値を
+    /// デリファレンスする。
     fn gen_load_resolved(&mut self, resolved: ResolvedVar, span: Span) {
         self.emit(
             UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
             span,
         );
         if resolved.indirect {
+            self.emit_indirect_offset(resolved.offset, span);
             self.emit(UnconfirmedOp::Ind.into(), span);
         }
     }
 
     /// 解決済みの変数へ値を格納する。`gen_value`が値を生成するコードを
     /// 発行するコールバックで、`by_ref`の場合は先にスロットからアドレスを
-    /// 読み出してから値を積み、[`UnconfirmedOp::Sti`]で間接ストアする
-    /// （アドレスが先、値が後というスタック順を仮定している。
-    /// [`UnconfirmedOp::Sti`]のドキュメント参照）。
+    /// 読み出し（[`ResolvedVar::offset`]が非0ならそれを加算し）てから値を
+    /// 積み、[`UnconfirmedOp::Sti`]で間接ストアする（アドレスが先、値が後
+    /// というスタック順を仮定している。[`UnconfirmedOp::Sti`]のドキュメント
+    /// 参照）。
     fn gen_store_resolved(
         &mut self,
         resolved: ResolvedVar,
@@ -1199,6 +1318,7 @@ impl CodeGenerator {
                 UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
                 span,
             );
+            self.emit_indirect_offset(resolved.offset, span);
             gen_value(self);
             self.emit(UnconfirmedOp::Sti.into(), span);
         } else {
@@ -1216,12 +1336,15 @@ impl CodeGenerator {
     /// アドレス取得を避ける。伝統的なPascalの「`VAR`引数をさらに別の
     /// `VAR`引数として渡す」場合の意味論）。それ以外は
     /// [`UnconfirmedOp::Lda`]で新たにアドレスを計算する。
+    /// [`ResolvedVar::offset`]が非0（間接参照経由のレコードフィールド）な
+    /// 場合はその分を加算する。
     fn gen_address_of_resolved(&mut self, resolved: ResolvedVar, span: Span) {
         if resolved.indirect {
             self.emit(
                 UnconfirmedOp::Lod(resolved.level, resolved.address).into(),
                 span,
             );
+            self.emit_indirect_offset(resolved.offset, span);
         } else {
             self.emit(
                 UnconfirmedOp::Lda(resolved.level, resolved.address).into(),
@@ -1591,17 +1714,33 @@ impl CodeGenerator {
     /// （フィールドオフセットはコンパイル時定数であり、ベースアドレスへの
     /// 加算だけで済む）に基づく。
     ///
-    /// # スコープ: 単純な識別子（グローバルのレコード変数）のみ
+    /// # スコープ: 単純な識別子のみ（Step 21から`VAR`/値仮引数のレコードも含む）
     ///
     /// `record`は単純な識別子のみサポートする。ネストしたフィールド
-    /// アクセス（レコード内レコード）・配列要素のフィールド・`VAR`仮引数と
-    /// して渡されたレコードはいずれも今回のスコープ外
-    /// （[`crate::codegen`]モジュールドキュメント参照）。診断は
-    /// 呼び出し元ではなくこの関数自身が発行し、`None`を返す
+    /// アクセス（レコード内レコード）・配列要素のフィールドはいずれも
+    /// 今回のスコープ外（[`crate::codegen`]モジュールドキュメント参照）。
+    /// 診断は呼び出し元ではなくこの関数自身が発行し、`None`を返す
     /// （[`Self::gen_array_element_address`]と異なりダミー値は積まない。
     /// 呼び出し元がロード/ストアいずれの文脈かによって適切なダミー処理
     /// （`Ldc(0)`を積む、あるいは値だけ評価してストアは諦める）が異なる
     /// ため、ダミー処理の選択は呼び出し元に委ねる）。
+    ///
+    /// # Step 21: `VAR`/値仮引数として渡されたレコードのフィールドアクセス
+    ///
+    /// `record`がレコード型の`VAR`仮引数、または（本ステップの仮実装方針に
+    /// 基づく）値仮引数である場合、`base`（[`Self::resolve_var`]の結果）は
+    /// `indirect = true`になる。この場合、フィールドのオフセットは依然
+    /// コンパイル時定数だが、それを足し込む先はスロットの**中身**
+    /// （実行時にしか分からないレコード本体のアドレス）であって、スロット
+    /// 自身のアドレスではない。そのため`base.indirect`が真の場合は
+    /// オフセットを`ResolvedVar::address`へ静的に加算せず、代わりに
+    /// [`ResolvedVar::offset`]として持たせ、実際の加算を
+    /// [`Self::gen_load_resolved`]/[`Self::gen_store_resolved`]/
+    /// [`Self::gen_address_of_resolved`]が実行時に（`Lod`でスロットから
+    /// アドレスを読んだ後、必要なら`Ldc`+`Adi`で加算してから`Ind`/`Sti`）
+    /// 行う（配列添字アクセス[`Self::gen_array_element_address`]と同種の
+    /// 間接アドレッシングだが、添字がコンパイル時定数である分、条件付きで
+    /// `Ldc`+`Adi`を省略できる点が異なる）。
     fn resolve_field_access(
         &mut self,
         record_expr: &Expr,
@@ -1645,17 +1784,27 @@ impl CodeGenerator {
             return None;
         };
 
-        Some(ResolvedVar {
-            level: base.level,
-            address: Address(base.address.0 + offset),
-            // レコード変数自体を引数として渡すことは今回のスコープ外
-            // （[`crate::codegen`]モジュールドキュメント参照）なので、
-            // `base.indirect`は`Self::declare_record_vars`が組み立てる
-            // `VarSlot`が常に直接記憶方式である以上、常に偽である
-            // （`build_params`/`build_locals`がレコード型の仮引数・
-            // ローカル変数をそもそも受理しないため）。
-            indirect: false,
-        })
+        if base.indirect {
+            // `base`自体が`VAR`/値仮引数（スロットにレコード本体のアドレスを
+            // 格納している）である場合。`resolve_field_access`のドキュメント
+            // 「Step 21」参照: オフセットの加算は実行時に委ねる。
+            Some(ResolvedVar {
+                level: base.level,
+                address: base.address,
+                indirect: true,
+                offset: base.offset + offset,
+            })
+        } else {
+            // 直接記憶方式（`PROGRAM`直下のグローバルレコード変数）。
+            // オフセットをコンパイル時に`address`へ静的に加算できる
+            // （このモジュールドキュメントの「設計判断」参照）。
+            Some(ResolvedVar {
+                level: base.level,
+                address: Address(base.address.0 + offset),
+                indirect: false,
+                offset: 0,
+            })
+        }
     }
 
     /// フィールドの種類（[`ValueKind`]）を、診断を出さずに解決する
@@ -2206,7 +2355,18 @@ impl CodeGenerator {
     /// アドレスを（[`Self::gen_address_of_resolved`]、単純な変数参照のみ
     /// サポート）、`STRING[n]`の値仮引数には呼び出し元が新規確保した
     /// 一時領域のアドレスを（[`Self::gen_string_value_arg`]、Step 18）、
-    /// それ以外の値仮引数には値を（[`Self::gen_expr`]）積む。
+    /// 配列・レコードの値仮引数には元の変数のアドレスをそのまま
+    /// （[`Self::gen_array_or_record_value_arg`]、Step 21の仮実装。コピーは
+    /// 作らない）、それ以外の値仮引数には値を（[`Self::gen_expr`]）積む。
+    ///
+    /// # 引数の評価順序: 仮引数の並び順（左から右）
+    ///
+    /// 引数は`args.iter().zip(params.iter())`が辿る順、すなわち呼び出し式に
+    /// 書かれた実引数の並び順（＝仮引数の宣言順）で左から右へ評価・発行する
+    /// （一次資料由来のCONFIRMED済みの呼び出し規約。`crate`モジュール
+    /// ドキュメント「呼び出し規約とRPUのBパラメータ」参照）。この順序で
+    /// 積んだ結果が、そのまま活性化レコードのパラメータ領域の並び
+    /// （[`Self::build_params`]が割り当てるオフセット順）と一致する。
     fn gen_call_args(
         &mut self,
         params: &[FrameSlot],
@@ -2235,6 +2395,8 @@ impl CodeGenerator {
                 self.gen_var_arg(arg, span);
             } else if let ValueKind::StringN(max_len) = param.kind {
                 self.gen_string_value_arg(arg, max_len, span);
+            } else if matches!(param.kind, ValueKind::Array(_) | ValueKind::Record(_)) {
+                self.gen_array_or_record_value_arg(arg, span);
             } else {
                 self.gen_expr(arg);
             }
@@ -2321,12 +2483,56 @@ impl CodeGenerator {
     }
 
     fn gen_var_arg(&mut self, arg: &Expr, span: Span) {
+        self.gen_identifier_address_arg(
+            arg,
+            span,
+            "cannot pass an expression as a VAR argument (only a simple variable reference is \
+             supported by this step's minimal codegen)",
+        );
+    }
+
+    /// 配列・レコードの値仮引数への実引数のコード生成（Step 21）。
+    ///
+    /// # UNCONFIRMED/TODO: 値渡しの正しい意味論（コピー生成）は未実装（仮実装）
+    ///
+    /// 本来のPascalの値渡し意味論では、配列・レコードを値渡しする場合、
+    /// 呼び出し側でコピーを作成し、そのコピーのアドレスを渡す（呼び出された
+    /// 側での変更が元の変数に影響しない）。しかし本ステップでは実装を
+    /// 単純化するため、コピー生成を行わず、[`Self::gen_var_arg`]（`VAR`
+    /// 引数）と全く同じ命令列（元の変数のアドレスをそのまま積む）を発行
+    /// する。結果として、呼び出された側での配列要素・レコードフィールドへの
+    /// 変更が呼び出し側にも反映されてしまう（実質的に参照渡しのように
+    /// 振る舞う）という既知の制限がある。これはタスク依頼で明示された
+    /// 意図的な仮実装であり、正しい値渡し意味論（コピー生成）は、将来の
+    /// `VAR`パラメータの正式な構文・意味論の実装と合わせて別ステップで
+    /// 対応する予定（[`Self::build_params`]のドキュメント、リポジトリの
+    /// `README.md`「既知の制限」も参照）。
+    ///
+    /// `STRING[n]`の値渡し（[`Self::gen_string_value_arg`]、Step 18）とは
+    /// 対照的に、こちらは意図的にコピーを作らない点に注意。
+    ///
+    /// # スコープ: 単純な識別子のみ
+    ///
+    /// [`Self::gen_var_arg`]と同様、単純な変数参照のみサポートする
+    /// （配列要素・レコードフィールドを配列/レコード引数として渡すことは
+    /// 型上そもそも起こらないため、この制約は実質的に「式は渡せない」
+    /// ことのみを意味する）。
+    fn gen_array_or_record_value_arg(&mut self, arg: &Expr, span: Span) {
+        self.gen_identifier_address_arg(
+            arg,
+            span,
+            "array/record value arguments only support a simple variable reference (not an \
+             expression) in this step's minimal codegen",
+        );
+    }
+
+    /// [`Self::gen_var_arg`]/[`Self::gen_array_or_record_value_arg`]共通の
+    /// 実装: 単純な識別子を解決し、そのアドレスをスタックへ積む
+    /// （[`Self::gen_address_of_resolved`]）。`arg`が単純な識別子でない場合は
+    /// `expr_error`を診断として報告する。
+    fn gen_identifier_address_arg(&mut self, arg: &Expr, span: Span, expr_error: &str) {
         let Expr::Identifier(ident) = arg else {
-            self.error(
-                arg.span(),
-                "cannot pass an expression as a VAR argument (only a simple variable reference \
-                 is supported by this step's minimal codegen)",
-            );
+            self.error(arg.span(), expr_error);
             self.gen_expr(arg);
             return;
         };

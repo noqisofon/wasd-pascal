@@ -886,3 +886,106 @@ fn string_n_record_field_assignment_and_writeln_prints_the_assigned_value() {
     assert_eq!(output.as_string(), "Gandalf\n10\n");
     assert!(vm.is_halted());
 }
+
+// ---- Step 21: 複数引数（任意数）、配列・レコードの値仮引数 ----
+
+/// タスク依頼の動作確認用サンプルプログラムそのもの:
+/// - `FUNCTION Add(a, b, c: INTEGER): INTEGER`（3個の`INTEGER`仮引数）
+/// - `PROCEDURE Damage(VAR ch: Character; amount: INTEGER)`（レコード型の
+///   `VAR`仮引数 + `INTEGER`の値仮引数の混在）
+///
+/// `VAR`仮引数の構文（`VAR ch: Character`）は本実装で既にサポート済み
+/// （`wasd-parser`の`parses_procedure_decl_with_var_param`、
+/// `wasd-sema`の`by_ref`チェック参照）のため、タスク依頼が許容する
+/// 「VAR構文が未対応なら値渡し引数に書き換えてよい」という代替は不要と
+/// 判断し、タスク依頼のソースをそのまま使う。`10 + 20 + 30 = 60`、
+/// `50 - 30 = 20`（`<= 0`ではないので`alive`は`TRUE`のまま）で、
+/// 期待される出力は完了条件に明記された`"60\n20\n"`と一致する。
+#[test]
+fn multi_arg_task_sample_program_runs_correctly() {
+    let module = common::compile(
+        r#"
+        PROGRAM MultiArgTest;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+
+        FUNCTION Add(a: INTEGER; b: INTEGER; c: INTEGER): INTEGER;
+        BEGIN
+            Add := a + b + c;
+        END;
+
+        PROCEDURE Damage(VAR ch: Character; amount: INTEGER);
+        BEGIN
+            ch.hp := ch.hp - amount;
+            IF ch.hp <= 0 THEN
+                ch.alive := FALSE;
+        END;
+
+        VAR
+            hero: Character;
+            total: INTEGER;
+        BEGIN
+            total := Add(10, 20, 30);
+            WriteLn(total);
+
+            hero.hp := 50;
+            hero.alive := TRUE;
+            Damage(hero, 30);
+            WriteLn(hero.hp);
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "60\n20\n");
+    assert!(vm.is_halted());
+}
+
+/// タスク依頼「3つ以上の異なる型を混在させた引数（INTEGER、BOOLEAN、
+/// STRING[n]、配列）を持つ呼び出し」パターン。同時に、配列の値仮引数が
+/// 仮実装（コピーを作らずアドレスをそのまま渡す。
+/// `wasd_pcode::CodeGenerator::gen_array_or_record_value_arg`のドキュメント
+/// 「UNCONFIRMED/TODO」参照）であることの既知の副作用——呼び出された側での
+/// 配列要素への変更が呼び出し元にも反映されてしまうこと——も実行結果で
+/// 確認する（`nums[1]`が`Describe`呼び出し後に呼び出し元から見ても`999`に
+/// 変わっていること）。
+#[test]
+fn procedure_call_with_integer_boolean_string_and_array_parameters_mixed_runs_correctly() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR
+            nums: ARRAY [1..3] OF INTEGER;
+
+        PROCEDURE Describe(n: INTEGER; flag: BOOLEAN; msg: STRING[10]; arr: ARRAY [1..3] OF INTEGER);
+        BEGIN
+            WriteLn(n);
+            WriteLn(flag);
+            WriteLn(msg);
+            WriteLn(arr[1]);
+            WriteLn(arr[2]);
+            WriteLn(arr[3]);
+            arr[1] := 999;
+        END;
+
+        BEGIN
+            nums[1] := 1;
+            nums[2] := 2;
+            nums[3] := 3;
+            Describe(42, TRUE, 'hi', nums);
+            WriteLn(nums[1])
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "42\ntrue\nhi\n1\n2\n3\n999\n");
+    assert!(vm.is_halted());
+}
