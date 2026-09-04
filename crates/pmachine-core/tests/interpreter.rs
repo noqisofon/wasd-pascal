@@ -754,3 +754,135 @@ fn array_index_can_be_a_runtime_computed_expression() {
     assert_eq!(output.as_string(), "50\n40\n30\n20\n10\n");
     assert!(vm.is_halted());
 }
+
+// ---- Step 20: レコード（フィールドアクセス） ----
+
+/// タスク依頼の動作確認用サンプルプログラムそのもの
+/// （Wizardry的なキャラクターデータ構造の最小版）。`hero.hp := 100;`
+/// `hero.alive := TRUE;`のフィールド書き込み、`WriteLn(hero.hp)`の
+/// フィールド読み出しに加えて、`hero.hp := hero.hp - 30;`という
+/// 「同じフィールドを読み出してから書き戻す」パターンも確認する。
+#[test]
+fn record_field_access_sample_program_runs_correctly() {
+    let module = common::compile(
+        r#"
+        PROGRAM RecordTest;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR
+            hero: Character;
+        BEGIN
+            hero.hp := 100;
+            hero.alive := TRUE;
+
+            WriteLn(hero.hp);
+
+            hero.hp := hero.hp - 30;
+            WriteLn(hero.hp)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "100\n70\n");
+    assert!(vm.is_halted());
+}
+
+/// レコードのフィールドの読み書きが、配列変数と共存しても互いに干渉
+/// しないこと（Step 19の配列がグローバルデータ領域を使うのと同じ領域を
+/// レコードも使うため、アドレス割り当てが重ならないことを確認する）。
+#[test]
+fn record_fields_and_arrays_coexist_without_interfering() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR
+            scores: ARRAY [1..3] OF INTEGER;
+            hero: Character;
+            i: INTEGER;
+        BEGIN
+            FOR i := 1 TO 3 DO
+                scores[i] := i * 100;
+
+            hero.hp := 50;
+            hero.alive := TRUE;
+
+            FOR i := 1 TO 3 DO
+                WriteLn(scores[i]);
+            WriteLn(hero.hp);
+            WriteLn(hero.alive)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "100\n200\n300\n50\ntrue\n");
+    assert!(vm.is_halted());
+}
+
+/// `TYPE`宣言を経ない無名`RECORD`型の`VAR`宣言でも、フィールドの読み書きが
+/// 正しく動作すること。
+#[test]
+fn anonymous_record_field_access_round_trips() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR point: RECORD x, y: INTEGER END;
+        BEGIN
+            point.x := 3;
+            point.y := 4;
+            WriteLn(point.x);
+            WriteLn(point.y)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "3\n4\n");
+    assert!(vm.is_halted());
+}
+
+/// `STRING[n]`フィールドへの代入・`WriteLn`も実際に実行して正しい文字列が
+/// 出力されること（`crates/wasd-pcode/tests/codegen.rs`の
+/// `string_n_record_field_assignment_and_writeln_are_supported`が命令列を
+/// 検証しているのに対し、こちらは実行結果そのものを検証する）。
+#[test]
+fn string_n_record_field_assignment_and_writeln_prints_the_assigned_value() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                name: STRING[20];
+            END;
+        VAR hero: Character;
+        BEGIN
+            hero.hp := 10;
+            hero.name := 'Gandalf';
+            WriteLn(hero.name);
+            WriteLn(hero.hp)
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "Gandalf\n10\n");
+    assert!(vm.is_halted());
+}

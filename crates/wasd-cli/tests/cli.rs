@@ -131,11 +131,11 @@ fn compile_emits_pcode_for_a_program_with_procedures_and_functions() {
 
 /// Step 15: `hello.pas`は文字列リテラルを`WriteLn`へ直接渡すだけなので
 /// もはや"out of scope"の例として使えない（`check_succeeds_on_a_valid_program`
-/// 参照）。`pcode_unsupported.pas`（レコード型の`VAR`宣言。意味解析は通るが
-/// `wasd-pcode`のスコープ外）に差し替える。Step 19で配列型のグローバル
-/// `VAR`宣言はサポート対象になったため、`pcode_unsupported.pas`自体の
-/// 中身もレコード型に差し替えた（配列型はもはや"out of scope"の例として
-/// 使えない）。
+/// 参照）。`pcode_unsupported.pas`（ポインタ型の`VAR`宣言。意味解析は通るが
+/// `wasd-pcode`のスコープ外）に差し替える。Step 19で配列型、Step 20で
+/// レコード型のグローバル`VAR`宣言がそれぞれサポート対象になったため、
+/// `pcode_unsupported.pas`自体の中身もポインタ型に差し替えた（配列型・
+/// レコード型はもはや"out of scope"の例として使えない）。
 #[test]
 fn compile_reports_out_of_scope_constructs_without_panicking() {
     wasdc()
@@ -197,7 +197,8 @@ fn run_executes_writeln_demo_and_prints_output() {
 }
 
 /// Step 15: `compile_reports_out_of_scope_constructs_without_panicking`と
-/// 同じ理由で`hello.pas`から`pcode_unsupported.pas`に差し替える。
+/// 同じ理由で`hello.pas`から`pcode_unsupported.pas`（Step 20時点ではポインタ
+/// 型の`VAR`宣言）に差し替える。
 #[test]
 fn run_reports_out_of_scope_constructs_without_panicking() {
     wasdc()

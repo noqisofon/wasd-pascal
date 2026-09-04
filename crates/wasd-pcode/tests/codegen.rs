@@ -624,24 +624,27 @@ fn case_statements_are_reported_as_an_error_without_panicking() {
     );
 }
 
-/// レコード・ポインタ型の`VAR`宣言はスコープ外としてエラー報告される
-/// こと（配列型自体はStep 19からグローバル変数として扱えるようになった。
-/// 下記「Step 19: 配列」節参照）。
+/// ポインタ型の`VAR`宣言はスコープ外としてエラー報告されること（配列型・
+/// レコード型自体はそれぞれStep 19・Step 20からグローバル変数として扱える
+/// ようになった。下記「Step 19: 配列」「Step 20: レコード」節参照）。
 #[test]
-fn record_typed_variables_are_reported_as_an_error_without_panicking() {
+fn pointer_typed_variables_are_reported_as_an_error_without_panicking() {
     let program = parse_program(
         r#"
         PROGRAM P;
-        VAR r: RECORD x: INTEGER END;
+        TYPE Node = RECORD x: INTEGER END;
+        VAR r: ^Node;
         BEGIN
         END.
         "#,
     );
 
     let result = CodeGenerator::new().generate(&program);
-    let diagnostics = result.expect_err("record VARs must be rejected, not codegen'd");
+    let diagnostics = result.expect_err("pointer VARs must be rejected, not codegen'd");
     assert!(
-        diagnostics.iter().any(|d| d.message.contains("RECORD")),
+        diagnostics
+            .iter()
+            .any(|d| d.message.to_lowercase().contains("pointer")),
         "diagnostics: {diagnostics:?}"
     );
 }
@@ -1505,4 +1508,379 @@ fn array_with_too_many_elements_is_reported_as_an_error_without_panicking() {
             .any(|d| d.message.contains("too many elements")),
         "diagnostics: {diagnostics:?}"
     );
+}
+
+// ---- Step 20: レコード（フィールドアクセス） ----
+
+/// `TYPE Character = RECORD hp: INTEGER; alive: BOOLEAN; END;`経由の
+/// `VAR hero: Character;`が、全フィールドのワード数の合計
+/// （`INTEGER`1語 + `BOOLEAN`1語 = 2語）を確保すること。
+#[test]
+fn global_record_variable_via_type_decl_reserves_field_word_count() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR hero: Character;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(module.global_data_words, 2);
+}
+
+/// `TYPE`宣言を経ない無名`RECORD`型の`VAR`宣言（`VAR r: RECORD a, b: INTEGER
+/// END;`）も、同様にフィールドのワード数の合計を確保すること。
+#[test]
+fn anonymous_record_variable_reserves_field_word_count() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR r: RECORD a, b: INTEGER END;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(module.global_data_words, 2);
+}
+
+/// `x := hero.hp;`（`hero`が`hp: INTEGER; alive: BOOLEAN`を持つレコード、
+/// `hp`はオフセット0）が、配列（`Lda`+`Ldc`+`Sbi`+`Adi`+`Ind`という間接
+/// アドレッシングの命令列）とは異なり、単純な`Lod`1命令だけで済むこと
+/// （`CodeGenerator::resolve_field_access`の設計判断ドキュメント参照:
+/// フィールドオフセットはコンパイル時定数なので、既存の`Lod`/`Str`の
+/// アドレスオペランドへ直接畳み込める）。
+#[test]
+fn record_field_load_generates_a_single_lod_with_the_field_offset() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR hero: Character;
+        VAR x: INTEGER;
+        BEGIN
+            x := hero.hp
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // hero: Address(0)..Address(2) (hp=0, alive=1), x: Address(2)
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lod(Level(0), Address(0))), // hero.hp
+            op(UnconfirmedOp::Str(Level(0), Address(2))), // x := ...
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `hero.hp := x;`が、`hp`のフィールドオフセットへ直接`Str`する単純な
+/// 命令列になること（2番目のフィールド`alive`のオフセットが1であることも
+/// 併せて検証: `hero.alive := TRUE`相当のオフセット計算を別テストではなく
+/// フィールド宣言順の確認としてここに含める）。
+#[test]
+fn record_field_store_generates_a_single_str_with_the_field_offset() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR hero: Character;
+        VAR x: INTEGER;
+        BEGIN
+            hero.hp := x;
+            hero.alive := TRUE
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // hero: Address(0)..Address(2) (hp=0, alive=1), x: Address(2)
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lod(Level(0), Address(2))), // x
+            op(UnconfirmedOp::Str(Level(0), Address(0))), // hero.hp := x
+            op(UnconfirmedOp::Ldc(1)),                    // TRUE
+            op(UnconfirmedOp::Str(Level(0), Address(1))), // hero.alive := TRUE
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `WriteLn(hero.hp)`/`WriteLn(hero.alive)`が、それぞれのフィールドの
+/// 種類（`INTEGER`/`BOOLEAN`）に応じた`BUILTIN_WRITELN_INT`/
+/// `BUILTIN_WRITELN_BOOL`を呼ぶこと（`CodeGenerator::field_kind`が
+/// `infer_expr_kind`から正しく解決できていることの確認）。
+#[test]
+fn writeln_with_record_field_selects_the_field_kind() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+        VAR hero: Character;
+        BEGIN
+            WriteLn(hero.hp);
+            WriteLn(hero.alive)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_INT)),
+            op(UnconfirmedOp::Lod(Level(0), Address(1))),
+            cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_BOOL)),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// レコード変数そのものを式として使う（`x := hero;`のような、フィールドを
+/// 指定しない値としての参照）はスコープ外としてエラー報告されること
+/// （配列の同種のガードと同じ方針。`CodeGenerator::gen_identifier_load`
+/// 参照）。
+#[test]
+fn bare_record_reference_as_a_value_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE Character = RECORD hp: INTEGER END;
+        VAR hero: Character;
+        VAR x: INTEGER;
+        BEGIN
+            x := hero
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics =
+        result.expect_err("a bare record reference as a value must be rejected, not codegen'd");
+    assert!(
+        diagnostics.iter().any(|d| d
+            .message
+            .contains("a whole record cannot be used as a value")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// レコード全体の代入（`hero2 := hero1;`）はスコープ外としてエラー報告
+/// されること。
+#[test]
+fn whole_record_assignment_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE Character = RECORD hp: INTEGER END;
+        VAR hero1, hero2: Character;
+        BEGIN
+            hero2 := hero1
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("whole-record assignment must be rejected, not codegen'd");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("whole-record assignment")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `PROCEDURE`/`FUNCTION`本体内のローカルレコード変数はスコープ外として
+/// エラー報告されること（`STRING[n]`/配列が最初は`PROGRAM`直下の
+/// グローバル変数のみサポートされたのと同じ前例。
+/// `CodeGenerator::declare_record_vars`のドキュメント参照）。
+#[test]
+fn local_record_variable_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE Character = RECORD hp: INTEGER END;
+
+        PROCEDURE DoSomething;
+        VAR hero: Character;
+        BEGIN
+        END;
+
+        BEGIN
+            DoSomething
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("local record VARs must be rejected, not codegen'd");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("local VAR type")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `RECORD`以外を要素とする複合的なフィールド（配列フィールド）は
+/// スコープ外としてエラー報告されること（タスク文書の「今回のスコープに
+/// 含めない」節: 「配列をレコードのフィールドにする」複合構造）。
+#[test]
+fn record_field_of_unsupported_type_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Bag = RECORD
+                items: ARRAY [1..3] OF INTEGER;
+            END;
+        VAR b: Bag;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("record fields with unsupported types must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("record field type")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// 存在しないフィールド名へのアクセスはエラー報告されること。
+#[test]
+fn unknown_record_field_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE Character = RECORD hp: INTEGER END;
+        VAR hero: Character;
+        VAR x: INTEGER;
+        BEGIN
+            x := hero.mp
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("unknown fields must be rejected, not codegen'd");
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("no field")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `TYPE Name = RECORD ... END;`以外の`TYPE`宣言（配列型の別名等）は
+/// 引き続きスコープ外としてエラー報告されること。
+#[test]
+fn non_record_type_decl_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE Nums = ARRAY [1..3] OF INTEGER;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics =
+        result.expect_err("non-RECORD TYPE declarations must be rejected, not codegen'd");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("RECORD ... END")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `hero.name`（`name: STRING[20]`フィールド）への文字列リテラル代入・
+/// `WriteLn`が、単純な`STRING[n]`変数と同じ命令列パターン（長さ+文字ごとの
+/// `STR`、`WriteLn`は`LDA`+`CXG WRITELN_STRVAR`）で動作すること（フィールドの
+/// 型として`STRING[n]`もサポートする、というタスク文書のボーナス項目）。
+#[test]
+fn string_n_record_field_assignment_and_writeln_are_supported() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                name: STRING[20];
+            END;
+        VAR hero: Character;
+        BEGIN
+            hero.name := 'Gandalf';
+            WriteLn(hero.name)
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // hero: hp=Address(0) (1 word), name=Address(1) (1 + 20 words)
+    let name_addr = Address(1);
+    let mut expected = vec![
+        op(UnconfirmedOp::Ldc(7)), // "Gandalf".len()
+        op(UnconfirmedOp::Str(Level(0), name_addr)),
+    ];
+    for (i, ch) in "Gandalf".chars().enumerate() {
+        expected.push(op(UnconfirmedOp::Ldc(ch as i16)));
+        expected.push(op(UnconfirmedOp::Str(
+            Level(0),
+            Address(name_addr.0 + 1 + i as u16),
+        )));
+    }
+    expected.push(op(UnconfirmedOp::Lda(Level(0), name_addr)));
+    expected.push(cop(ConfirmedOp::Cxg(
+        KERNEL_SEGMENT,
+        BUILTIN_WRITELN_STRVAR,
+    )));
+    expected.push(op(UnconfirmedOp::Stp));
+
+    assert_eq!(opcodes(&module), expected);
 }
