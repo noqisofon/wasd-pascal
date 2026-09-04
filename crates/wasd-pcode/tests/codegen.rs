@@ -1936,16 +1936,18 @@ fn procedure_call_with_three_mixed_type_parameters_pushes_arguments_left_to_righ
     );
 }
 
-/// 配列型の値仮引数（Step 21の仮実装）: 呼び出し元はコピーを作らず、
-/// 実引数のアドレスをそのまま積む（`STRING[n]`の値仮引数がコピーを作る
+/// 配列型の値仮引数（Step 22でコピー生成を実装）: 呼び出し元は、実引数の
+/// アドレスをそのまま積むのではなく、まずグローバルデータ領域の末尾に
+/// 新規の一時領域を確保して要素ごとにコピーし（`STRING[n]`の値仮引数が
+/// コピーを作る
 /// ([`procedure_with_string_n_value_parameter_materializes_literal_argument`]
-/// 参照)のとは対照的）。呼び出し先の配列要素アクセスは、`VAR`仮引数の
-/// 配列と同じ間接アドレッシング（スロットから`LOD`でアドレスを読み、
-/// そこへ添字オフセットを加算する）になる
+/// 参照)のと同じ方針）、その一時領域自身のアドレスを積む。呼び出し先の
+/// 配列要素アクセスは、`VAR`仮引数の配列と同じ間接アドレッシング（スロット
+/// から`LOD`でアドレスを読み、そこへ添字オフセットを加算する）になる
 /// （[`array_index_load_generates_lda_ldc_sbi_adi_ind`]の直接記憶方式版と
 /// 比較: ベースアドレス計算が`LDA`ではなく`LOD`になる点のみが異なる）。
 #[test]
-fn array_value_parameter_pushes_the_address_of_the_argument_without_copying() {
+fn array_value_parameter_copies_the_argument_before_the_call() {
     let program = parse_program(
         r#"
         PROGRAM P;
@@ -1965,12 +1967,12 @@ fn array_value_parameter_pushes_the_address_of_the_argument_without_copying() {
         .generate(&program)
         .expect("codegen should succeed");
 
-    // nums: Address(0)..Address(3), x: Address(3)
+    // nums: Address(0)..Address(3), x: Address(3), copy temp: Address(4)..Address(7)
     assert_eq!(
         opcodes(&module),
         vec![
             // Foo's body (entry = 0): x := arr[1]
-            op(UnconfirmedOp::Lod(Level(0), Address(5))), // arr's slot holds nums' address
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // arr's slot holds the copy's address
             op(UnconfirmedOp::Ldc(1)),                    // index literal 1
             op(UnconfirmedOp::Ldc(1)),                    // low bound
             op(UnconfirmedOp::Sbi),
@@ -1978,15 +1980,24 @@ fn array_value_parameter_pushes_the_address_of_the_argument_without_copying() {
             op(UnconfirmedOp::Ind),                       // arr[1]
             op(UnconfirmedOp::Str(Level(1), Address(3))), // x := ...
             cop(ConfirmedOp::Rpu(1)),
-            // Foo(nums) call: the caller pushes the ADDRESS of nums, not a copy of it
-            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            // Foo(nums) call: the caller copies nums element-by-element into a
+            // fresh temp (Address(4)..=6), then pushes the COPY's address (not
+            // nums' own address).
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(4))),
+            op(UnconfirmedOp::Lod(Level(0), Address(1))),
+            op(UnconfirmedOp::Str(Level(0), Address(5))),
+            op(UnconfirmedOp::Lod(Level(0), Address(2))),
+            op(UnconfirmedOp::Str(Level(0), Address(6))),
+            op(UnconfirmedOp::Lda(Level(0), Address(4))),
             cop(ConfirmedOp::Cpg(CodeAddress(0))),
             op(UnconfirmedOp::Stp),
         ]
     );
 }
 
-/// レコード型の値仮引数（Step 21の仮実装）経由でのフィールドアクセスは、
+/// レコード型の値仮引数（Step 22からコピー生成。呼び出し先スロットには
+/// コピーのアドレスが入る）経由でのフィールドアクセスは、
 /// 直接記憶方式のレコード変数（[`record_field_load_generates_a_single_lod_with_the_field_offset`]
 /// 等）とは異なり、フィールドのオフセットをコンパイル時に静的加算できない
 /// （スロットに格納されているのはレコード本体そのものではなくアドレス
@@ -2026,30 +2037,41 @@ fn record_value_parameter_field_access_uses_runtime_offset_when_indirect() {
         .generate(&program)
         .expect("codegen should succeed");
 
-    // hero: Address(0)..Address(2) (hp=0, alive=1), x: Address(2)
+    // hero: Address(0)..Address(2) (hp=0, alive=1), x: Address(2),
+    // ReadHp's copy temp: Address(3)..Address(5), Revive's copy temp: Address(5)..Address(7)
     assert_eq!(
         opcodes(&module),
         vec![
             // ReadHp's body (entry = 0): x := ch.hp (field offset 0: no LDC/ADI needed)
-            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ch's slot holds hero's address
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ch's slot holds the copy's address
             op(UnconfirmedOp::Ind),                       // ch.hp (offset 0)
             op(UnconfirmedOp::Str(Level(1), Address(2))), // x := ...
             cop(ConfirmedOp::Rpu(1)),
             // Revive's body (entry = ...): ch.alive := TRUE (field offset 1: runtime add)
-            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ch's slot holds hero's address
+            op(UnconfirmedOp::Lod(Level(0), Address(5))), // ch's slot holds the copy's address
             op(UnconfirmedOp::Ldc(1)),                    // + field offset 1 (alive)
             op(UnconfirmedOp::Adi),
             op(UnconfirmedOp::Ldc(1)), // TRUE
             op(UnconfirmedOp::Sti),
             cop(ConfirmedOp::Rpu(1)),
-            // ReadHp(hero) call: the caller pushes the ADDRESS of hero, not a copy of it
-            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            // ReadHp(hero) call: the caller copies hero field-by-field into a
+            // fresh temp (Address(3)..=4), then pushes the COPY's address
+            // (not hero's own address).
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(3))),
+            op(UnconfirmedOp::Lod(Level(0), Address(1))),
+            op(UnconfirmedOp::Str(Level(0), Address(4))),
+            op(UnconfirmedOp::Lda(Level(0), Address(3))),
             cop(ConfirmedOp::Cpg(CodeAddress(0))),
-            // Revive(hero) call: same, a fresh address computation
+            // Revive(hero) call: a second, independent copy (Address(5)..=6)
             // (Revive's entry is CodeAddress(4): ReadHp's body occupies
             // instructions 0..=3 -- Lod/Ind/Str/Rpu -- and Revive's own
             // body starts right after)
-            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            op(UnconfirmedOp::Lod(Level(0), Address(0))),
+            op(UnconfirmedOp::Str(Level(0), Address(5))),
+            op(UnconfirmedOp::Lod(Level(0), Address(1))),
+            op(UnconfirmedOp::Str(Level(0), Address(6))),
+            op(UnconfirmedOp::Lda(Level(0), Address(5))),
             cop(ConfirmedOp::Cpg(CodeAddress(4))),
             op(UnconfirmedOp::Stp),
         ]
