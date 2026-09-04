@@ -131,8 +131,11 @@ fn compile_emits_pcode_for_a_program_with_procedures_and_functions() {
 
 /// Step 15: `hello.pas`は文字列リテラルを`WriteLn`へ直接渡すだけなので
 /// もはや"out of scope"の例として使えない（`check_succeeds_on_a_valid_program`
-/// 参照）。`pcode_unsupported.pas`（配列型の`VAR`宣言。意味解析は通るが
-/// `wasd-pcode`のスコープ外）に差し替える。
+/// 参照）。`pcode_unsupported.pas`（レコード型の`VAR`宣言。意味解析は通るが
+/// `wasd-pcode`のスコープ外）に差し替える。Step 19で配列型のグローバル
+/// `VAR`宣言はサポート対象になったため、`pcode_unsupported.pas`自体の
+/// 中身もレコード型に差し替えた（配列型はもはや"out of scope"の例として
+/// 使えない）。
 #[test]
 fn compile_reports_out_of_scope_constructs_without_panicking() {
     wasdc()

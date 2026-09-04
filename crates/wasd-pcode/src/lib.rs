@@ -10,11 +10,18 @@
 //! からはUCSD拡張の`STRING[n]`型（`PROGRAM`直下のグローバル`VAR`宣言のみ、
 //! 文字列リテラルの代入と`WriteLn`への直接渡しのみ）も扱う
 //! （[`codegen::CodeGenerator::gen_string_literal_assignment`]・
-//! [`builtin::BUILTIN_WRITELN_STRVAR`]参照）。
-//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、`STRING[n]`
-//! のローカル変数・仮引数、文字列演算（比較・連結・部分アクセス等）、
-//! `WriteLn`以外の組み込み手続き、`PROCEDURE`内`PROCEDURE`のような多段の
-//! ネストは別ステップに回す（[`codegen::CodeGenerator`]のドキュメント参照）。
+//! [`builtin::BUILTIN_WRITELN_STRVAR`]参照）。Step 19からは配列型
+//! （`PROGRAM`直下のグローバル`VAR`宣言のみ、1次元・`INTEGER`/`BOOLEAN`
+//! 要素のみ）の添字アクセス（読み込み・代入）も扱う
+//! （[`codegen::CodeGenerator::gen_array_element_address`]参照。新規の
+//! p-codeオペコードは追加せず、既存の`LDA`/`IND`/`STI`と算術命令の組み
+//! 合わせだけで実現しているため、`pmachine-core`側の改修は不要）。
+//! `CASE`、`UNIT`、レコード・ポインタ型、`REAL`/`CHAR`型、`STRING[n]`
+//! のローカル変数・仮引数、配列のローカル変数・仮引数・多次元配列・配列
+//! 同士の丸ごと代入・実行時の添字範囲チェック、文字列演算（比較・連結・
+//! 部分アクセス等）、`WriteLn`以外の組み込み手続き、`PROCEDURE`内
+//! `PROCEDURE`のような多段のネストは別ステップに回す
+//! （[`codegen::CodeGenerator`]のドキュメント参照）。
 //!
 //! p-machine命令セットの実バイナリ実行（p-machine本体）は別クレート
 //! （`pmachine-core`、未着手）を想定しており、本クレートはそれに向けた

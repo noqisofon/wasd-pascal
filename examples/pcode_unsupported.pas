@@ -1,7 +1,9 @@
 PROGRAM UnsupportedFeatures;
 
 VAR
-    arr: ARRAY [1..10] OF INTEGER;
+    r: RECORD
+        x: INTEGER
+    END;
 
 BEGIN
 END.
