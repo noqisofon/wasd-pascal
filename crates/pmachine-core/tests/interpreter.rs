@@ -605,4 +605,152 @@ fn string_n_value_parameter_calls_do_not_interfere_across_multiple_calls() {
     let mut vm = PMachine::with_output(module, Box::new(output.clone()));
     vm.run().expect("program should run without error");
     assert_eq!(output.as_string(), "First\nSecond\n");
+    assert!(vm.is_halted());
+}
+
+// ---- Step 19: 配列（グローバル・1次元・INTEGER/BOOLEAN要素のみ）----
+//
+// `wasd-pcode`側（`CodeGenerator::gen_array_element_address`のドキュメント
+// 「設計判断」参照）が配列添字アクセスを新規のp-codeオペコードを追加せず
+// 既存の`LDA`/`LDC`/`SBI`/`ADI`/`IND`/`STI`の組み合わせだけで合成する設計を
+// 採ったため、本クレート（`pmachine-core`）自体にはオペコード追加が一切
+// 不要だった。以下のテストは、その組み合わせが実際に正しく動作すること
+// （`crates/wasd-pcode/tests/codegen.rs`が検証する命令列を、実際に
+// `PMachine`で実行して結果を確認する。`crates/pmachine-core`実装指示の
+// 「テスト方針8」参照）を確認する。
+
+/// 配列の1要素への書き込みと読み込みが正しく往復すること
+/// （`arr[i] := value; x := arr[i]`）。
+#[test]
+fn array_element_write_then_read_round_trips() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..10] OF INTEGER;
+        VAR x: INTEGER;
+        BEGIN
+            arr[3] := 123;
+            x := arr[3]
+        END.
+        "#,
+    );
+
+    let mut vm = PMachine::new(module);
+    vm.run().expect("program should run without error");
+
+    // arr occupies globals 0..10, x is global 10.
+    assert_eq!(vm.global(2), Some(123)); // arr[3] (low=1, so index 2 in the backing store)
+    assert_eq!(vm.global(10), Some(123));
+    assert!(vm.is_halted());
+}
+
+/// `FOR`ループで配列全要素へ書き込み、別の`FOR`ループで合計を計算する
+/// （配列 + 制御構造 + 変数間の組み合わせの実行確認）。`arr[i] := i * i`
+/// (1から5までの二乗) の合計は `1+4+9+16+25 = 55`。
+#[test]
+fn for_loop_fills_array_and_a_second_loop_sums_it() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..5] OF INTEGER;
+        VAR i, total: INTEGER;
+        BEGIN
+            FOR i := 1 TO 5 DO
+                arr[i] := i * i;
+            total := 0;
+            FOR i := 1 TO 5 DO
+                total := total + arr[i]
+        END.
+        "#,
+    );
+
+    let mut vm = PMachine::new(module);
+    vm.run().expect("program should run without error");
+
+    // arr: globals 0..5, i: global 5, total: global 6.
+    assert_eq!(vm.globals()[0..5], [1, 4, 9, 16, 25]);
+    assert_eq!(vm.global(6), Some(55));
+    assert!(vm.is_halted());
+}
+
+/// 下限が1以外（`ARRAY [5..7]`）の配列でも、宣言された下限を基準に
+/// 正しくアドレッシングされること（`CodeGenerator::gen_array_element_address`
+/// が`LDC`に積む値は常に宣言された`low`そのものであり、0起点への
+/// 正規化を行わない設計であることの実行確認）。
+#[test]
+fn array_with_non_default_low_bound_indexes_correctly() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [5..7] OF INTEGER;
+        BEGIN
+            arr[5] := 50;
+            arr[6] := 60;
+            arr[7] := 70
+        END.
+        "#,
+    );
+
+    let mut vm = PMachine::new(module);
+    vm.run().expect("program should run without error");
+
+    assert_eq!(vm.globals()[0..3], [50, 60, 70]);
+    assert!(vm.is_halted());
+}
+
+/// `BOOLEAN`要素の配列も正しく読み書きでき、`WriteLn`で出力できること。
+#[test]
+fn boolean_array_element_write_then_writeln() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR flags: ARRAY [1..3] OF BOOLEAN;
+        BEGIN
+            flags[1] := TRUE;
+            flags[2] := FALSE;
+            flags[3] := TRUE;
+            WriteLn(flags[1]);
+            WriteLn(flags[2]);
+            WriteLn(flags[3])
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "true\nfalse\ntrue\n");
+    assert!(vm.is_halted());
+}
+
+/// 添字が変数式（定数だけでなく、実行時に計算される値）でも正しく
+/// アドレッシングできること（`wasd-sema`のコンパイル時定数添字チェックは
+/// リテラル添字のみが対象であり、変数添字は実行時まで検証されない。
+/// `crates/wasd-sema/src/typeck.rs`の`infer_index_access_type`ドキュメント
+/// 参照）。ここでは配列を逆順に読み出す形で確認する。
+#[test]
+fn array_index_can_be_a_runtime_computed_expression() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..5] OF INTEGER;
+        VAR i, j: INTEGER;
+        BEGIN
+            FOR i := 1 TO 5 DO
+                arr[i] := i * 10;
+            j := 6;
+            FOR i := 1 TO 5 DO
+            BEGIN
+                j := j - 1;
+                WriteLn(arr[j])
+            END
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "50\n40\n30\n20\n10\n");
+    assert!(vm.is_halted());
 }

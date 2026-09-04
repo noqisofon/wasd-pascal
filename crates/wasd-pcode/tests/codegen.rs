@@ -624,23 +624,24 @@ fn case_statements_are_reported_as_an_error_without_panicking() {
     );
 }
 
-/// 配列・レコード・ポインタ型の`VAR`宣言もスコープ外としてエラー報告
-/// されること。
+/// レコード・ポインタ型の`VAR`宣言はスコープ外としてエラー報告される
+/// こと（配列型自体はStep 19からグローバル変数として扱えるようになった。
+/// 下記「Step 19: 配列」節参照）。
 #[test]
-fn array_typed_variables_are_reported_as_an_error_without_panicking() {
+fn record_typed_variables_are_reported_as_an_error_without_panicking() {
     let program = parse_program(
         r#"
         PROGRAM P;
-        VAR arr: ARRAY [1..10] OF INTEGER;
+        VAR r: RECORD x: INTEGER END;
         BEGIN
         END.
         "#,
     );
 
     let result = CodeGenerator::new().generate(&program);
-    let diagnostics = result.expect_err("array VARs must be rejected, not codegen'd");
+    let diagnostics = result.expect_err("record VARs must be rejected, not codegen'd");
     assert!(
-        diagnostics.iter().any(|d| d.message.contains("ARRAY")),
+        diagnostics.iter().any(|d| d.message.contains("RECORD")),
         "diagnostics: {diagnostics:?}"
     );
 }
@@ -805,8 +806,7 @@ fn writeln_with_multiple_arguments_is_reported_as_an_error_without_panicking() {
     );
 
     let result = CodeGenerator::new().generate(&program);
-    let diagnostics =
-        result.expect_err("multi-argument WriteLn must be rejected, not codegen'd");
+    let diagnostics = result.expect_err("multi-argument WriteLn must be rejected, not codegen'd");
     assert!(
         diagnostics.iter().any(|d| d.message.contains("WriteLn")),
         "diagnostics: {diagnostics:?}"
@@ -839,12 +839,18 @@ fn less_than_and_greater_than_are_synthesized_from_geqi_leqi_and_not() {
     let geq_not = ops
         .windows(2)
         .any(|w| w == [op(UnconfirmedOp::Geq), op(UnconfirmedOp::Not)]);
-    assert!(geq_not, "expected GEQI immediately followed by NOT for `<`, got {ops:?}");
+    assert!(
+        geq_not,
+        "expected GEQI immediately followed by NOT for `<`, got {ops:?}"
+    );
     // `a > b` -> LEQI + NOT (in that order, adjacent).
     let leq_not = ops
         .windows(2)
         .any(|w| w == [op(UnconfirmedOp::Leq), op(UnconfirmedOp::Not)]);
-    assert!(leq_not, "expected LEQI immediately followed by NOT for `>`, got {ops:?}");
+    assert!(
+        leq_not,
+        "expected LEQI immediately followed by NOT for `>`, got {ops:?}"
+    );
 }
 
 // ---- Step 16: STRING[n] ----
@@ -1160,5 +1166,343 @@ fn string_n_parameter_is_no_longer_out_of_scope() {
     assert!(
         result.is_ok(),
         "STRING[n] parameters should be supported from Step 18 onward: {result:?}"
+    );
+}
+
+// ---- Step 19: 配列（グローバル・1次元・INTEGER/BOOLEAN要素のみ） ----
+
+/// `ARRAY [low..high] OF INTEGER`のグローバル`VAR`が`high - low + 1`ワード
+/// 確保すること（下限が1でない場合、複数の名前を1つの宣言で共有する場合の
+/// 両方を確認）。
+#[test]
+fn global_array_variable_reserves_high_minus_low_plus_one_words() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR a: ARRAY [1..10] OF INTEGER;
+        VAR b: ARRAY [5..7] OF INTEGER;
+        VAR c, d: ARRAY [0..2] OF BOOLEAN;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // a: 10 words (0..10), b: 3 words (10..13), c: 3 words (13..16), d: 3 words (16..19)
+    assert_eq!(module.global_data_words, 19);
+}
+
+/// `x := arr[i]`（`arr`がグローバル配列変数）が、
+/// `LDA <arr先頭> ; <i> ; LDC <low> ; SBI ; ADI ; IND ; STR <x>`という
+/// 命令列になること（`CodeGenerator::gen_array_element_address`の設計判断
+/// ドキュメント参照: 専用オペコードを新設せず、既存の`LDA`/`IND`と算術
+/// 命令だけで合成する）。
+#[test]
+fn array_index_load_generates_lda_ldc_sbi_adi_ind() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..10] OF INTEGER;
+        VAR i, x: INTEGER;
+        BEGIN
+            x := arr[i]
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    // arr: Address(0)..Address(10), i: Address(10), x: Address(11)
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),  // &arr[1]
+            op(UnconfirmedOp::Lod(Level(0), Address(10))), // i
+            op(UnconfirmedOp::Ldc(1)),                     // low
+            op(UnconfirmedOp::Sbi),                        // i - low
+            op(UnconfirmedOp::Adi),                        // &arr[1] + (i - low)
+            op(UnconfirmedOp::Ind),                        // arr[i]
+            op(UnconfirmedOp::Str(Level(0), Address(11))), // x := ...
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `arr[i] := x`が、`LDA <arr先頭> ; <i> ; LDC <low> ; SBI ; ADI ; <x> ; STI`
+/// という命令列になること（読み込みと対称に、最後が`IND`ではなく値を積んで
+/// からの`STI`になる）。
+#[test]
+fn array_index_store_generates_lda_ldc_sbi_adi_sti() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..10] OF INTEGER;
+        VAR i, x: INTEGER;
+        BEGIN
+            arr[i] := x
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),  // &arr[1]
+            op(UnconfirmedOp::Lod(Level(0), Address(10))), // i
+            op(UnconfirmedOp::Ldc(1)),                     // low
+            op(UnconfirmedOp::Sbi),                        // i - low
+            op(UnconfirmedOp::Adi),                        // &arr[1] + (i - low)
+            op(UnconfirmedOp::Lod(Level(0), Address(11))), // x
+            op(UnconfirmedOp::Sti),                        // arr[i] := x
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// 下限が1以外（例: `ARRAY [5..7]`）でも、`LDC`に積む下限がその値
+/// そのものになること（0起点への正規化を勝手に行わない）。
+#[test]
+fn array_index_uses_the_declared_low_bound_as_is() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [5..7] OF INTEGER;
+        BEGIN
+            arr[5] := 42
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert_eq!(
+        opcodes(&module),
+        vec![
+            op(UnconfirmedOp::Lda(Level(0), Address(0))),
+            op(UnconfirmedOp::Ldc(5)), // index literal
+            op(UnconfirmedOp::Ldc(5)), // low bound
+            op(UnconfirmedOp::Sbi),
+            op(UnconfirmedOp::Adi),
+            op(UnconfirmedOp::Ldc(42)),
+            op(UnconfirmedOp::Sti),
+            op(UnconfirmedOp::Stp),
+        ]
+    );
+}
+
+/// `WriteLn(arr[i])`が、通常の`INTEGER`式と同じく`BUILTIN_WRITELN_INT`を
+/// 呼ぶこと（`infer_expr_kind`の`IndexAccess`腕が要素の種類を正しく
+/// 返すことの確認）。
+#[test]
+fn writeln_with_array_element_emits_cxg_writeln_int() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..3] OF INTEGER;
+        BEGIN
+            WriteLn(arr[1])
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert!(
+        module
+            .instructions
+            .iter()
+            .any(|i| i.opcode == cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_INT))),
+        "expected a WriteLn(INTEGER) call: {:?}",
+        opcodes(&module)
+    );
+}
+
+/// `BOOLEAN`要素の配列も同様にサポートされ、`WriteLn`は
+/// `BUILTIN_WRITELN_BOOL`を呼ぶこと。
+#[test]
+fn boolean_array_element_supports_writeln_bool() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR flags: ARRAY [1..3] OF BOOLEAN;
+        BEGIN
+            flags[1] := TRUE;
+            WriteLn(flags[1])
+        END.
+        "#,
+    );
+
+    let module = CodeGenerator::new()
+        .generate(&program)
+        .expect("codegen should succeed");
+
+    assert!(
+        module
+            .instructions
+            .iter()
+            .any(|i| i.opcode == cop(ConfirmedOp::Cxg(KERNEL_SEGMENT, BUILTIN_WRITELN_BOOL))),
+        "expected a WriteLn(BOOLEAN) call: {:?}",
+        opcodes(&module)
+    );
+}
+
+/// 配列全体を1ワードの値として読み込む（添字を付けない裸の配列参照）ことは
+/// 依然としてスコープ外であり、配列の先頭要素だけを読む誤ったコードを
+/// 黙って生成してはならないこと。
+#[test]
+fn bare_array_reference_as_a_value_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR arr: ARRAY [1..3] OF INTEGER;
+        VAR x: INTEGER;
+        BEGIN
+            WriteLn(arr)
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("a bare array reference must be rejected");
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("array")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// 同じ配列型同士の丸ごと代入（`a := b`）も依然としてスコープ外であり、
+/// 先頭要素だけを書き換える誤ったコードを黙って生成してはならないこと
+/// （`wasd-sema`の`assignment_compatible`は構造的に同じ配列型同士の代入を
+/// 許してしまうため、この段階（コード生成）でのガードが必要。
+/// `CodeGenerator::gen_assignment`の`Some(ValueKind::Array(_))`腕の
+/// ドキュメント参照）。
+#[test]
+fn whole_array_assignment_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR a: ARRAY [1..3] OF INTEGER;
+        VAR b: ARRAY [1..3] OF INTEGER;
+        BEGIN
+            a := b
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("whole-array assignment must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("whole-array")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `PROCEDURE`/`FUNCTION`本体内のローカル配列変数は、`STRING[n]`と同様に
+/// 依然としてスコープ外であること（`PROGRAM`直下のグローバル変数のみ
+/// サポート）。
+#[test]
+fn local_array_variable_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        PROCEDURE Foo;
+        VAR arr: ARRAY [1..3] OF INTEGER;
+        BEGIN
+        END;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("local array VARs must be rejected, not codegen'd");
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("ARRAY")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// 多次元配列（`ARRAY [1..3] OF ARRAY [1..3] OF INTEGER`。`wasd-ast`は
+/// これを入れ子の`Array`として表現する）は、要素型が`INTEGER`/`BOOLEAN`
+/// のいずれでもないため、今回のスコープ外として報告されること。
+#[test]
+fn multi_dimensional_array_variable_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR grid: ARRAY [1..3] OF ARRAY [1..3] OF INTEGER;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("multi-dimensional arrays must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("multi-dimensional")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// `INTEGER`/`BOOLEAN`以外を要素とする配列（例: `CHAR`）も今回のスコープ外
+/// として報告されること。
+#[test]
+fn array_of_unsupported_element_type_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR letters: ARRAY [1..3] OF CHAR;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("arrays of unsupported element types must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("array element type")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+/// 要素数が16bitワード数に収まらない配列は、パニックせず明確な診断で
+/// 報告されること。
+#[test]
+fn array_with_too_many_elements_is_reported_as_an_error_without_panicking() {
+    let program = parse_program(
+        r#"
+        PROGRAM P;
+        VAR huge: ARRAY [1..70000] OF INTEGER;
+        BEGIN
+        END.
+        "#,
+    );
+
+    let result = CodeGenerator::new().generate(&program);
+    let diagnostics = result.expect_err("oversized arrays must be rejected, not codegen'd");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("too many elements")),
+        "diagnostics: {diagnostics:?}"
     );
 }

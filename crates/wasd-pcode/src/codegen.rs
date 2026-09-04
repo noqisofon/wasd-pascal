@@ -16,7 +16,23 @@
 //! 文脈では引き続きスコープ外（意味解析（`wasd-sema`）の段階で型エラーに
 //! なるため、本クレートまで到達しない）。
 //!
-//! `CASE`、`UNIT`、配列・レコード・ポインタ型、`REAL`/`CHAR`型、`WriteLn`
+//! Step 19からは、UCSD拡張ではなく標準Pascalの配列型（`ARRAY [low..high]
+//! OF element`）についても、`PROGRAM`直下のグローバル`VAR`宣言・要素が
+//! `INTEGER`/`BOOLEAN`・1次元のみという条件付きでサポートする
+//! （`STRING[n]`がStep 16でまずグローバル変数のみサポートされた前例を
+//! 踏襲。[`ArrayKind`]のドキュメント参照）。添字アクセス（読み込み
+//! `arr[i]`・代入`arr[i] := value`の両方）は、専用の新しいp-code
+//! オペコードを追加せず、既存の[`UnconfirmedOp::Lda`]/[`UnconfirmedOp::Ind`]/
+//! [`UnconfirmedOp::Sti`]と算術命令（`LDC`/`SBI`/`ADI`）の組み合わせだけで
+//! 合成する（[`CodeGenerator::gen_array_element_address`]のドキュメント
+//! 「設計判断」参照）。`PROCEDURE`/`FUNCTION`のローカル配列変数・配列型
+//! 仮引数・多次元配列・`INTEGER`/`BOOLEAN`以外を要素とする配列・配列同士の
+//! 丸ごと代入（`a := b`）・実行時の添字範囲チェックは、いずれも引き続き
+//! 今回のスコープ外（`wasd-sema`のコンパイル時定数添字チェックのみで、
+//! 実行時チェックは行わない方針とも歩調を合わせる。`crates/wasd-sema/src/
+//! typeck.rs`の`infer_index_access_type`ドキュメント参照）。
+//!
+//! `CASE`、`UNIT`、レコード・ポインタ型、`REAL`/`CHAR`型、`WriteLn`
 //! 以外の組み込み手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数
 //! 引数の`WriteLn`は意味解析を通過済みのASTに含まれ得るが、本クレートの
 //! 責務では**ない**。遭遇した場合はパニックせず、「未対応機能」の
@@ -151,11 +167,68 @@ enum ValueKind {
     /// 複合的な変数を指す点に注意（[`word_size_of`]、
     /// [`CodeGenerator::declare_vars`]参照）。
     StringN(u8),
+    /// 配列型（Step 19）。[`ArrayKind`]のドキュメント参照。
+    Array(ArrayKind),
+}
+
+/// 配列要素の種類。本ステップのスコープでは`INTEGER`/`BOOLEAN`のみ
+/// （いずれも1ワード）。[`ArrayKind::element`]参照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarValueKind {
+    Int,
+    Bool,
+}
+
+impl From<ScalarValueKind> for ValueKind {
+    fn from(kind: ScalarValueKind) -> Self {
+        match kind {
+            ScalarValueKind::Int => ValueKind::Int,
+            ScalarValueKind::Bool => ValueKind::Bool,
+        }
+    }
+}
+
+/// 配列型`ARRAY [low..high] OF element`の中身（Step 19）。
+///
+/// # スコープ: 1次元・`INTEGER`/`BOOLEAN`要素・`PROGRAM`直下のグローバル変数のみ
+///
+/// `STRING[n]`がStep 16でまず`PROGRAM`直下のグローバル変数のみサポート
+/// されたのと同じ前例を踏襲する（[`CodeGenerator::build_locals`]・
+/// [`CodeGenerator::build_params`]は引き続き配列型を拒否する。
+/// [`CodeGenerator::declare_array_vars`]のドキュメント参照）。
+/// 多次元配列（`element`がさらに配列であるケース）・`RECORD`/`STRING[n]`/
+/// ポインタ型を要素とする配列は、いずれも今回のスコープ外
+/// （[`CodeGenerator::declare_array_vars`]参照）。
+///
+/// `low`/`high`は`wasd_ast::Literal::Int`と同じ`i64`（`wasd-sema`の
+/// `ArrayType`と同じ表現）。この時点（p-code生成はwasd-sema成功後にのみ
+/// 走る。`crates/wasd-driver/src/pcode.rs`のドキュメント参照）では
+/// `low <= high`は既に`wasd-sema`が保証済み
+/// （`crates/wasd-sema/src/typeck.rs`の`eval_subrange_bounds`参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrayKind {
+    low: i64,
+    high: i64,
+    element: ScalarValueKind,
+}
+
+impl ArrayKind {
+    /// 配列全体が占めるワード数（`high - low + 1`、要素はいずれも1ワード）。
+    fn element_count(&self) -> i64 {
+        self.high - self.low + 1
+    }
 }
 
 /// `TypeExpr`をこのクレートのスコープが対応する[`ValueKind`]へ変換する。
 /// `INTEGER`/`BOOLEAN`/`STRING[n]`以外（このクレートのスコープ外の型）は
 /// `None`。
+///
+/// `TypeExpr::Array`は意図的にここでは扱わない: 配列は`STRING[n]`と同様
+/// （[`ArrayKind`]のドキュメント参照）`PROGRAM`直下のグローバル変数
+/// でのみサポートするため、専用の[`CodeGenerator::declare_array_vars`]で
+/// 個別に処理する。ここで`None`を返すことで、`PROCEDURE`/`FUNCTION`の
+/// ローカル変数・仮引数の位置に現れた配列型は（従来通り）
+/// [`describe_type`]を使った汎用の「スコープ外」診断に自然に流れる。
 fn value_kind_of(ty: &TypeExpr) -> Option<ValueKind> {
     match ty {
         TypeExpr::Integer(_) => Some(ValueKind::Int),
@@ -168,11 +241,18 @@ fn value_kind_of(ty: &TypeExpr) -> Option<ValueKind> {
 /// [`ValueKind`]の値が占めるワード数。`INTEGER`/`BOOLEAN`は1ワード、
 /// `STRING[n]`は`1 + n`ワード（先頭1ワードが長さ、続く`n`ワードが
 /// 文字データ。[`crate::builtin::BUILTIN_WRITELN_STRVAR`]のドキュメント
-/// 「メモリレイアウト」参照）。
+/// 「メモリレイアウト」参照）、配列は`high - low + 1`ワード
+/// （[`ArrayKind::element_count`]参照）。
+///
+/// 配列については現状[`CodeGenerator::declare_array_vars`]がこの関数を
+/// 経由せず直接ワード数を求めている（16bitワード数に収まるかどうかの
+/// 診断を出す必要があるため）。ここでの`Array`腕は`ValueKind`の
+/// 網羅性のために存在し、想定される呼び出しでは実際には使われない。
 fn word_size_of(kind: ValueKind) -> u16 {
     match kind {
         ValueKind::Int | ValueKind::Bool => 1,
         ValueKind::StringN(max_len) => 1 + max_len as u16,
+        ValueKind::Array(arr) => u16::try_from(arr.element_count()).unwrap_or(u16::MAX),
     }
 }
 
@@ -413,12 +493,16 @@ impl CodeGenerator {
 
     fn declare_vars(&mut self, var_decls: &[VarDecl]) {
         for decl in var_decls {
+            if matches!(decl.ty, TypeExpr::Array { .. }) {
+                self.declare_array_vars(decl);
+                continue;
+            }
             let Some(kind) = value_kind_of(&decl.ty) else {
                 self.error(
                     decl.ty.span(),
                     format!(
                         "VAR type '{}' is out of scope for this step's minimal codegen (only \
-                         INTEGER/BOOLEAN/STRING[n] are supported)",
+                         INTEGER/BOOLEAN/STRING[n]/ARRAY are supported)",
                         describe_type(&decl.ty)
                     ),
                 );
@@ -429,6 +513,81 @@ impl CodeGenerator {
                 self.vars
                     .insert(normalize(&name.name), VarSlot { address, kind });
             }
+        }
+    }
+
+    /// `ARRAY [low..high] OF element`のグローバル`VAR`宣言（Step 19）。
+    /// [`ArrayKind`]のドキュメント「スコープ」参照: 1次元・`INTEGER`/
+    /// `BOOLEAN`要素のみ。それ以外（多次元・その他の要素型）は診断のみ
+    /// 積んで宣言をスキップする（[`Self::declare_vars`]の既存の型と同じ
+    /// 「診断1件でも`generate`全体が`Err`になる」方針に乗るため、以降の
+    /// アドレス割り当てのズレは問題にならない）。
+    fn declare_array_vars(&mut self, decl: &VarDecl) {
+        let TypeExpr::Array {
+            index_type,
+            element_type,
+            span,
+            ..
+        } = &decl.ty
+        else {
+            unreachable!("caller already matched TypeExpr::Array");
+        };
+
+        let element = match element_type.as_ref() {
+            TypeExpr::Integer(_) => ScalarValueKind::Int,
+            TypeExpr::Boolean(_) => ScalarValueKind::Bool,
+            other => {
+                self.error(
+                    other.span(),
+                    format!(
+                        "array element type '{}' is out of scope for this step's minimal \
+                         codegen (only INTEGER/BOOLEAN array elements are supported; in \
+                         particular, multi-dimensional arrays are out of scope)",
+                        describe_type(other)
+                    ),
+                );
+                return;
+            }
+        };
+
+        let (low, high) = match index_type.as_ref() {
+            TypeExpr::Subrange {
+                low: Literal::Int(lo, _),
+                high: Literal::Int(hi, _),
+                ..
+            } => (*lo, *hi),
+            other => {
+                self.error(
+                    other.span(),
+                    "this array index range form is out of scope for this step's minimal \
+                     codegen (only an INTEGER literal subrange 'low..high' is supported)",
+                );
+                return;
+            }
+        };
+
+        let arr = ArrayKind { low, high, element };
+        // `low <= high`は`wasd-sema`が既に保証済み（`ArrayKind`のドキュメント
+        // 参照）なので`element_count()`は必ず正だが、要素数自体が16bitワード
+        // 数に収まるとは限らない（例: `ARRAY [1..100000] OF INTEGER`）ため、
+        // ここで明示的に診断する。
+        let Ok(words) = u16::try_from(arr.element_count()) else {
+            self.error(
+                *span,
+                format!(
+                    "array has too many elements for this step's minimal codegen ({} elements \
+                     does not fit in a 16-bit word count)",
+                    arr.element_count()
+                ),
+            );
+            return;
+        };
+        let kind = ValueKind::Array(arr);
+
+        for name in &decl.names {
+            let address = self.alloc_words(words);
+            self.vars
+                .insert(normalize(&name.name), VarSlot { address, kind });
         }
     }
 
@@ -914,13 +1073,23 @@ impl CodeGenerator {
     }
 
     fn gen_assignment(&mut self, target: &Expr, value: &Expr, span: Span) {
-        let Expr::Identifier(ident) = target else {
-            self.error(
-                target.span(),
-                "assignment targets other than a simple variable (array/record/pointer \
-                 lvalues) are out of scope for this step's minimal codegen",
-            );
-            return;
+        let ident = match target {
+            Expr::Identifier(ident) => ident,
+            // Step 19: 配列要素への代入（`arr[i] := value`）。
+            Expr::IndexAccess { array, index, .. } => {
+                self.gen_array_element_address(array, index, target.span());
+                self.gen_expr(value);
+                self.emit(UnconfirmedOp::Sti.into(), span);
+                return;
+            }
+            _ => {
+                self.error(
+                    target.span(),
+                    "assignment targets other than a simple variable or array element \
+                     (record/pointer lvalues) are out of scope for this step's minimal codegen",
+                );
+                return;
+            }
         };
         let key = normalize(&ident.name);
 
@@ -944,6 +1113,23 @@ impl CodeGenerator {
             Some(resolved) => match self.lookup_kind(&key) {
                 Some(ValueKind::StringN(max_len)) => {
                     self.gen_string_literal_assignment(resolved, max_len, value, span);
+                }
+                // Step 19: 配列全体を1ワードのスカラーとして代入することは
+                // できない（`arr2 := arr1;`のような、両辺が同じ配列型の
+                // 「配列全体の代入」は伝統的なPascalの意味論としては妥当で、
+                // `wasd-sema`の`assignment_compatible`も構造的に同じ配列型
+                // 同士を許してしまう。これをここでガードせず
+                // `gen_store_resolved`にそのまま流すと、配列の先頭1ワードだけ
+                // を読み書きする誤ったコードを黙って生成してしまう
+                // （[`Self::gen_identifier_load`]の同種のガードも参照）。
+                Some(ValueKind::Array(_)) => {
+                    self.error(
+                        ident.span,
+                        "whole-array assignment ('a := b' where both sides are arrays) is out \
+                         of scope for this step's minimal codegen (only assigning to a single \
+                         indexed element, 'a[i] := value', is supported)",
+                    );
+                    self.gen_expr(value);
                 }
                 _ => {
                     self.gen_store_resolved(resolved, span, |g| g.gen_expr(value));
@@ -974,6 +1160,87 @@ impl CodeGenerator {
                 self.gen_expr(value);
             }
         }
+    }
+
+    /// 配列要素`array[index]`の**アドレス**（[`UnconfirmedOp::Lda`]と同じ、
+    /// `stack`中の絶対インデックスを表す1ワード）を計算してスタックへ積む
+    /// （Step 19）。
+    ///
+    /// # 設計判断: 専用オペコード（`IXA`相当）を新設しない
+    ///
+    /// 実機のUCSD p-codeには配列添字のアドレス計算専用の命令
+    /// （伝聞では`IXA`）があるとされるが、このセッションでは一次資料に
+    /// 一切あたれておらず、命令の存在・名称・オペコード番号のいずれも
+    /// 確認できない（[`crate::opcode::UnconfirmedOp`]のドキュメント
+    /// 「一次資料で確認できていない」の節と同じ状況）。
+    ///
+    /// 一方、本IRの`STRING[n]`向けに既に導入済みの[`UnconfirmedOp::Lda`]
+    /// （アドレスを1ワードの整数値としてスタックへ積む）という設計を
+    /// 前提にすると、配列要素のアドレスは既存の整数演算命令だけで
+    /// 合成できる: 配列の先頭要素（`low`番目）のアドレスを`LDA`で積み、
+    /// 添字の値を評価し、`LDC <low>`で下限を積んで`SBI`で引き算すれば
+    /// 「先頭からのオフセット（0起点）」が得られ、それを`ADI`で先頭
+    /// アドレスへ加算すれば目的の要素のアドレスになる（要素は本ステップの
+    /// スコープでは常に1ワードなので、オフセットへの乗算は不要）。
+    /// この計算はすべて`ADI`/`SBI`という既存の（かつオペコード番号自体は
+    /// 未確認だが、少なくとも算術命令として確立済みの）命令の組み合わせに
+    /// 過ぎず、新たな「発明」を追加しない。そのため`pmachine-core`側も
+    /// 無改修でこの配列インデックスを実行できる
+    /// （`crates/pmachine-core`にオペコード追加が不要な理由）。
+    ///
+    /// 計算結果のアドレスは、値を読むなら[`UnconfirmedOp::Ind`]、書くなら
+    /// 値を積んでから[`UnconfirmedOp::Sti`]と組み合わせて使う（`VAR`仮引数
+    /// の間接アドレッシングと全く同じ後続命令。[`Self::gen_load_resolved`]/
+    /// [`Self::gen_store_resolved`]のドキュメント参照）。
+    ///
+    /// # スコープ: 単純な配列変数のみ
+    ///
+    /// `array`は単純な識別子（`PROGRAM`直下のグローバル配列変数）のみ
+    /// サポートする。多次元配列（`array`自体が`IndexAccess`になっている
+    /// ケース）・レコードのフィールドである配列・`VAR`仮引数として渡された
+    /// 配列はいずれも今回のスコープ外（[`ArrayKind`]のドキュメント参照）。
+    ///
+    /// # 範囲チェックなし
+    ///
+    /// `wasd-sema`のコンパイル時定数添字に対する範囲チェック
+    /// （`crates/wasd-sema/src/typeck.rs`の`infer_index_access_type`
+    /// ドキュメント「実行時の範囲チェックは今回のscopeでは行わない」）と
+    /// 歩調を合わせ、本クレートも実行時の範囲チェック命令（実機の`CHK`
+    /// 相当）は発行しない。範囲外アクセスは`pmachine-core`側の
+    /// `AddressOutOfRange`（配列がグローバルデータ領域の末尾付近にある
+    /// 場合）で検出されることもあれば、他の変数の領域を静かに読み書き
+    /// してしまうこともあり得る、という制約が残る。
+    fn gen_array_element_address(&mut self, array_expr: &Expr, index_expr: &Expr, span: Span) {
+        let Expr::Identifier(ident) = array_expr else {
+            self.error(
+                array_expr.span(),
+                "array indexing is only supported on a simple array variable (not a nested \
+                 index, field access, or other expression) by this step's minimal codegen",
+            );
+            self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            return;
+        };
+        let key = normalize(&ident.name);
+        let Some(ValueKind::Array(arr)) = self.lookup_kind(&key) else {
+            self.error(
+                ident.span,
+                format!(
+                    "'{}' is not a known array variable in this scope",
+                    ident.name
+                ),
+            );
+            self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            return;
+        };
+        let Some(resolved) = self.resolve_var(&key) else {
+            unreachable!("lookup_kind and resolve_var share the same name resolution order");
+        };
+
+        self.gen_address_of_resolved(resolved, span);
+        self.gen_expr(index_expr);
+        self.emit_ldc_int(arr.low, index_expr.span());
+        self.emit(UnconfirmedOp::Sbi.into(), span);
+        self.emit(UnconfirmedOp::Adi.into(), span);
     }
 
     /// `s := 'literal';`（`s`が`STRING[max_len]`）のコード生成。
@@ -1303,6 +1570,11 @@ impl CodeGenerator {
                     Some(ValueKind::StringN(_)) => {
                         unreachable!("STRING[n] arguments are handled by the previous match arm")
                     }
+                    // Step 19: `WriteLn(arr)`（`arr`が配列全体）。`self.gen_expr(arg)`
+                    // （上）が既に`Self::gen_identifier_load`のガードで診断を
+                    // 出し、ダミー値を積んでいるため、ここでは追加の診断を
+                    // 出さずダミーの`proc`番号を選ぶだけでよい。
+                    Some(ValueKind::Array(_)) => BUILTIN_WRITELN_INT,
                     None => {
                         self.error(
                             arg.span(),
@@ -1413,6 +1685,12 @@ impl CodeGenerator {
                 let info = self.routines.get(&normalize(&name.name))?;
                 info.is_func.then_some(info.return_kind)
             }
+            // Step 19: `arr[i]`の種類は、配列の要素の種類（`INTEGER`/
+            // `BOOLEAN`のみ。`ArrayKind`のドキュメント参照）そのもの。
+            Expr::IndexAccess { array, .. } => match self.infer_expr_kind(array) {
+                Some(ValueKind::Array(arr)) => Some(arr.element.into()),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1651,8 +1929,13 @@ impl CodeGenerator {
             Expr::NilLiteral(span) => {
                 self.unsupported_expr(*span, "NIL / pointer values");
             }
-            Expr::IndexAccess { span, .. } => {
-                self.unsupported_expr(*span, "array indexing");
+            // Step 19: 配列要素の読み込み（`arr[i]`をrvalueとして評価）。
+            // アドレス計算は代入文の左辺（`Self::gen_assignment`）と共通
+            // （`Self::gen_array_element_address`参照）で、読み込みは
+            // `VAR`仮引数の間接ロードと同じ`IND`を続けるだけで済む。
+            Expr::IndexAccess { array, index, span } => {
+                self.gen_array_element_address(array, index, *span);
+                self.emit(UnconfirmedOp::Ind.into(), *span);
             }
             Expr::FieldAccess { span, .. } => {
                 self.unsupported_expr(*span, "record field access");
@@ -1689,6 +1972,22 @@ impl CodeGenerator {
         let key = normalize(&ident.name);
 
         if let Some(resolved) = self.resolve_var(&key) {
+            // Step 19: 配列全体を1ワードの値として読み込むことはできない
+            // （[`Self::gen_assignment`]の`Some(ValueKind::Array(_))`腕の
+            // ドキュメント参照。同じ理由でここもガードしないと、配列の
+            // 先頭要素だけを読む誤ったコードを黙って生成してしまう）。
+            if matches!(self.lookup_kind(&key), Some(ValueKind::Array(_))) {
+                self.error(
+                    ident.span,
+                    format!(
+                        "'{}' is an array; a whole array cannot be used as a value in this \
+                         step's minimal codegen (index it first, e.g. '{}[i]')",
+                        ident.name, ident.name
+                    ),
+                );
+                self.emit(UnconfirmedOp::Ldc(0).into(), ident.span);
+                return;
+            }
             self.gen_load_resolved(resolved, ident.span);
             return;
         }
