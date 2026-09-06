@@ -947,13 +947,14 @@ fn multi_arg_task_sample_program_runs_correctly() {
 }
 
 /// タスク依頼「3つ以上の異なる型を混在させた引数（INTEGER、BOOLEAN、
-/// STRING[n]、配列）を持つ呼び出し」パターン。同時に、配列の値仮引数が
-/// 仮実装（コピーを作らずアドレスをそのまま渡す。
-/// `wasd_pcode::CodeGenerator::gen_array_or_record_value_arg`のドキュメント
-/// 「UNCONFIRMED/TODO」参照）であることの既知の副作用——呼び出された側での
-/// 配列要素への変更が呼び出し元にも反映されてしまうこと——も実行結果で
-/// 確認する（`nums[1]`が`Describe`呼び出し後に呼び出し元から見ても`999`に
-/// 変わっていること）。
+/// STRING[n]、配列）を持つ呼び出し」パターン。Step 21時点では配列の値
+/// 仮引数が仮実装（コピーを作らずアドレスをそのまま渡す）だったため、
+/// 呼び出された側での配列要素への変更が呼び出し元にも反映されてしまう
+/// という既知の副作用があったが、Step 22でコピー生成
+/// （`wasd_pcode::CodeGenerator::gen_array_or_record_value_arg`参照）が
+/// 実装され解消された。そのため`nums[1]`は`Describe`呼び出し後も呼び出し元
+/// から見て`1`のまま（`arr[1] := 999`はコピーにのみ影響する）であることを
+/// 実行結果で確認する。
 #[test]
 fn procedure_call_with_integer_boolean_string_and_array_parameters_mixed_runs_correctly() {
     let module = common::compile(
@@ -986,6 +987,103 @@ fn procedure_call_with_integer_boolean_string_and_array_parameters_mixed_runs_co
     let output = common::CapturedOutput::new();
     let mut vm = PMachine::with_output(module, Box::new(output.clone()));
     vm.run().expect("program should run without error");
-    assert_eq!(output.as_string(), "42\ntrue\nhi\n1\n2\n3\n999\n");
+    assert_eq!(output.as_string(), "42\ntrue\nhi\n1\n2\n3\n1\n");
+    assert!(vm.is_halted());
+}
+
+/// Step 22: `VAR`修飾子付き仮引数の正式実装。2つの`VAR INTEGER`仮引数を
+/// 使った典型的な参照渡しパターン（`SWAP`）が呼び出し元の変数へ正しく
+/// 反映されることを確認する。
+#[test]
+fn var_parameters_swap_two_caller_variables() {
+    let module = common::compile(
+        r#"
+        PROGRAM P;
+        VAR x, y: INTEGER;
+        PROCEDURE Swap(VAR a: INTEGER; VAR b: INTEGER);
+        VAR temp: INTEGER;
+        BEGIN
+            temp := a;
+            a := b;
+            b := temp;
+        END;
+        BEGIN
+            x := 1;
+            y := 2;
+            Swap(x, y);
+        END.
+        "#,
+    );
+
+    let mut vm = PMachine::new(module);
+    vm.run().expect("program should run without error");
+    assert_eq!(vm.global(0), Some(2));
+    assert_eq!(vm.global(1), Some(1));
+}
+
+/// Step 22の完了条件のサンプルプログラム（タスク依頼「動作確認」節）。
+/// `VAR`仮引数（`Swap`の2つの`VAR INTEGER`、`Damage`の`VAR`レコード）と
+/// 値仮引数（`Damage`の`amount: INTEGER`、`TryModify`の`ch: Character`）が
+/// 混在するケースを一度に確認する。最後の`TryModify`は値渡しレコードの
+/// コピーに対してのみ変更を加えるため、呼び出し元の`hero.hp`はStep 21の
+/// 仮実装（コピーを作らずアドレスを渡す）では`9999`になってしまっていた
+/// ところ、Step 22のコピー生成により`20`のまま変わらないことがこのテストで
+/// 検証される（負債解消の確認）。
+#[test]
+fn var_and_value_record_parameters_mixed_sample_program_runs_correctly() {
+    let module = common::compile(
+        r#"
+        PROGRAM VarParamTest;
+        TYPE
+            Character = RECORD
+                hp: INTEGER;
+                alive: BOOLEAN;
+            END;
+
+        PROCEDURE Swap(VAR a: INTEGER; VAR b: INTEGER);
+        VAR temp: INTEGER;
+        BEGIN
+            temp := a;
+            a := b;
+            b := temp;
+        END;
+
+        PROCEDURE Damage(VAR ch: Character; amount: INTEGER);
+        BEGIN
+            ch.hp := ch.hp - amount;
+            IF ch.hp <= 0 THEN
+                ch.alive := FALSE;
+        END;
+
+        PROCEDURE TryModify(ch: Character);
+        BEGIN
+            ch.hp := 9999;
+        END;
+
+        VAR
+            x, y: INTEGER;
+            hero: Character;
+        BEGIN
+            x := 1;
+            y := 2;
+            Swap(x, y);
+            WriteLn(x);
+            WriteLn(y);
+
+            hero.hp := 50;
+            hero.alive := TRUE;
+            Damage(hero, 30);
+            WriteLn(hero.hp);
+
+            TryModify(hero);
+            WriteLn(hero.hp);
+        END.
+        "#,
+    );
+
+    let output = common::CapturedOutput::new();
+    let mut vm = PMachine::with_output(module, Box::new(output.clone()));
+    vm.run().expect("program should run without error");
+    assert_eq!(output.as_string(), "2\n1\n20\n20\n");
     assert!(vm.is_halted());
 }

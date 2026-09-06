@@ -331,3 +331,56 @@ Step 20時点の`CodeGenerator::resolve_field_access`は、レコード変数が
 コンパイル時定数なので、非0の場合のみ`LDC`/`ADI`を発行する点が異なる）。
 詳細は`crates/wasd-pcode/src/codegen.rs`の`ResolvedVar`・
 `resolve_field_access`のドキュメントを参照。
+
+## Step 22セッション（VARパラメータの正式実装）: Step 21の仮実装債務を解消
+
+Step 22のタスク依頼は、`VAR`修飾子付き仮引数（参照渡し）の正式実装と、
+Step 21で意図的な仮実装として残した「配列・レコードの値仮引数はコピーを
+作らずアドレスをそのまま渡す」という既知の制限（上記セクション参照）の
+解消を求めていた。
+
+### 判明した既存実装の状態: AST/パーサー/意味解析/`VAR`スカラー仮引数のコード生成は既に実装済みだった
+
+着手前に既存実装を調査した結果、`VAR`修飾子の構文（`wasd-ast`の
+`ParamDecl::by_ref`、`wasd-parser`の`parse_param_list`）、意味解析
+（`wasd-sema`の`check_call_args`——`VAR`仮引数への実引数が左辺値である
+ことの検査、および型の完全一致の検査）、コード生成側の`VAR`スカラー仮引数
+（`INTEGER`/`BOOLEAN`）の受け渡し（呼び出し側は`gen_var_arg`でアドレスを
+積み、呼び出し先は`indirect`スロット経由で間接読み書き）は、いずれも
+Step 18時点で既に実装・テスト済みだった
+（`crates/pmachine-core/tests/interpreter.rs`の
+`var_parameter_mutation_is_visible_to_the_caller`/
+`var_parameter_works_across_repeated_calls`参照）。そのため今回の実装変更
+は`wasd-pcode`（`gen_array_or_record_value_arg`の書き換え）にほぼ限定
+された。
+
+### 配列・レコードの値仮引数のコピー生成: `STRING[n]`と同じ方針を採用
+
+`CodeGenerator::gen_array_or_record_value_arg`を、`STRING[n]`の値仮引数
+（`gen_string_value_arg`、Step 18から）と同じ方針で書き換えた: 呼び出し元
+がグローバルデータ領域の末尾に実引数と同じワード数の一時領域を新規確保し
+（`CodeGenerator::alloc_words`）、実引数の中身を要素（配列）/フィールド
+（レコード）単位で`LOD`/`STR`のループによりコピーしたうえで、その一時
+領域自身のアドレスを`LDA`で積む。ブロック転送用の専用命令は一次資料上に
+見当たらなかったため、`emit_string_copy_words`と同様、愚直なワード単位の
+ループとした。
+
+「VARパラメータおよびレコード・配列値パラメータはアドレスを格納する」
+という一次資料由来のCONFIRMED済みの規則自体は変わらない。変わるのは
+値仮引数の場合にそのアドレスが指す先が「呼び出し元の実引数そのもの」
+ではなく「呼び出し元がその場で作った新しいコピー」になった点のみであり、
+`VAR`仮引数（`gen_var_arg`）は引き続き元の変数のアドレスをそのまま渡す
+（意図した参照渡し）。
+
+既知の制限の解消を、Step 21で仮実装の副作用を確認していたテスト
+（`procedure_call_with_integer_boolean_string_and_array_parameters_mixed_runs_correctly`）
+の期待値を反転させる形で確認した（`Describe`呼び出し内で`arr[1] := 999`と
+しても、呼び出し元の`nums[1]`はもはや変化しない）。また、レコードの値
+仮引数についても同様の回帰がないことを新規テスト
+`var_and_value_record_parameters_mixed_sample_program_runs_correctly`
+（`TryModify(hero)`が呼び出し元の`hero.hp`に影響しないことを確認）で
+検証した。
+
+`STRING[n]`はStep 18の時点から既にコピーを作る設計だったため
+（前セクション参照）、今回のコピー生成ロジックの対象には含めていない
+（変更なし）。

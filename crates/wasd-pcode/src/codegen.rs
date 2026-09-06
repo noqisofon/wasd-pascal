@@ -56,20 +56,20 @@
 //!
 //! Step 21からは、`PROCEDURE`/`FUNCTION`の仮引数リストを任意個数
 //! （型混在可）に一般化し、さらに配列・レコード型も仮引数の型として
-//! 許可する（[`CodeGenerator::build_params`]参照）。
+//! 許可する（[`CodeGenerator::build_params`]参照）。Step 21時点では、
+//! 配列・レコードの値仮引数はコピーを作らず元の変数のアドレスをそのまま
+//! 渡す**仮実装**であり（`VAR`仮引数と実質同じ命令列）、呼び出された側での
+//! 変更が呼び出し元にも反映されてしまうUNCONFIRMED/TODOの既知の制限が
+//! あった。
 //!
-//! **UNCONFIRMED/TODO（既知の制限）**: 配列・レコードの値仮引数は、
-//! 本来のPascalの値渡し意味論（呼び出し側でコピーを作成し、そのコピーの
-//! アドレスを渡す）ではなく、コピーを作らず元の変数のアドレスをそのまま
-//! 渡す**仮実装**である（`STRING[n]`の値仮引数がコピーを作るのとは対照的。
-//! [`CodeGenerator::gen_string_value_arg`]参照）。そのため、呼び出された
-//! 側での配列要素・レコードフィールドへの変更が呼び出し元にも反映されて
-//! しまう（実質的に参照渡しのように振る舞う）という既知の制限がある。
-//! これはタスク依頼で明示された意図的な単純化であり、正しい値渡し意味論
-//! （コピー生成）は、将来の`VAR`パラメータの正式な構文・意味論の実装と
-//! 合わせて別ステップで対応する予定（[`CodeGenerator::build_params`]/
-//! [`CodeGenerator::gen_array_or_record_value_arg`]のドキュメント、
-//! リポジトリの`README.md`「既知の制限」も参照）。
+//! Step 22では、`VAR`修飾子付き仮引数（参照渡し）を正式実装するとともに、
+//! この負債を解消する: 配列・レコードの値仮引数は、呼び出し側で
+//! `STRING[n]`の値仮引数（Step 18から）と同じ方針でコピーを作成し、その
+//! コピーのアドレスを渡すようになった（[`CodeGenerator::gen_array_or_record_value_arg`]
+//! 参照）。これにより、呼び出された側での配列要素・レコードフィールドへの
+//! 変更は呼び出し元の実引数に影響しなくなり、本来のPascalの値渡し意味論と
+//! 一致する。`VAR`仮引数（[`CodeGenerator::gen_var_arg`]）は引き続き元の
+//! 変数のアドレスをそのまま渡す（意図した参照渡し）。
 //!
 //! `CASE`、`UNIT`、ポインタ型、`REAL`/`CHAR`型、`WriteLn`以外の組み込み
 //! 手続き（`Write`/`Read`/`ReadLn`/`New`/`Dispose`）、複数引数の`WriteLn`は
@@ -109,10 +109,10 @@
 //!    参照）。仮引数はどの型であっても常にちょうど1ワードを占める:
 //!    `VAR`仮引数はアドレスを1ワードで格納し、それ以外の値仮引数のうち
 //!    `INTEGER`/`BOOLEAN`は値そのものを1ワードで格納する。`STRING[n]`の
-//!    値仮引数（Step 18）、および配列・レコードの値仮引数（Step 21。
-//!    仮実装でコピーを作らずアドレスを渡す。[`CodeGenerator::build_params`]
-//!    のドキュメント「UNCONFIRMED/TODO」参照）は、レコード・配列の値
-//!    パラメータに関するStep 12のCONFIRMED済みの規則からの類推
+//!    値仮引数（Step 18）、および配列・レコードの値仮引数（Step 21で許可、
+//!    Step 22から呼び出し側で作成したコピーのアドレスを格納する。
+//!    [`CodeGenerator::gen_array_or_record_value_arg`]参照）は、レコード・
+//!    配列の値パラメータに関するStep 12のCONFIRMED済みの規則からの類推
 //!    （[`CodeGenerator::gen_string_value_arg`]のドキュメント参照、
 //!    UNCONFIRMED）により、`VAR`仮引数と同様にアドレスを1ワードで格納する。
 //!    そのため`P`は単純に仮引数の個数と一致する）
@@ -951,22 +951,19 @@ impl CodeGenerator {
     /// 依然としてスコープ外（[`Self::build_locals`]参照）だが、仮引数は
     /// データそのものではなくアドレスしか持たないため、この制約に抵触しない。
     ///
-    /// # UNCONFIRMED/TODO: 配列・レコード型の仮引数はStep 21から許可（仮実装）
+    /// # 配列・レコード型の仮引数（Step 21から許可、Step 22でコピー生成を実装）
     ///
     /// Step 21のタスク依頼に従い、配列・レコード型を仮引数の型として許可
-    /// する。ただし本来のPascalの値渡し意味論（呼び出し側でコピーを作成し、
-    /// そのコピーのアドレスを渡す）は実装せず、`STRING[n]`の値仮引数
-    /// （[`Self::gen_string_value_arg`]、コピーを作る）とは異なり、**コピーを
-    /// 作らず元の変数のアドレスをそのまま渡す**仮実装とする（意図的な
-    /// 単純化。タスク依頼の明示的な指示）。そのため`by_ref`（`VAR`）で
-    /// あるかどうかに関わらず、配列・レコード型の仮引数は常に
-    /// `indirect = true`（スロットにアドレスを格納）になる。結果として、
-    /// 呼び出された側での配列要素・レコードフィールドへの変更が呼び出し元
-    /// にも反映されてしまう（実質的に参照渡しのように振る舞う）という
-    /// 既知の制限がある。正しい値渡し意味論（コピー生成）は、将来の`VAR`
-    /// パラメータの正式な構文・意味論の実装と合わせて別ステップで対応する
-    /// 予定（呼び出し側のコード生成は[`Self::gen_array_or_record_value_arg`]、
-    /// リポジトリの`README.md`「既知の制限」も参照）。
+    /// する。`by_ref`（`VAR`）であるかどうかに関わらず、配列・レコード型の
+    /// 仮引数は常に`indirect = true`（スロットにアドレスを格納）になる:
+    /// `VAR`仮引数は元の変数そのもののアドレス、値仮引数は呼び出し側が
+    /// 作成したコピーのアドレス（Step 22から。[`Self::gen_array_or_record_value_arg`]
+    /// 参照。Step 21時点ではコピーを作らず元の変数のアドレスをそのまま
+    /// 渡す仮実装だったが、Step 22で`VAR`パラメータの正式実装と合わせて
+    /// 解消した）を指す。呼び出し先本体からはどちらも同じ間接アクセス
+    /// （このスロットに格納されたアドレス経由）で読み書きできるが、値
+    /// 仮引数側は独立したコピーであるため、呼び出し先での変更が呼び出し元
+    /// の実引数に影響しない。
     fn build_params(&mut self, params: &[ParamDecl], param_base: u16) -> Vec<(String, FrameSlot)> {
         let mut result = Vec::new();
         for p in params {
@@ -2355,9 +2352,9 @@ impl CodeGenerator {
     /// アドレスを（[`Self::gen_address_of_resolved`]、単純な変数参照のみ
     /// サポート）、`STRING[n]`の値仮引数には呼び出し元が新規確保した
     /// 一時領域のアドレスを（[`Self::gen_string_value_arg`]、Step 18）、
-    /// 配列・レコードの値仮引数には元の変数のアドレスをそのまま
-    /// （[`Self::gen_array_or_record_value_arg`]、Step 21の仮実装。コピーは
-    /// 作らない）、それ以外の値仮引数には値を（[`Self::gen_expr`]）積む。
+    /// 配列・レコードの値仮引数には呼び出し元が新規作成したコピーの
+    /// アドレスを（[`Self::gen_array_or_record_value_arg`]、Step 22）、
+    /// それ以外の値仮引数には値を（[`Self::gen_expr`]）積む。
     ///
     /// # 引数の評価順序: 仮引数の並び順（左から右）
     ///
@@ -2491,45 +2488,112 @@ impl CodeGenerator {
         );
     }
 
-    /// 配列・レコードの値仮引数への実引数のコード生成（Step 21）。
+    /// 配列・レコードの値仮引数への実引数のコード生成。
     ///
-    /// # UNCONFIRMED/TODO: 値渡しの正しい意味論（コピー生成）は未実装（仮実装）
+    /// # Step 21のUNCONFIRMED/TODOの解消（Step 22）
     ///
-    /// 本来のPascalの値渡し意味論では、配列・レコードを値渡しする場合、
-    /// 呼び出し側でコピーを作成し、そのコピーのアドレスを渡す（呼び出された
-    /// 側での変更が元の変数に影響しない）。しかし本ステップでは実装を
-    /// 単純化するため、コピー生成を行わず、[`Self::gen_var_arg`]（`VAR`
-    /// 引数）と全く同じ命令列（元の変数のアドレスをそのまま積む）を発行
-    /// する。結果として、呼び出された側での配列要素・レコードフィールドへの
-    /// 変更が呼び出し側にも反映されてしまう（実質的に参照渡しのように
-    /// 振る舞う）という既知の制限がある。これはタスク依頼で明示された
-    /// 意図的な仮実装であり、正しい値渡し意味論（コピー生成）は、将来の
-    /// `VAR`パラメータの正式な構文・意味論の実装と合わせて別ステップで
-    /// 対応する予定（[`Self::build_params`]のドキュメント、リポジトリの
-    /// `README.md`「既知の制限」も参照）。
+    /// Step 21では実装を単純化するため、コピー生成を行わず、
+    /// [`Self::gen_var_arg`]（`VAR`引数）と全く同じ命令列（元の変数の
+    /// アドレスをそのまま積む）を発行する**仮実装**としていた。結果として
+    /// 呼び出された側での配列要素・レコードフィールドへの変更が呼び出し元
+    /// にも反映されてしまう（実質的に参照渡しのように振る舞う）という
+    /// 既知の制限があった。
     ///
-    /// `STRING[n]`の値渡し（[`Self::gen_string_value_arg`]、Step 18）とは
-    /// 対照的に、こちらは意図的にコピーを作らない点に注意。
+    /// 本ステップ（Step 22）で`VAR`パラメータを正式実装するにあたり、この
+    /// 負債を解消する: 本来のPascalの値渡し意味論に従い、呼び出し側で
+    /// コピーを作成し、そのコピーのアドレスを渡す。方針は`STRING[n]`の値
+    /// 仮引数（[`Self::gen_string_value_arg`]、Step 18）と同じで、呼び出し
+    /// 元がグローバルデータ領域の末尾に新規の一時領域を確保し
+    /// （[`Self::alloc_words`]）、実引数の中身をそこへコピーしたうえで、
+    /// その一時領域自身のアドレスを積む。「VARパラメータおよびレコード・
+    /// 配列値パラメータはアドレスを格納する」という一次資料由来の
+    /// CONFIRMED済みの規則（`crate`モジュールドキュメント「活性化レコードの
+    /// レイアウト」参照）自体は変わらない——変わるのは、そのアドレスが
+    /// 「元の変数そのもの」ではなく「呼び出し元が作った新しいコピー」を
+    /// 指すようになる点のみ。
     ///
-    /// # スコープ: 単純な識別子のみ
+    /// コピーの生成には、ブロック転送用の専用命令が一次資料上に見当たら
+    /// ないため（`crate::opcode::UnconfirmedOp`のドキュメント参照）、
+    /// `STRING[n]`のコピー（[`Self::emit_string_copy_words`]）と同様、
+    /// 要素ごとのロード・ストアを愚直にループさせるだけの実装とする。
     ///
-    /// [`Self::gen_var_arg`]と同様、単純な変数参照のみサポートする
-    /// （配列要素・レコードフィールドを配列/レコード引数として渡すことは
-    /// 型上そもそも起こらないため、この制約は実質的に「式は渡せない」
-    /// ことのみを意味する）。
+    /// # `STRING[n]`の値渡しは対象外（このステップでは変更しない）
+    ///
+    /// `STRING[n]`の値仮引数は元々（Step 18から）このコピー生成ロジックと
+    /// 同じ方針（呼び出し元が一時領域を確保してコピーする）で実装済みで
+    /// あり、「値渡しなのにコピーされない」という同種の問題は元から
+    /// 抱えていない（[`Self::gen_string_value_arg`]参照）。そのため今回の
+    /// 負債解消の対象には含めない。
+    ///
+    /// # スコープ: 直接記憶方式の単純な識別子のみ
+    ///
+    /// 配列・レコードのローカル変数は依然としてサポート外
+    /// （[`Self::build_locals`]参照）であり、直接記憶方式で存在しうる
+    /// 配列・レコード変数は`PROGRAM`直下のグローバル変数のみ。そのため
+    /// [`Self::gen_string_value_arg`]と同様、既に`VAR`/値引数として間接的に
+    /// 受け取った配列・レコードをさらに別の値引数として中継する場合は
+    /// 今回のスコープ外としてエラー報告する（ネストしたVARアクセス等の
+    /// 複雑なケースは別ステップに回す、というタスク依頼の方針に従う）。
     fn gen_array_or_record_value_arg(&mut self, arg: &Expr, span: Span) {
-        self.gen_identifier_address_arg(
-            arg,
-            span,
-            "array/record value arguments only support a simple variable reference (not an \
-             expression) in this step's minimal codegen",
-        );
+        let Expr::Identifier(ident) = arg else {
+            self.error(
+                arg.span(),
+                "array/record value arguments only support a simple variable reference (not an \
+                 expression) in this step's minimal codegen",
+            );
+            self.gen_expr(arg);
+            return;
+        };
+        let key = normalize(&ident.name);
+        let (resolved, kind) = match (self.resolve_var(&key), self.lookup_kind(&key)) {
+            (Some(resolved), Some(kind @ (ValueKind::Array(_) | ValueKind::Record(_)))) => {
+                (resolved, kind)
+            }
+            _ => {
+                self.error(
+                    ident.span,
+                    format!(
+                        "'{}' is not a known array/record variable in this scope",
+                        ident.name
+                    ),
+                );
+                self.emit(UnconfirmedOp::Ldc(0).into(), span);
+                return;
+            }
+        };
+        if resolved.indirect {
+            self.error(
+                ident.span,
+                "passing an already-received array/record parameter onward as another \
+                 array/record value argument is out of scope for this step's minimal codegen",
+            );
+            self.emit(UnconfirmedOp::Ldc(0).into(), span);
+            return;
+        }
+
+        // `resolved.indirect`が偽であることが上で確認済みなので、
+        // `resolved.level`/`resolved.address`は元の変数のワードを直接指す
+        // （`resolved.offset`も常に0。[`ResolvedVar`]のドキュメント参照）。
+        // コピー先の一時領域も同じグローバルデータ領域に確保するため、
+        // ロード元・ストア先とも同じ`resolved.level`をそのまま使い回せる。
+        let words = word_size_of(kind);
+        let temp = self.alloc_words(words);
+        for i in 0..words {
+            self.emit(
+                UnconfirmedOp::Lod(resolved.level, Address(resolved.address.0 + i)).into(),
+                span,
+            );
+            self.emit(
+                UnconfirmedOp::Str(resolved.level, Address(temp.0 + i)).into(),
+                span,
+            );
+        }
+        self.emit(UnconfirmedOp::Lda(resolved.level, temp).into(), span);
     }
 
-    /// [`Self::gen_var_arg`]/[`Self::gen_array_or_record_value_arg`]共通の
-    /// 実装: 単純な識別子を解決し、そのアドレスをスタックへ積む
-    /// （[`Self::gen_address_of_resolved`]）。`arg`が単純な識別子でない場合は
-    /// `expr_error`を診断として報告する。
+    /// [`Self::gen_var_arg`]（`VAR`仮引数）の実装: 単純な識別子を解決し、
+    /// そのアドレスをスタックへ積む（[`Self::gen_address_of_resolved`]）。
+    /// `arg`が単純な識別子でない場合は`expr_error`を診断として報告する。
     fn gen_identifier_address_arg(&mut self, arg: &Expr, span: Span, expr_error: &str) {
         let Expr::Identifier(ident) = arg else {
             self.error(arg.span(), expr_error);
